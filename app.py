@@ -4,6 +4,7 @@ import os
 import subprocess
 import platform
 import random
+import time  # Add time module for duration tracking
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -164,8 +165,23 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
     current_seed = seed
     all_outputs = []
     last_used_seed = seed
+    
+    # Timing variables
+    start_time = time.time()
+    generation_times = []
+    
+    # Post-processing time estimates (in seconds)
+    estimated_vae_time_per_frame = 0.05  # Estimate for VAE decoding per frame
+    estimated_save_time = 2.0  # Estimate for saving video to disk
+    
+    # If we have past generation data, we can update these estimates
+    vae_time_history = []
+    save_time_history = []
 
     for gen_idx in range(num_generations):
+        # Track start time for current generation
+        gen_start_time = time.time()
+        
         if stream.input_queue.top() == 'end':
             stream.output_queue.push(('end', None))
             return
@@ -298,6 +314,9 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                 else:
                     transformer.initialize_teacache(enable_teacache=False)
 
+                # Track sampling start time for ETA calculation
+                sampling_start_time = time.time()
+
                 def callback(d):
                     preview = d['denoised']
                     preview = vae_decode_fake(preview)
@@ -314,9 +333,44 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
 
                     current_step = d['i'] + 1
                     percentage = int(100.0 * current_step / steps)
+                    
+                    # Calculate ETA for sampling steps
+                    elapsed_time = time.time() - sampling_start_time
+                    time_per_step = elapsed_time / current_step if current_step > 0 else 0
+                    remaining_steps = steps - current_step
+                    eta_seconds = time_per_step * remaining_steps
+                    
+                    # Calculate total frames expected in this video
+                    expected_frames = latent_window_size * 4 - 3
+                    
+                    # Add estimated post-processing time (VAE decoding + saving)
+                    if current_step == steps:  # At 100%, show post-processing ETA
+                        post_processing_eta = expected_frames * estimated_vae_time_per_frame + estimated_save_time
+                        eta_seconds = post_processing_eta
+                    else:
+                        # Add post-processing time to regular ETA
+                        post_processing_eta = expected_frames * estimated_vae_time_per_frame + estimated_save_time
+                        eta_seconds += post_processing_eta
+                    
+                    # Format ETA
+                    eta_str = ""
+                    if eta_seconds > 60:
+                        eta_str = f"{eta_seconds/60:.1f} min"
+                    else:
+                        eta_str = f"{eta_seconds:.1f} sec"
+                    
+                    # Total elapsed time for all generations
+                    total_elapsed = time.time() - start_time
+                    elapsed_str = f"{total_elapsed/60:.1f} min" if total_elapsed > 60 else f"{total_elapsed:.1f} sec"
+                    
                     hint = f'Sampling {current_step}/{steps} (Gen {gen_idx+1}/{num_generations}, Seed {current_seed})'
                     desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
-                    stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                    time_info = f'Elapsed: {elapsed_str} | ETA: {eta_str}'
+                    
+                    # Print to command line
+                    print(f"\rProgress: {percentage}% | {hint} | {time_info}     ", end="")
+                    
+                    stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, f"{hint}<br/>{time_info}"))))
                     return
 
                 generated_latents = sample_hunyuan(
@@ -350,6 +404,10 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     callback=callback,
                 )
 
+                # Record the time taken for this section
+                section_time = time.time() - sampling_start_time
+                print(f"\nSection completed in {section_time:.2f} seconds")
+
                 if is_last_section:
                     generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
@@ -360,6 +418,9 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
                     load_model_as_complete(vae, target_device=gpu)
 
+                # Start timing VAE decoding
+                vae_start_time = time.time()
+                
                 real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
                 if history_pixels is None:
@@ -370,6 +431,16 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
 
                     current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                     history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                
+                # Record VAE decoding time and update estimate
+                vae_time = time.time() - vae_start_time
+                num_frames_decoded = real_history_latents.shape[2]
+                vae_time_per_frame = vae_time / num_frames_decoded if num_frames_decoded > 0 else estimated_vae_time_per_frame
+                vae_time_history.append(vae_time_per_frame)
+                if len(vae_time_history) > 0:
+                    estimated_vae_time_per_frame = sum(vae_time_history) / len(vae_time_history)
+                
+                print(f"VAE decoding completed in {vae_time:.2f} seconds ({vae_time_per_frame:.3f} sec/frame)")
 
                 if not high_vram:
                     unload_complete_models()
@@ -385,6 +456,9 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     output_filename = os.path.join(outputs_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.mp4')
                     webm_output_filename = os.path.join(webm_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webm')
 
+                # Start timing save operations
+                save_start_time = time.time()
+                
                 # Pass video quality to the save function
                 try:
                     save_bcthw_as_mp4(history_pixels, output_filename, fps=30, video_quality=video_quality)
@@ -433,14 +507,37 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                         print(f"Saved WebP animation to {webp_filename}")
                     except Exception as e:
                         print(f"Error saving WebP: {str(e)}")
-
+                
+                # Record save time and update estimate
+                save_time = time.time() - save_start_time
+                save_time_history.append(save_time)
+                if len(save_time_history) > 0:
+                    estimated_save_time = sum(save_time_history) / len(save_time_history)
+                
+                print(f"Saving operations completed in {save_time:.2f} seconds")
                 print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
                 # Push the filename to the output queue for processing
                 stream.output_queue.push(('file', output_filename))
 
+                # Check if this is the last section and break the loop if it is
                 if is_last_section:
                     break
+            
+            # Record generation time
+            gen_time = time.time() - gen_start_time
+            generation_times.append(gen_time)
+            avg_gen_time = sum(generation_times) / len(generation_times)
+            remaining_gens = num_generations - (gen_idx + 1)
+            estimated_remaining_time = avg_gen_time * remaining_gens
+            
+            print(f"\nGeneration {gen_idx+1}/{num_generations} completed in {gen_time:.2f} seconds")
+            if remaining_gens > 0:
+                print(f"Estimated time for remaining generations: {estimated_remaining_time/60:.1f} minutes")
+            
+            # Push timing information to the queue
+            stream.output_queue.push(('timing', {'gen_time': gen_time, 'avg_time': avg_gen_time, 'remaining_time': estimated_remaining_time}))
+            
         except KeyboardInterrupt as e:
             # Handle the user ending the task gracefully
             if str(e) == 'User ends the task.':
@@ -469,7 +566,12 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     text_encoder, text_encoder_2, image_encoder, vae, transformer
                 )
 
-    # Return the last used seed after all generations are complete
+    # Calculate total time
+    total_time = time.time() - start_time
+    print(f"\nTotal generation time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+    
+    # Return the last used seed and timing info after all generations are complete
+    stream.output_queue.push(('final_timing', {'total_time': total_time, 'generation_times': generation_times}))
     stream.output_queue.push(('final_seed', last_used_seed))
     stream.output_queue.push(('end', None))
     return
@@ -479,7 +581,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
     global stream
     assert input_image is not None, 'No input image!'
 
-    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True), seed
+    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
 
     stream = AsyncStream()
 
@@ -491,17 +593,36 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
     apng_filename = None
     webp_filename = None
     current_seed = seed
+    timing_info = ""
 
     while True:
         flag, data = stream.output_queue.next()
 
         if flag == 'seed_update':
             current_seed = data
-            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed
+            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
 
         if flag == 'final_seed':
             current_seed = data
             # Final seed will be returned at the end
+
+        if flag == 'timing':
+            gen_time = data['gen_time']
+            avg_time = data['avg_time']
+            remaining_time = data['remaining_time']
+            
+            if remaining_time > 60:
+                eta_str = f"{remaining_time/60:.1f} minutes"
+            else:
+                eta_str = f"{remaining_time:.1f} seconds"
+                
+            timing_info = f"Last generation: {gen_time:.2f}s | Average: {avg_time:.2f}s | ETA: {eta_str}"
+            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
+        
+        if flag == 'final_timing':
+            total_time = data['total_time']
+            timing_info = f"Total generation time: {total_time:.2f}s ({total_time/60:.2f} min)"
+            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
 
         if flag == 'file':
             output_filename = data
@@ -509,7 +630,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
             # Check if output_filename is None (indicating a save error)
             if output_filename is None:
                 print("Warning: No output file was generated due to an error")
-                yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed
+                yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
                 continue
                 
             base_name = os.path.basename(output_filename)
@@ -549,11 +670,11 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
             if video_quality == 'web_compatible' and webm_filename:
                 video_file = webm_filename
                 
-            yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed
+            yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
 
         if flag == 'progress':
             preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), current_seed
+            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
 
         if flag == 'end':
             # Select the appropriate video file based on quality setting
@@ -561,7 +682,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
             if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
                 video_file = webm_filename
                 
-            yield video_file, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), current_seed
+            yield video_file, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
             break
 
 
@@ -580,7 +701,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V8 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V9 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
@@ -626,6 +747,7 @@ with block:
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+            timing_display = gr.Markdown("", label="Time Information", elem_classes='no-generating-animation')
             
             # Add folder navigation buttons
             gr.Markdown("### Folder Options")
@@ -675,7 +797,7 @@ with block:
     
     # Update inputs list to include new parameters
     ips = [input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp]
-    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed])
+    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     end_button.click(fn=end_process)
     
     # Connect folder buttons
