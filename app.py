@@ -96,7 +96,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high'):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -291,10 +291,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=30)
+            # Pass video quality to the save function
+            save_bcthw_as_mp4(history_pixels, output_filename, fps=30, video_quality=video_quality)
 
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
+            # Push the filename to the output queue for processing
             stream.output_queue.push(('file', output_filename))
 
             if is_last_section:
@@ -311,7 +313,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high'):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -319,23 +321,40 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality)
 
     output_filename = None
+    webm_filename = None
 
     while True:
         flag, data = stream.output_queue.next()
 
         if flag == 'file':
             output_filename = data
-            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+            webm_filename = os.path.splitext(output_filename)[0] + '.webm'
+            
+            # Check if webm was created and exists
+            if not os.path.exists(webm_filename):
+                webm_filename = None
+                
+            # Select the appropriate video file based on quality setting
+            video_file = output_filename
+            if video_quality == 'web_compatible' and webm_filename:
+                video_file = webm_filename
+                
+            yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
 
         if flag == 'progress':
             preview, desc, html = data
             yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
 
         if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+            # Select the appropriate video file based on quality setting
+            video_file = output_filename
+            if video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
+                video_file = webm_filename
+                
+            yield video_file, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
             break
 
 
@@ -352,7 +371,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V1 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V2 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
@@ -379,14 +398,51 @@ with block:
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                
+                video_quality = gr.Radio(
+                    label="Video Quality",
+                    choices=["high", "medium", "low", "web_compatible"],
+                    value="high",
+                    info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility"
+                )
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
-            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
+            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=True, height=512, loop=True)
+            video_info = gr.HTML("<div id='video-info'>Generate a video to see information</div>")
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache]
+    
+    # Add JavaScript to show video information when loaded
+    video_info_js = """
+    function updateVideoInfo() {
+        const videoElement = document.querySelector('video');
+        if (videoElement) {
+            const info = document.getElementById('video-info');
+            videoElement.addEventListener('loadedmetadata', function() {
+                info.innerHTML = `<p>Resolution: ${videoElement.videoWidth}x${videoElement.videoHeight} | 
+                                   Duration: ${videoElement.duration.toFixed(2)}s | 
+                                   Format: ${videoElement.currentSrc.split('.').pop()}</p>`;
+            });
+        }
+    }
+    
+    // Run when page loads and after video updates
+    document.addEventListener('DOMContentLoaded', updateVideoInfo);
+    const observer = new MutationObserver(function(mutations) {
+        updateVideoInfo();
+    });
+    
+    observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+    });
+    """
+    
+    block.load(None, js=video_info_js)
+    
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 

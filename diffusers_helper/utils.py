@@ -263,7 +263,16 @@ def soft_append_bcthw(history, current, overlap=0):
     return output.to(history)
 
 
-def save_bcthw_as_mp4(x, output_filename, fps=10):
+def save_bcthw_as_mp4(x, output_filename, fps=10, video_quality='high'):
+    """
+    Save batch of video tensors as MP4 with improved quality and compatibility.
+    
+    Args:
+        x: Input tensor of shape [batch, channels, time, height, width]
+        output_filename: Path to save the output MP4
+        fps: Frames per second for the output video
+        video_quality: Quality setting - 'high' for best quality, 'medium' for balanced, 'low' for smaller files
+    """
     b, c, t, h, w = x.shape
 
     per_row = b
@@ -273,11 +282,67 @@ def save_bcthw_as_mp4(x, output_filename, fps=10):
             break
 
     os.makedirs(os.path.dirname(os.path.abspath(os.path.realpath(output_filename))), exist_ok=True)
-    x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
-    x = x.detach().cpu().to(torch.uint8)
-    x = einops.rearrange(x, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
-    torchvision.io.write_video(output_filename, x, fps=fps, video_codec='h264', options={'crf': '0'})
-    return x
+    
+    # Create normalized and rearranged tensor
+    x_normalized = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
+    x_uint8 = x_normalized.detach().cpu().to(torch.uint8)
+    x_rearranged = einops.rearrange(x_uint8, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
+    
+    # Quality settings for MP4
+    if video_quality == 'high':
+        mp4_options = {
+            'crf': '8',          # Lower CRF = higher quality (18 is high quality)
+            'preset': 'slow',     # Slower preset = better compression
+            'pix_fmt': 'yuv420p', # Most compatible pixel format
+            'movflags': '+faststart' # Allows video to start playing before it's fully downloaded
+        }
+    elif video_quality == 'medium':
+        mp4_options = {
+            'crf': '12',          # Medium quality
+            'preset': 'medium',   # Balanced compression speed
+            'pix_fmt': 'yuv420p',
+            'movflags': '+faststart'
+        }
+    elif video_quality == 'low':
+        mp4_options = {
+            'crf': '16',          # Lower quality, smaller file
+            'preset': 'fast',     # Faster encoding
+            'pix_fmt': 'yuv420p',
+            'movflags': '+faststart'
+        }
+    else:  # web_compatible or any other value
+        mp4_options = {
+            'crf': '10',          # Medium quality
+            'preset': 'medium',   # Balanced compression speed
+            'pix_fmt': 'yuv420p',
+            'movflags': '+faststart',
+            'profile:v': 'baseline', # Most compatible H.264 profile
+            'level': '3.0'        # Compatible with most devices
+        }
+    
+    # Save MP4
+    torchvision.io.write_video(output_filename, x_rearranged, fps=fps, video_codec='h264', options=mp4_options)
+    
+    # Create WebM version for better web compatibility
+    webm_path = os.path.splitext(output_filename)[0] + '.webm'
+    try:
+        if video_quality == 'high':
+            webm_options = {
+                'crf': '30',      # VP9 uses different CRF scale
+                'b:v': '0',       # Use CRF-based quality control
+                'cpu-used': '2'   # Speed/quality tradeoff (0=best quality, 4=good balance)
+            }
+        else:
+            webm_options = {
+                'crf': '36',      # Lower quality for web compatible
+                'b:v': '0',
+                'cpu-used': '4'   # Faster encoding
+            }
+        torchvision.io.write_video(webm_path, x_rearranged, fps=fps, video_codec='vp9', options=webm_options)
+    except Exception as e:
+        print(f"WebM encoding failed (not critical): {e}")
+    
+    return x_rearranged
 
 
 def save_bcthw_as_png(x, output_filename):
