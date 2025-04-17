@@ -392,7 +392,7 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     
                     # Also save as WebM if video quality is set to web_compatible
                     if video_quality == 'web_compatible':
-                        save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=30, video_quality='web_compatible')
+                        save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=30, video_quality=video_quality, format='webm')
                         print(f"Saved WebM video to {webm_output_filename}")
                 except Exception as e:
                     print(f"Error saving MP4/WebM video: {str(e)}")
@@ -580,7 +580,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V7 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V8 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
