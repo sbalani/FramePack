@@ -94,45 +94,57 @@ else:
 
 stream = AsyncStream()
 
-outputs_folder = './outputs/'
-used_images_folder = os.path.join(outputs_folder, 'used_images/')
-intermediate_videos_folder = os.path.join(outputs_folder, 'intermediate_videos/')
-gif_videos_folder = os.path.join(outputs_folder, 'gif_videos/')
-apng_videos_folder = os.path.join(outputs_folder, 'apng_videos/')
-webp_videos_folder = os.path.join(outputs_folder, 'webp_videos/')
-intermediate_gif_videos_folder = os.path.join(outputs_folder, 'intermediate_gif_videos/')
-intermediate_apng_videos_folder = os.path.join(outputs_folder, 'intermediate_apng_videos/')
-intermediate_webp_videos_folder = os.path.join(outputs_folder, 'intermediate_webp_videos/')
+# Change directory paths to use absolute paths
+current_dir = os.path.dirname(os.path.abspath(__file__))
+outputs_folder = os.path.join(current_dir, 'outputs')
+used_images_folder = os.path.join(outputs_folder, 'used_images')
+intermediate_videos_folder = os.path.join(outputs_folder, 'intermediate_videos')
+gif_videos_folder = os.path.join(outputs_folder, 'gif_videos')
+apng_videos_folder = os.path.join(outputs_folder, 'apng_videos')
+webp_videos_folder = os.path.join(outputs_folder, 'webp_videos')
+webm_videos_folder = os.path.join(outputs_folder, 'webm_videos')
+intermediate_gif_videos_folder = os.path.join(outputs_folder, 'intermediate_gif_videos')
+intermediate_apng_videos_folder = os.path.join(outputs_folder, 'intermediate_apng_videos')
+intermediate_webp_videos_folder = os.path.join(outputs_folder, 'intermediate_webp_videos')
+intermediate_webm_videos_folder = os.path.join(outputs_folder, 'intermediate_webm_videos')
 
-# Ensure all directories exist
-os.makedirs(outputs_folder, exist_ok=True)
-os.makedirs(used_images_folder, exist_ok=True)
-os.makedirs(intermediate_videos_folder, exist_ok=True)
-os.makedirs(gif_videos_folder, exist_ok=True)
-os.makedirs(apng_videos_folder, exist_ok=True)
-os.makedirs(webp_videos_folder, exist_ok=True)
-os.makedirs(intermediate_gif_videos_folder, exist_ok=True)
-os.makedirs(intermediate_apng_videos_folder, exist_ok=True)
-os.makedirs(intermediate_webp_videos_folder, exist_ok=True)
+# Ensure all directories exist with proper error handling
+for directory in [
+    outputs_folder, 
+    used_images_folder, 
+    intermediate_videos_folder, 
+    gif_videos_folder, 
+    apng_videos_folder, 
+    webp_videos_folder,
+    webm_videos_folder,
+    intermediate_gif_videos_folder, 
+    intermediate_apng_videos_folder, 
+    intermediate_webp_videos_folder,
+    intermediate_webm_videos_folder
+]:
+    try:
+        os.makedirs(directory, exist_ok=True)
+        print(f"Created directory: {directory}")
+    except Exception as e:
+        print(f"Error creating directory {directory}: {str(e)}")
 
 def open_outputs_folder():
     """Opens the outputs folder in the file explorer/manager in a cross-platform way."""
-    outputs_path = os.path.abspath(outputs_folder)
     try:
         if platform.system() == "Windows":
-            os.startfile(outputs_path)
+            os.startfile(outputs_folder)
         elif platform.system() == "Darwin":  # macOS
-            subprocess.run(["open", outputs_path])
+            subprocess.run(["open", outputs_folder])
         else:  # Linux
-            subprocess.run(["xdg-open", outputs_path])
+            subprocess.run(["xdg-open", outputs_folder])
         return "Opened outputs folder"
     except Exception as e:
         return f"Error opening folder: {str(e)}"
 
 def open_folder(folder_path):
     """Opens the specified folder in the file explorer/manager in a cross-platform way."""
-    folder_path = os.path.abspath(folder_path)
     try:
+        folder_path = os.path.abspath(folder_path)
         if platform.system() == "Windows":
             os.startfile(folder_path)
         elif platform.system() == "Darwin":  # macOS
@@ -161,7 +173,7 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
         # Update seed for this generation
         if use_random_seed:
             current_seed = random.randint(1, 2147483647)
-        elif gen_idx > 0:  # increment seed only after first generation
+        elif gen_idx > 0:  # increment seed for non-random seeds after first generation
             current_seed += 1
             
         last_used_seed = current_seed
@@ -203,7 +215,11 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
             height, width = find_nearest_bucket(H, W, resolution=640)
             input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
-            Image.fromarray(input_image_np).save(os.path.join(used_images_folder, f'{job_id}.png'))
+            try:
+                Image.fromarray(input_image_np).save(os.path.join(used_images_folder, f'{job_id}.png'))
+                print(f"Saved input image to {os.path.join(used_images_folder, f'{job_id}.png')}")
+            except Exception as e:
+                print(f"Error saving input image: {str(e)}")
 
             input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
             input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
@@ -291,6 +307,9 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
 
                     if stream.input_queue.top() == 'end':
                         stream.output_queue.push(('end', None))
+                        print("\n" + "="*50)
+                        print("USER REQUESTED TO END GENERATION - STOPPING...")
+                        print("="*50)
                         raise KeyboardInterrupt('User ends the task.')
 
                     current_step = d['i'] + 1
@@ -361,11 +380,25 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                 # Choose appropriate folder for the MP4 video
                 if is_intermediate:
                     output_filename = os.path.join(intermediate_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.mp4')
+                    webm_output_filename = os.path.join(intermediate_webm_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webm')
                 else:
                     output_filename = os.path.join(outputs_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.mp4')
+                    webm_output_filename = os.path.join(webm_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webm')
 
                 # Pass video quality to the save function
-                save_bcthw_as_mp4(history_pixels, output_filename, fps=30, video_quality=video_quality)
+                try:
+                    save_bcthw_as_mp4(history_pixels, output_filename, fps=30, video_quality=video_quality)
+                    print(f"Saved MP4 video to {output_filename}")
+                    
+                    # Also save as WebM if video quality is set to web_compatible
+                    if video_quality == 'web_compatible':
+                        save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=30, video_quality='web_compatible')
+                        print(f"Saved WebM video to {webm_output_filename}")
+                except Exception as e:
+                    print(f"Error saving MP4/WebM video: {str(e)}")
+                    # Create a default output filename in case of failure
+                    output_filename = None
+                    webm_output_filename = None
 
                 # Save in additional formats if requested
                 if export_gif:
@@ -373,24 +406,33 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                         gif_filename = os.path.join(intermediate_gif_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.gif')
                     else:
                         gif_filename = os.path.join(gif_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.gif')
-                    save_bcthw_as_gif(history_pixels, gif_filename, fps=30)
-                    print(f"Saved GIF animation to {gif_filename}")
+                    try:
+                        save_bcthw_as_gif(history_pixels, gif_filename, fps=30)
+                        print(f"Saved GIF animation to {gif_filename}")
+                    except Exception as e:
+                        print(f"Error saving GIF: {str(e)}")
 
                 if export_apng:
                     if is_intermediate:
                         apng_filename = os.path.join(intermediate_apng_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.png')
                     else:
                         apng_filename = os.path.join(apng_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.png')
-                    save_bcthw_as_apng(history_pixels, apng_filename, fps=30)
-                    print(f"Saved APNG animation to {apng_filename}")
+                    try:
+                        save_bcthw_as_apng(history_pixels, apng_filename, fps=30)
+                        print(f"Saved APNG animation to {apng_filename}")
+                    except Exception as e:
+                        print(f"Error saving APNG: {str(e)}")
 
                 if export_webp:
                     if is_intermediate:
                         webp_filename = os.path.join(intermediate_webp_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webp')
                     else:
                         webp_filename = os.path.join(webp_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webp')
-                    save_bcthw_as_webp(history_pixels, webp_filename, fps=30)
-                    print(f"Saved WebP animation to {webp_filename}")
+                    try:
+                        save_bcthw_as_webp(history_pixels, webp_filename, fps=30)
+                        print(f"Saved WebP animation to {webp_filename}")
+                    except Exception as e:
+                        print(f"Error saving WebP: {str(e)}")
 
                 print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
@@ -399,6 +441,26 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
 
                 if is_last_section:
                     break
+        except KeyboardInterrupt as e:
+            # Handle the user ending the task gracefully
+            if str(e) == 'User ends the task.':
+                print("\n" + "="*50)
+                print("GENERATION ENDED BY USER")
+                print("="*50)
+                
+                # Make sure we unload models to free memory
+                if not high_vram:
+                    print("Unloading models from memory...")
+                    unload_complete_models(
+                        text_encoder, text_encoder_2, image_encoder, vae, transformer
+                    )
+                
+                # Push end message to output queue to ensure UI updates correctly
+                stream.output_queue.push(('end', None))
+                return
+            else:
+                # Re-raise if it's not our specific interrupt
+                raise
         except:
             traceback.print_exc()
 
@@ -443,14 +505,24 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
 
         if flag == 'file':
             output_filename = data
+            
+            # Check if output_filename is None (indicating a save error)
+            if output_filename is None:
+                print("Warning: No output file was generated due to an error")
+                yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed
+                continue
+                
             base_name = os.path.basename(output_filename)
             base_name_no_ext = os.path.splitext(base_name)[0]
             
             # Get the correct paths for all possible output files
             is_intermediate = 'intermediate' in output_filename
             
-            # Check for WebM format (always in same folder as MP4)
-            webm_filename = os.path.splitext(output_filename)[0] + '.webm'
+            # Check for WebM format (in dedicated folder)
+            if is_intermediate:
+                webm_filename = os.path.join(intermediate_webm_videos_folder, f"{base_name_no_ext}.webm")
+            else:
+                webm_filename = os.path.join(webm_videos_folder, f"{base_name_no_ext}.webm")
             
             # Determine paths for other formats based on whether this is intermediate or final
             if is_intermediate:
@@ -486,7 +558,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
         if flag == 'end':
             # Select the appropriate video file based on quality setting
             video_file = output_filename
-            if video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
+            if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
                 video_file = webm_filename
                 
             yield video_file, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), current_seed
@@ -494,7 +566,9 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
 
 
 def end_process():
+    print("\nSending end generation signal...")
     stream.input_queue.push('end')
+    print("End signal sent. Waiting for generation to stop safely...")
 
 
 quick_prompts = [
@@ -506,7 +580,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V6 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V7 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
