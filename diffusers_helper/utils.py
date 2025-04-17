@@ -8,6 +8,7 @@ import einops
 import numpy as np
 import datetime
 import torchvision
+import uuid
 
 import safetensors.torch as sf
 from PIL import Image
@@ -429,8 +430,10 @@ def save_bcthw_as_apng(x, output_filename, fps=10):
     x_uint8 = x_normalized.detach().cpu().to(torch.uint8)
     x_rearranged = einops.rearrange(x_uint8, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
     
-    # Create temporary folder for frame PNGs
-    temp_dir = os.path.join(os.path.dirname(output_filename), "temp_apng_frames")
+    # Create temporary folder with unique identifier for frame PNGs
+    unique_id = str(uuid.uuid4())[:8]  # Generate a short unique ID
+    base_name = os.path.splitext(os.path.basename(output_filename))[0]
+    temp_dir = os.path.join(os.path.dirname(output_filename), f"temp_apng_frames_{base_name}_{unique_id}")
     os.makedirs(temp_dir, exist_ok=True)
     
     # Save frames as individual PNGs
