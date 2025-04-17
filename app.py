@@ -1,6 +1,8 @@
 from diffusers_helper.hf_login import login
 
 import os
+import subprocess
+import platform
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -93,6 +95,21 @@ stream = AsyncStream()
 
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
+
+
+def open_outputs_folder():
+    """Opens the outputs folder in the file explorer/manager in a cross-platform way."""
+    outputs_path = os.path.abspath(outputs_folder)
+    try:
+        if platform.system() == "Windows":
+            os.startfile(outputs_path)
+        elif platform.system() == "Darwin":  # macOS
+            subprocess.run(["open", outputs_path])
+        else:  # Linux
+            subprocess.run(["xdg-open", outputs_path])
+        return "Opened outputs folder"
+    except Exception as e:
+        return f"Error opening folder: {str(e)}"
 
 
 @torch.no_grad()
@@ -399,7 +416,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V3 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V4 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
@@ -408,7 +425,7 @@ with block:
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
             with gr.Row():
-                start_button = gr.Button(value="Start Generation")
+                start_button = gr.Button(value="Start Generation",variant='primary')
                 end_button = gr.Button(value="End Generation", interactive=False)
 
             with gr.Group():
@@ -436,6 +453,10 @@ with block:
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+            
+            # Add open outputs folder button
+            open_folder_btn = gr.Button(value="Open Outputs Folder")
+            
             video_quality = gr.Radio(
                 label="Video Quality",
                 choices=["high", "medium", "low", "web_compatible"],
@@ -480,6 +501,7 @@ with block:
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
+    open_folder_btn.click(fn=open_outputs_folder, outputs=gr.Text(visible=False))
 
 
 block.launch(
