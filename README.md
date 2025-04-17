@@ -77,6 +77,22 @@ You will see the progress bar for each section and the latent preview for the ne
 
 Note that the initial progress may be slower than later diffusion as the device may need some warmup.
 
+## Export Options
+
+FramePack supports multiple export formats:
+
+- **MP4/WebM**: Default video formats with different quality settings (high, medium, low, web_compatible)
+- **GIF**: Animated GIF format widely supported across platforms but with larger file size
+- **APNG**: Animated PNG with better quality than GIF but requires more modern browser support
+- **WebP**: Google's animated image format with good compression and quality balance
+
+To use additional export formats, select the corresponding checkboxes before starting generation. The animations will be exported simultaneously with the video in your chosen formats.
+
+**Note**: APNG export requires the additional `apng` package, which can be installed with:
+```
+pip install apng==0.3.4
+```
+
 # Sanity Check
 
 Before trying your own inputs, we highly recommend going through the sanity check to find out if any hardware or software went wrong. 
@@ -276,7 +292,7 @@ Below are some more examples that you may be interested in reproducing.
 
 <img src="https://github.com/user-attachments/assets/853f4f40-2956-472f-aa7a-fa50da03ed92" width="150">
 
-`The girl suddenly took out a sign that said “cute” using right hand`
+`The girl suddenly took out a sign that said "cute" using right hand`
 
 ![image](https://github.com/user-attachments/assets/d51180e4-5537-4e25-a6c6-faecae28648a)
 

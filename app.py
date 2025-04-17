@@ -17,7 +17,7 @@ from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
+from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp, save_bcthw_as_gif, save_bcthw_as_apng, save_bcthw_as_webp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
@@ -96,7 +96,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high'):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -294,6 +294,22 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             # Pass video quality to the save function
             save_bcthw_as_mp4(history_pixels, output_filename, fps=30, video_quality=video_quality)
 
+            # Save in additional formats if requested
+            if export_gif:
+                gif_filename = os.path.splitext(output_filename)[0] + '.gif'
+                save_bcthw_as_gif(history_pixels, gif_filename, fps=30)
+                print(f"Saved GIF animation to {gif_filename}")
+
+            if export_apng:
+                apng_filename = os.path.splitext(output_filename)[0] + '.png'
+                save_bcthw_as_apng(history_pixels, apng_filename, fps=30)
+                print(f"Saved APNG animation to {apng_filename}")
+
+            if export_webp:
+                webp_filename = os.path.splitext(output_filename)[0] + '.webp'
+                save_bcthw_as_webp(history_pixels, webp_filename, fps=30)
+                print(f"Saved WebP animation to {webp_filename}")
+
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
             # Push the filename to the output queue for processing
@@ -313,7 +329,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high'):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -321,10 +337,13 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp)
 
     output_filename = None
     webm_filename = None
+    gif_filename = None
+    apng_filename = None
+    webp_filename = None
 
     while True:
         flag, data = stream.output_queue.next()
@@ -332,10 +351,19 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
         if flag == 'file':
             output_filename = data
             webm_filename = os.path.splitext(output_filename)[0] + '.webm'
+            gif_filename = os.path.splitext(output_filename)[0] + '.gif'
+            apng_filename = os.path.splitext(output_filename)[0] + '.png'
+            webp_filename = os.path.splitext(output_filename)[0] + '.webp'
             
-            # Check if webm was created and exists
+            # Check if these files were created and exist
             if not os.path.exists(webm_filename):
                 webm_filename = None
+            if not os.path.exists(gif_filename):
+                gif_filename = None
+            if not os.path.exists(apng_filename):
+                apng_filename = None
+            if not os.path.exists(webp_filename):
+                webp_filename = None
                 
             # Select the appropriate video file based on quality setting
             video_file = output_filename
@@ -371,7 +399,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V2 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V3 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
@@ -399,12 +427,7 @@ with block:
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 
-                video_quality = gr.Radio(
-                    label="Video Quality",
-                    choices=["high", "medium", "low", "web_compatible"],
-                    value="high",
-                    info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility"
-                )
+
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -413,6 +436,18 @@ with block:
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+            video_quality = gr.Radio(
+                label="Video Quality",
+                choices=["high", "medium", "low", "web_compatible"],
+                value="high",
+                info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility"
+            )
+                
+            gr.Markdown("### Additional Export Formats")
+            gr.Markdown("Select additional formats to export alongside MP4:")
+            export_gif = gr.Checkbox(label="Export as GIF", value=False, info="Save animation as GIF (larger file size but widely compatible)")
+            export_apng = gr.Checkbox(label="Export as APNG", value=False, info="Save animation as Animated PNG (better quality than GIF but less compatible)")
+            export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP (good balance of quality and file size)")
     
     # Add JavaScript to show video information when loaded
     video_info_js = """
@@ -442,7 +477,7 @@ with block:
     
     block.load(None, js=video_info_js)
     
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
