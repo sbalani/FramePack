@@ -1161,8 +1161,6 @@ def get_available_drives():
 # Launch with dynamically detected drives
 block.launch(
     share=args.share,
-    server_name=args.server,
-    server_port=args.port,
     inbrowser=True,
     allowed_paths=get_available_drives()
 )
