@@ -129,6 +129,14 @@ for directory in [
     except Exception as e:
         print(f"Error creating directory {directory}: {str(e)}")
 
+# Add batch processing output folder
+outputs_batch_folder = os.path.join(outputs_folder, 'batch_outputs')
+try:
+    os.makedirs(outputs_batch_folder, exist_ok=True)
+    print(f"Created batch outputs directory: {outputs_batch_folder}")
+except Exception as e:
+    print(f"Error creating batch outputs directory: {str(e)}")
+
 def open_outputs_folder():
     """Opens the outputs folder in the file explorer/manager in a cross-platform way."""
     try:
@@ -156,6 +164,105 @@ def open_folder(folder_path):
     except Exception as e:
         return f"Error opening folder: {str(e)}"
 
+def print_supported_image_formats():
+    """Print information about supported image formats for batch processing."""
+    # List of extensions we handle
+    extensions = [
+        '.png', '.jpg', '.jpeg', '.bmp', '.webp', 
+        '.tif', '.tiff', '.gif', '.eps', '.ico',
+        '.ppm', '.pgm', '.pbm', '.tga', '.exr', '.dib'
+    ]
+    
+    # Check which formats PIL actually supports in this environment
+    supported_formats = []
+    unsupported_formats = []
+    
+    for ext in extensions:
+        format_name = ext[1:].upper()  # Remove dot and convert to uppercase
+        if format_name == 'JPG':
+            format_name = 'JPEG'  # PIL uses JPEG, not JPG
+        
+        try:
+            Image.init()
+            if format_name in Image.ID or format_name in Image.MIME:
+                supported_formats.append(ext)
+            else:
+                unsupported_formats.append(ext)
+        except:
+            unsupported_formats.append(ext)
+    
+    print("\nSupported image formats for batch processing:")
+    print(", ".join(supported_formats))
+    
+    if unsupported_formats:
+        print("\nUnsupported formats in this environment:")
+        print(", ".join(unsupported_formats))
+    
+    return supported_formats
+
+def get_images_from_folder(folder_path):
+    """Get all image files from a folder."""
+    if not folder_path or not os.path.exists(folder_path):
+        return []
+    
+    # Get dynamically supported image formats
+    image_extensions = print_supported_image_formats()
+    images = []
+    
+    for file in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file)
+        if os.path.isfile(file_path) and os.path.splitext(file)[1].lower() in image_extensions:
+            images.append(file_path)
+    
+    return sorted(images)
+
+def get_prompt_from_txt_file(image_path):
+    """Check for a matching txt file with the same name as the image and return its content as prompt."""
+    txt_path = os.path.splitext(image_path)[0] + '.txt'
+    if os.path.exists(txt_path):
+        try:
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception as e:
+            print(f"Error reading prompt file {txt_path}: {str(e)}")
+    return None
+
+def save_processing_metadata(output_path, metadata):
+    """Save processing metadata to a text file."""
+    metadata_path = os.path.splitext(output_path)[0] + '_metadata.txt'
+    try:
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            for key, value in metadata.items():
+                f.write(f"{key}: {value}\n")
+        return True
+    except Exception as e:
+        print(f"Error saving metadata to {metadata_path}: {str(e)}")
+        return False
+
+def move_and_rename_output_file(original_file, target_folder, original_image_filename):
+    """Move and rename the output file to match the input image filename."""
+    if not original_file or not os.path.exists(original_file):
+        return None
+    
+    # Get the original extension
+    ext = os.path.splitext(original_file)[1]
+    
+    # Create the new filename with the same name as the input image
+    new_filename = os.path.splitext(original_image_filename)[0] + ext
+    new_filepath = os.path.join(target_folder, new_filename)
+    
+    try:
+        # Ensure target directory exists
+        os.makedirs(os.path.dirname(new_filepath), exist_ok=True)
+        
+        # Copy instead of move to preserve the original in outputs folder
+        import shutil
+        shutil.copy2(original_file, new_filepath)
+        print(f"Saved output to {new_filepath}")
+        return new_filepath
+    except Exception as e:
+        print(f"Error moving/renaming file to {new_filepath}: {str(e)}")
+        return None
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1):
@@ -577,7 +684,7 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
     return
 
 
-def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False):
+def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -681,15 +788,190 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
             video_file = output_filename
             if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
                 video_file = webm_filename
+            
+            # Save metadata if enabled and we have a valid output file
+            if save_metadata and video_file:
+                metadata = {
+                    "Prompt": prompt,
+                    "Seed": current_seed,
+                    "TeaCache": "Enabled" if use_teacache else "Disabled",
+                    "Video Length (seconds)": total_second_length,
+                    "Steps": steps,
+                    "Distilled CFG Scale": gs
+                }
+                save_processing_metadata(video_file, metadata)
                 
             yield video_file, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
             break
+
+
+def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_random_seed, total_second_length, 
+                  latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, 
+                  video_quality='high', export_gif=False, export_apng=False, export_webp=False, 
+                  skip_existing=True, save_metadata=True):
+    global stream
+    
+    # Check input folder
+    if not input_folder or not os.path.exists(input_folder):
+        return None, f"Input folder does not exist: {input_folder}", "", "", gr.update(interactive=True), gr.update(interactive=False), seed, ""
+    
+    # Set default output folder if not provided
+    if not output_folder:
+        output_folder = outputs_batch_folder
+    else:
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+        except Exception as e:
+            return None, f"Error creating output folder: {str(e)}", "", "", gr.update(interactive=True), gr.update(interactive=False), seed, ""
+    
+    # Get all images from the input folder
+    image_files = get_images_from_folder(input_folder)
+    
+    if not image_files:
+        return None, f"No image files found in {input_folder}", "", "", gr.update(interactive=True), gr.update(interactive=False), seed, ""
+    
+    yield None, None, f"Found {len(image_files)} images to process", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+    
+    # Process each image
+    for idx, image_path in enumerate(image_files):
+        # Check if we should skip this file
+        output_filename = os.path.splitext(os.path.basename(image_path))[0] + ".mp4"
+        output_filepath = os.path.join(output_folder, output_filename)
+        
+        if skip_existing and os.path.exists(output_filepath):
+            print(f"Skipping {image_path} - output already exists: {output_filepath}")
+            yield None, None, f"Skipping {idx+1}/{len(image_files)}: {os.path.basename(image_path)} - already processed", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+            continue
+        
+        # Check for a custom prompt in a txt file
+        current_prompt = prompt
+        custom_prompt = get_prompt_from_txt_file(image_path)
+        if custom_prompt:
+            current_prompt = custom_prompt
+            print(f"Using custom prompt from txt file for {image_path}: {current_prompt}")
+        
+        # Reset the stream for this image
+        stream = AsyncStream()
+        
+        # Load the image
+        try:
+            # Open image and convert to RGB mode to ensure consistency 
+            # (some formats like RGBA PNG, CMYK TIFF, etc. need conversion)
+            img = Image.open(image_path)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            input_image = np.array(img)
+            
+            # Handle grayscale images that might be read as 2D arrays
+            if len(input_image.shape) == 2:
+                input_image = np.stack([input_image, input_image, input_image], axis=2)
+                
+            print(f"Loaded image {image_path} with shape {input_image.shape} and dtype {input_image.dtype}")
+        except Exception as e:
+            print(f"Error loading image {image_path}: {str(e)}")
+            yield None, None, f"Error processing {idx+1}/{len(image_files)}: {os.path.basename(image_path)} - {str(e)}", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+            continue
+        
+        # Generate a single video for this image (num_generations=1)
+        yield None, None, f"Processing {idx+1}/{len(image_files)}: {os.path.basename(image_path)}", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+        
+        # Start the worker
+        async_run(worker, input_image, current_prompt, n_prompt, seed, use_random_seed, 
+                 total_second_length, latent_window_size, steps, cfg, gs, rs, 
+                 gpu_memory_preservation, use_teacache, video_quality, export_gif, 
+                 export_apng, export_webp, num_generations=1)
+        
+        # Get the results
+        output_filename = None
+        current_seed = seed
+        last_output = None
+        all_outputs = {}  # To store all output files (mp4, gif, etc.)
+        
+        while True:
+            flag, data = stream.output_queue.next()
+            
+            if flag == 'seed_update':
+                current_seed = data
+                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, gr.update()
+            
+            if flag == 'file':
+                output_filename = data
+                
+                if output_filename:
+                    # Rename and move the file to the batch output folder
+                    image_filename = os.path.basename(image_path)
+                    moved_file = move_and_rename_output_file(output_filename, output_folder, image_filename)
+                    
+                    if moved_file:
+                        all_outputs['mp4'] = moved_file
+                        last_output = moved_file
+                    
+                    # Also handle other formats if enabled
+                    if export_gif:
+                        gif_filename = os.path.splitext(output_filename)[0] + '.gif'
+                        if os.path.exists(gif_filename):
+                            moved_gif = move_and_rename_output_file(gif_filename, output_folder, image_filename)
+                            if moved_gif:
+                                all_outputs['gif'] = moved_gif
+                    
+                    if export_apng:
+                        apng_filename = os.path.splitext(output_filename)[0] + '.png'
+                        if os.path.exists(apng_filename):
+                            moved_apng = move_and_rename_output_file(apng_filename, output_folder, image_filename)
+                            if moved_apng:
+                                all_outputs['apng'] = moved_apng
+                    
+                    if export_webp:
+                        webp_filename = os.path.splitext(output_filename)[0] + '.webp'
+                        if os.path.exists(webp_filename):
+                            moved_webp = move_and_rename_output_file(webp_filename, output_folder, image_filename)
+                            if moved_webp:
+                                all_outputs['webp'] = moved_webp
+                    
+                    # Also handle WebM format
+                    if video_quality == 'web_compatible':
+                        webm_filename = os.path.splitext(output_filename)[0] + '.webm'
+                        if os.path.exists(webm_filename):
+                            moved_webm = move_and_rename_output_file(webm_filename, output_folder, image_filename)
+                            if moved_webm:
+                                all_outputs['webm'] = moved_webm
+                                last_output = moved_webm
+            
+            if flag == 'progress':
+                preview, desc, html = data
+                current_progress = f"Processing {idx+1}/{len(image_files)}: {os.path.basename(image_path)}"
+                if desc:
+                    current_progress += f" - {desc}"
+                progress_html = html
+                if not progress_html:
+                    progress_html = make_progress_bar_html(0, f"Processing file {idx+1} of {len(image_files)}")
+                yield gr.update(), gr.update(visible=True, value=preview), current_progress, progress_html, gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+            
+            if flag == 'end':
+                # Save metadata if enabled
+                if save_metadata and last_output:
+                    metadata = {
+                        "Prompt": current_prompt,
+                        "Seed": current_seed,
+                        "TeaCache": "Enabled" if use_teacache else "Disabled",
+                        "Video Length (seconds)": total_second_length,
+                        "Steps": steps,
+                        "Distilled CFG Scale": gs
+                    }
+                    save_processing_metadata(last_output, metadata)
+                
+                yield last_output, gr.update(visible=False), f"Completed {idx+1}/{len(image_files)}: {os.path.basename(image_path)}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                break
+    
+    # All images processed
+    yield last_output, gr.update(visible=False), f"Batch processing complete. Processed {len(image_files)} images.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
 
 
 def end_process():
     print("\nSending end generation signal...")
     stream.input_queue.push('end')
     print("End signal sent. Waiting for generation to stop safely...")
+    return gr.update(interactive=True), gr.update(interactive=False)
 
 
 quick_prompts = [
@@ -701,17 +983,39 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V9 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V10 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
-            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
-            prompt = gr.Textbox(label="Prompt", value='')
-            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
-            example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
+            with gr.Tabs():
+                with gr.Tab("Single Image"):
+                    input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+                    prompt = gr.Textbox(label="Prompt", value='')
+                    example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
+                    example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
-            with gr.Row():
-                start_button = gr.Button(value="Start Generation",variant='primary')
-                end_button = gr.Button(value="End Generation", interactive=False)
+                    with gr.Row():
+                        save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
+
+                    with gr.Row():
+                        start_button = gr.Button(value="Start Generation", variant='primary')
+                        end_button = gr.Button(value="End Generation", interactive=False)
+
+                with gr.Tab("Batch Processing"):
+                    batch_input_folder = gr.Textbox(label="Input Folder Path", info="Folder containing images to process")
+                    batch_output_folder = gr.Textbox(label="Output Folder Path (optional)", info="Leave empty to use the default batch_outputs folder")
+                    batch_prompt = gr.Textbox(label="Default Prompt", value='', info="Used if no matching .txt file exists")
+                    
+                    with gr.Row():
+                        batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip files that already exist in the output folder")
+                        batch_save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
+                    
+                    with gr.Row():
+                        batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
+                        batch_end_button = gr.Button(value="End Processing", interactive=False)
+                    
+                    with gr.Row():
+                        open_batch_input_folder = gr.Button(value="Open Input Folder")
+                        open_batch_output_folder = gr.Button(value="Open Output Folder")
 
             with gr.Group():
                 # Add number of generations slider
@@ -753,6 +1057,7 @@ with block:
             gr.Markdown("### Folder Options")
             with gr.Row():
                 open_outputs_btn = gr.Button(value="Open Generations Folder")
+                open_batch_outputs_btn = gr.Button(value="Open Batch Outputs Folder")
             
             video_quality = gr.Radio(
                 label="Video Quality",
@@ -796,15 +1101,75 @@ with block:
     block.load(None, js=video_info_js)
     
     # Update inputs list to include new parameters
-    ips = [input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp]
+    ips = [input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
-    end_button.click(fn=end_process)
+    end_button.click(fn=end_process, outputs=[start_button, end_button])
     
     # Connect folder buttons
     open_outputs_btn.click(fn=lambda: open_folder(outputs_folder), outputs=gr.Text(visible=False))
+    open_batch_outputs_btn.click(fn=lambda: open_folder(outputs_batch_folder), outputs=gr.Text(visible=False))
+    
+    # Connect batch processing buttons
+    batch_input_folder_text = gr.Text(visible=False)
+    batch_output_folder_text = gr.Text(visible=False)
+    
+    open_batch_input_folder.click(fn=lambda x: open_folder(x) if x else "No input folder specified", 
+                                 inputs=[batch_input_folder], 
+                                 outputs=[batch_input_folder_text])
+    
+    open_batch_output_folder.click(fn=lambda x: open_folder(x if x else outputs_batch_folder), 
+                                   inputs=[batch_output_folder], 
+                                   outputs=[batch_output_folder_text])
+    
+    # Connect batch processing start and end buttons
+    batch_ips = [batch_input_folder, batch_output_folder, batch_prompt, n_prompt, seed, use_random_seed, 
+                total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
+                use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing, 
+                batch_save_metadata]
+    
+    batch_start_button.click(fn=batch_process, inputs=batch_ips, 
+                            outputs=[result_video, preview_image, progress_desc, progress_bar, 
+                                     batch_start_button, batch_end_button, seed, timing_display])
+    
+    batch_end_button.click(fn=end_process, outputs=[batch_start_button, batch_end_button])
 
 
+def get_available_drives():
+    """Detect available drives on the system regardless of OS"""
+    available_paths = []
+    
+    if platform.system() == "Windows":
+        import string
+        from ctypes import windll
+        
+        # Check each drive letter
+        drives = []
+        bitmask = windll.kernel32.GetLogicalDrives()
+        for letter in string.ascii_uppercase:
+            if bitmask & 1:
+                drives.append(f"{letter}:/")
+            bitmask >>= 1
+            
+        available_paths = drives
+    else:
+        # For Linux/Mac, just use root
+        available_paths = ["/"]
+        
+    print(f"Available drives detected: {available_paths}")
+    return available_paths
+
+# Launch with dynamically detected drives
 block.launch(
     share=args.share,
-    inbrowser=True
+    server_name=args.server,
+    server_port=args.port,
+    inbrowser=True,
+    allowed_paths=get_available_drives()
 )
+
+# Print supported image formats at startup for user reference
+print("\n=== BATCH PROCESSING INFORMATION ===")
+print_supported_image_formats()
+print("Place text files with the same name as image files to use as custom prompts.")
+print("For example: image1.png and image1.txt for a custom prompt for image1.png")
+print("===================================\n")
