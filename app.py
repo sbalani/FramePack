@@ -6,6 +6,8 @@ import platform
 import random
 import time  # Add time module for duration tracking
 
+# Add this line to handle HF download errors
+os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 import gradio as gr
@@ -270,7 +272,7 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     current_seed = seed
-    all_outputs = []
+    all_outputs = {}
     last_used_seed = seed
     
     # Timing variables
@@ -581,6 +583,31 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     output_filename = None
                     webm_output_filename = None
 
+                # Save metadata for final outputs if enabled and this is the last section
+                if save_metadata and is_last_section:
+                    metadata = {
+                        "Prompt": prompt,
+                        "Seed": current_seed,
+                        "TeaCache": "Enabled" if use_teacache else "Disabled",
+                        "Video Length (seconds)": total_second_length,
+                        "Steps": steps,
+                        "Distilled CFG Scale": gs
+                    }
+                    save_processing_metadata(output_filename, metadata)
+                    
+                    # Also save metadata for other formats if they were exported
+                    if export_gif and os.path.exists(os.path.splitext(output_filename)[0] + '.gif'):
+                        save_processing_metadata(os.path.splitext(output_filename)[0] + '.gif', metadata)
+                    
+                    if export_apng and os.path.exists(os.path.splitext(output_filename)[0] + '.png'):
+                        save_processing_metadata(os.path.splitext(output_filename)[0] + '.png', metadata)
+                        
+                    if export_webp and os.path.exists(os.path.splitext(output_filename)[0] + '.webp'):
+                        save_processing_metadata(os.path.splitext(output_filename)[0] + '.webp', metadata)
+                        
+                    if video_quality == 'web_compatible' and os.path.exists(webm_output_filename):
+                        save_processing_metadata(webm_output_filename, metadata)
+
                 # Save in additional formats if requested
                 if export_gif:
                     if is_intermediate:
@@ -701,6 +728,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
     webp_filename = None
     current_seed = seed
     timing_info = ""
+    last_output = None  # Initialize last_output
 
     while True:
         flag, data = stream.output_queue.next()
@@ -740,6 +768,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
                 yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
                 continue
                 
+            last_output = output_filename  # Update last_output
             base_name = os.path.basename(output_filename)
             base_name_no_ext = os.path.splitext(base_name)[0]
             
@@ -773,11 +802,19 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
                 webp_filename = None
                 
             # Select the appropriate video file based on quality setting
-            video_file = output_filename
-            if video_quality == 'web_compatible' and webm_filename:
+            video_file = output_filename if output_filename is not None else None
+            if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
                 video_file = webm_filename
+            
+            # Metadata is now saved in the worker function
+            # This removes duplicate code and ensures metadata is only saved for final outputs
                 
-            yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
+            if video_file:
+                last_output = video_file  # Ensure last_output is updated
+            
+            # Use video_file directly to avoid referencing last_output if it's not defined
+            yield video_file, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+            break
 
         if flag == 'progress':
             preview, desc, html = data
@@ -785,30 +822,25 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
 
         if flag == 'end':
             # Select the appropriate video file based on quality setting
-            video_file = output_filename
+            video_file = output_filename if output_filename is not None else None
             if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
                 video_file = webm_filename
             
-            # Save metadata if enabled and we have a valid output file
-            if save_metadata and video_file:
-                metadata = {
-                    "Prompt": prompt,
-                    "Seed": current_seed,
-                    "TeaCache": "Enabled" if use_teacache else "Disabled",
-                    "Video Length (seconds)": total_second_length,
-                    "Steps": steps,
-                    "Distilled CFG Scale": gs
-                }
-                save_processing_metadata(video_file, metadata)
+            # Metadata is now saved in the worker function
+            # This removes duplicate code and ensures metadata is only saved for final outputs
                 
-            yield video_file, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+            if video_file:
+                last_output = video_file  # Ensure last_output is updated
+            
+            # Use video_file directly to avoid referencing last_output if it's not defined
+            yield video_file, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
             break
 
 
 def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_random_seed, total_second_length, 
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, 
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False, 
-                  skip_existing=True, save_metadata=True):
+                  skip_existing=True, save_metadata=True, num_generations=1):
     global stream
     
     # Check input folder
@@ -872,14 +904,14 @@ def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_rando
             yield None, None, f"Error processing {idx+1}/{len(image_files)}: {os.path.basename(image_path)} - {str(e)}", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
             continue
         
-        # Generate a single video for this image (num_generations=1)
-        yield None, None, f"Processing {idx+1}/{len(image_files)}: {os.path.basename(image_path)}", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+        # Generate video(s) for this image using the specified number of generations
+        yield None, None, f"Processing {idx+1}/{len(image_files)}: {os.path.basename(image_path)} with {num_generations} generation(s)", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
         
         # Start the worker
         async_run(worker, input_image, current_prompt, n_prompt, seed, use_random_seed, 
                  total_second_length, latent_window_size, steps, cfg, gs, rs, 
                  gpu_memory_preservation, use_teacache, video_quality, export_gif, 
-                 export_apng, export_webp, num_generations=1)
+                 export_apng, export_webp, num_generations=num_generations)
         
         # Get the results
         output_filename = None
@@ -898,44 +930,89 @@ def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_rando
                 output_filename = data
                 
                 if output_filename:
-                    # Rename and move the file to the batch output folder
-                    image_filename = os.path.basename(image_path)
-                    moved_file = move_and_rename_output_file(output_filename, output_folder, image_filename)
+                    # Check if this is an intermediate generation (not the final output)
+                    is_intermediate = 'intermediate' in output_filename
                     
-                    if moved_file:
-                        all_outputs['mp4'] = moved_file
-                        last_output = moved_file
-                    
-                    # Also handle other formats if enabled
-                    if export_gif:
-                        gif_filename = os.path.splitext(output_filename)[0] + '.gif'
-                        if os.path.exists(gif_filename):
-                            moved_gif = move_and_rename_output_file(gif_filename, output_folder, image_filename)
-                            if moved_gif:
-                                all_outputs['gif'] = moved_gif
-                    
-                    if export_apng:
-                        apng_filename = os.path.splitext(output_filename)[0] + '.png'
-                        if os.path.exists(apng_filename):
-                            moved_apng = move_and_rename_output_file(apng_filename, output_folder, image_filename)
-                            if moved_apng:
-                                all_outputs['apng'] = moved_apng
-                    
-                    if export_webp:
-                        webp_filename = os.path.splitext(output_filename)[0] + '.webp'
-                        if os.path.exists(webp_filename):
-                            moved_webp = move_and_rename_output_file(webp_filename, output_folder, image_filename)
-                            if moved_webp:
-                                all_outputs['webp'] = moved_webp
-                    
-                    # Also handle WebM format
-                    if video_quality == 'web_compatible':
-                        webm_filename = os.path.splitext(output_filename)[0] + '.webm'
-                        if os.path.exists(webm_filename):
-                            moved_webm = move_and_rename_output_file(webm_filename, output_folder, image_filename)
-                            if moved_webm:
-                                all_outputs['webm'] = moved_webm
-                                last_output = moved_webm
+                    # Only process final outputs for batch folder
+                    if not is_intermediate:
+                        # Rename and move the file to the batch output folder
+                        image_filename = os.path.basename(image_path)
+                        
+                        # Track which generation number we're on by checking how many outputs we've already collected
+                        generation_count = len([k for k in all_outputs.keys() if k.startswith('mp4')])
+                        
+                        # Add suffix for generation count if generating multiple videos per image
+                        if num_generations > 1:
+                            # For the base name, add a suffix like _1, _2, etc.
+                            base_name = os.path.splitext(image_filename)[0]
+                            ext = os.path.splitext(image_filename)[1]
+                            # Generation count is 0-based in our tracking, but display as 1-based
+                            suffix = f"_{generation_count + 1}" 
+                            modified_image_filename = f"{base_name}{suffix}{ext}"
+                        else:
+                            modified_image_filename = image_filename
+                        
+                        moved_file = move_and_rename_output_file(output_filename, output_folder, modified_image_filename)
+                        
+                        if moved_file:
+                            output_key = f'mp4_{generation_count}' if num_generations > 1 else 'mp4'
+                            all_outputs[output_key] = moved_file
+                            last_output = moved_file
+                            
+                            # Save metadata for this generation right after moving the file
+                            if save_metadata:
+                                metadata = {
+                                    "Prompt": current_prompt,
+                                    "Seed": current_seed,
+                                    "TeaCache": "Enabled" if use_teacache else "Disabled",
+                                    "Video Length (seconds)": total_second_length,
+                                    "Steps": steps,
+                                    "Distilled CFG Scale": gs
+                                }
+                                save_processing_metadata(moved_file, metadata)
+                        
+                        # Also handle other formats if enabled
+                        if export_gif:
+                            gif_filename = os.path.splitext(output_filename)[0] + '.gif'
+                            if os.path.exists(gif_filename):
+                                moved_gif = move_and_rename_output_file(gif_filename, output_folder, modified_image_filename)
+                                if moved_gif and save_metadata:
+                                    gif_key = f'gif_{generation_count}' if num_generations > 1 else 'gif'
+                                    all_outputs[gif_key] = moved_gif
+                                    # Save metadata for the GIF file
+                                    save_processing_metadata(moved_gif, metadata)
+                        
+                        if export_apng:
+                            apng_filename = os.path.splitext(output_filename)[0] + '.png'
+                            if os.path.exists(apng_filename):
+                                moved_apng = move_and_rename_output_file(apng_filename, output_folder, modified_image_filename)
+                                if moved_apng and save_metadata:
+                                    apng_key = f'apng_{generation_count}' if num_generations > 1 else 'apng'
+                                    all_outputs[apng_key] = moved_apng
+                                    # Save metadata for the APNG file
+                                    save_processing_metadata(moved_apng, metadata)
+                        
+                        if export_webp:
+                            webp_filename = os.path.splitext(output_filename)[0] + '.webp'
+                            if os.path.exists(webp_filename):
+                                moved_webp = move_and_rename_output_file(webp_filename, output_folder, modified_image_filename)
+                                if moved_webp and save_metadata:
+                                    webp_key = f'webp_{generation_count}' if num_generations > 1 else 'webp'
+                                    all_outputs[webp_key] = moved_webp
+                                    # Save metadata for the WebP file
+                                    save_processing_metadata(moved_webp, metadata)
+                        
+                        # Also handle WebM format
+                        if video_quality == 'web_compatible':
+                            webm_filename = os.path.splitext(output_filename)[0] + '.webm'
+                            if os.path.exists(webm_filename):
+                                moved_webm = move_and_rename_output_file(webm_filename, output_folder, modified_image_filename)
+                                if moved_webm and save_metadata:
+                                    webm_key = f'webm_{generation_count}' if num_generations > 1 else 'webm'
+                                    all_outputs[webm_key] = moved_webm
+                                    # Save metadata for the WebM file
+                                    save_processing_metadata(moved_webm, metadata)
+                                    last_output = moved_webm
             
             if flag == 'progress':
                 preview, desc, html = data
@@ -948,18 +1025,7 @@ def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_rando
                 yield gr.update(), gr.update(visible=True, value=preview), current_progress, progress_html, gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
             
             if flag == 'end':
-                # Save metadata if enabled
-                if save_metadata and last_output:
-                    metadata = {
-                        "Prompt": current_prompt,
-                        "Seed": current_seed,
-                        "TeaCache": "Enabled" if use_teacache else "Disabled",
-                        "Video Length (seconds)": total_second_length,
-                        "Steps": steps,
-                        "Distilled CFG Scale": gs
-                    }
-                    save_processing_metadata(last_output, metadata)
-                
+                # All processing for this image is complete
                 yield last_output, gr.update(visible=False), f"Completed {idx+1}/{len(image_files)}: {os.path.basename(image_path)}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
                 break
     
@@ -983,7 +1049,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V11 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V12 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1125,7 +1191,7 @@ with block:
     batch_ips = [batch_input_folder, batch_output_folder, batch_prompt, n_prompt, seed, use_random_seed, 
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
                 use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing, 
-                batch_save_metadata]
+                batch_save_metadata, num_generations]
     
     batch_start_button.click(fn=batch_process, inputs=batch_ips, 
                             outputs=[result_video, preview_image, progress_desc, progress_bar, 
