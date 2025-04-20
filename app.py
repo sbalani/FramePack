@@ -624,6 +624,19 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     transformer.to(gpu)
                     current_transformer = load_lora(transformer, lora_path, lora_name)
                     
+                    # Ensure all LoRA adapters are on the GPU
+                    print("Verifying all LoRA components are on GPU...")
+                    for name, module in transformer.named_modules():
+                        if 'lora_' in name.lower():
+                            module.to(gpu)
+                    
+                    # Check parameters device placement
+                    for name, param in transformer.named_parameters():
+                        if 'lora' in name.lower():
+                            if param.device.type != 'cuda':
+                                print(f"Force moving LoRA parameter {name} from {param.device} to {gpu}")
+                                param.data = param.data.to(gpu)
+                    
                     # Apply LoRA scale if different from 1.0
                     if lora_scale != 1.0:
                         print("LoRA scale not working at the moment")
@@ -688,6 +701,18 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                 if not high_vram:
                     unload_complete_models()
                     move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                    
+                    # Ensure LoRA layers are on the correct device
+                    if using_lora:
+                        print("Ensuring LoRA adapters are on correct device (cuda:0)...")
+                        # Move all LoRA adapter parameters to GPU
+                        for name, module in transformer.named_modules():
+                            if 'lora_' in name.lower():
+                                try:
+                                    module.to(gpu)
+                                    #print(f"Moved LoRA module {name} to GPU")
+                                except Exception as e:
+                                    print(f"Error moving LoRA module {name}: {str(e)}")
 
                 if use_teacache:
                     transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -754,6 +779,19 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     return
 
                 try:
+                    # Ensure all tensors used in sampling are on the same device before sampling
+                    if using_lora:
+                        print("Final device check for all tensors before sampling...")
+                        # Verify critical tensors are on GPU
+                        devices_found = set()
+                        for name, param in transformer.named_parameters():
+                            if param.requires_grad or 'lora' in name.lower():
+                                devices_found.add(str(param.device))
+                                if param.device.type != 'cuda':
+                                    print(f"Moving {name} from {param.device} to {gpu}")
+                                    param.data = param.data.to(gpu)
+                        print(f"Devices found for parameters: {devices_found}")
+                    
                     generated_latents = sample_hunyuan(
                         transformer=transformer,
                         sampler='unipc',
@@ -900,6 +938,13 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                         "Generation Time": generation_time_formatted,
                         "Total Seconds": f"{generation_time_seconds} seconds"
                     }
+                    
+                    # Add LoRA information if applicable
+                    if selected_lora != "none":
+                        lora_name = os.path.basename(selected_lora)
+                        metadata["LoRA"] = lora_name
+                        metadata["LoRA Scale"] = lora_scale
+                    
                     save_processing_metadata(output_filename, metadata)
                     
                     # Also save metadata for other formats if they were exported
@@ -1362,6 +1407,13 @@ def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_rando
                                     "Generation Time": generation_time_formatted,
                                     "Total Seconds": f"{generation_time_seconds} seconds" if generation_time_seconds else "Unknown"
                                 }
+                                
+                                # Add LoRA information if applicable
+                                if lora_path != "none":
+                                    lora_name = os.path.basename(lora_path)
+                                    metadata["LoRA"] = lora_name
+                                    metadata["LoRA Scale"] = lora_scale
+                                
                                 save_processing_metadata(moved_file, metadata)
                     # Display intermediate videos too (even though we don't move them to batch folder)
                     else:
@@ -1452,7 +1504,7 @@ def end_process():
 
 
 quick_prompts = [
-    'A character doing some simple body movements.','An epic fantasy animation capturing a dramatic confrontation in a swirling desert sandstorm. A heavily armored warrior, helmeted and with a flowing cape, charges or braces himself against a colossal, terrifying monster emerging from the sand. The monster, resembling a golem made of rock and sand, has a skull-like face with a gaping maw filled with sharp teeth. Sand and dust blow violently around both figures, creating a chaotic and intense atmosphere. The warriors cape billows wildly. The monster looms large, possibly roaring or shifting slightly as sand particles constantly stream off its form. Focus on dynamic movement, swirling sand effects, cinematic lighting, and hyperrealistic textures. High detail, fantasy art style.'
+    'A character doing some simple body movements.','A talking man.'
 ]
 quick_prompts = [[x] for x in quick_prompts]
 
