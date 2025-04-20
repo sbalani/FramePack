@@ -39,8 +39,6 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
-parser.add_argument("--server", type=str, default='0.0.0.0')
-parser.add_argument("--port", type=int, default=7860)
 args = parser.parse_args()
 
 print(args)
@@ -231,7 +229,9 @@ def get_prompt_from_txt_file(image_path):
     if os.path.exists(txt_path):
         try:
             with open(txt_path, 'r', encoding='utf-8') as f:
-                return f.read().strip()
+                # Return raw content with newlines preserved, don't strip() the whole content
+                content = f.read()
+                return content.rstrip()  # Just remove trailing whitespace but keep newlines
         except Exception as e:
             print(f"Error reading prompt file {txt_path}: {str(e)}")
     return None
@@ -1049,95 +1049,139 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
 
 # Modified process function signature
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True):
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False):
     global stream
     assert input_image is not None, 'No start input image!' # Changed assertion message
 
     lora_path = get_lora_path_from_name(selected_lora)
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
 
-    stream = AsyncStream()
-
-    # Pass end_image to worker
-    async_run(worker, input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora)
-
-    output_filename = None
-    webm_filename = None
-    gif_filename = None
-    apng_filename = None
-    webp_filename = None
-    current_seed = seed
-    timing_info = ""
-    last_output = None
+    # Process multi-line prompts if enabled
+    if use_multiline_prompts and prompt.strip():
+        # Split prompt by lines, filter empty lines and very short prompts (less than 2 chars)
+        prompt_lines = [line.strip() for line in prompt.split('\n')]
+        prompt_lines = [line for line in prompt_lines if len(line) >= 2]
+        
+        if not prompt_lines:
+            # If no valid prompts after filtering, use the original prompt
+            prompt_lines = [prompt.strip()]
+    else:
+        # Use the regular prompt as a single line
+        prompt_lines = [prompt.strip()]
+    
+    total_prompts = len(prompt_lines)
+    print(f"Processing {total_prompts} prompt(s)")
+    
     final_video = None
+    
+    # Loop through each prompt
+    for prompt_idx, current_prompt in enumerate(prompt_lines):
+        stream = AsyncStream()
+        
+        print(f"Processing prompt {prompt_idx+1}/{total_prompts}: {current_prompt}")
+        yield None, None, f"Processing prompt {prompt_idx+1}/{total_prompts}", '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
+        
+        # Pass current prompt to worker
+        async_run(worker, input_image, end_image, current_prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora)
 
-    while True:
-        flag, data = stream.output_queue.next()
+        output_filename = None
+        webm_filename = None
+        gif_filename = None
+        apng_filename = None
+        webp_filename = None
+        current_seed = seed
+        timing_info = ""
+        last_output = None
 
-        if flag == 'seed_update':
-            current_seed = data
-            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
+        while True:
+            flag, data = stream.output_queue.next()
 
-        if flag == 'final_seed':
-            current_seed = data
+            if flag == 'seed_update':
+                current_seed = data
+                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
 
-        if flag == 'timing':
-            gen_time = data['gen_time']
-            avg_time = data['avg_time']
-            remaining_time = data['remaining_time']
-            eta_str = f"{remaining_time/60:.1f} minutes" if remaining_time > 60 else f"{remaining_time:.1f} seconds"
-            timing_info = f"Last generation: {gen_time:.2f}s | Average: {avg_time:.2f}s | ETA: {eta_str}"
-            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
+            if flag == 'final_seed':
+                current_seed = data
 
-        if flag == 'final_timing':
-            total_time = data['total_time']
-            timing_info = f"Total generation time: {total_time:.2f}s ({total_time/60:.2f} min)"
-            yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
+            if flag == 'timing':
+                gen_time = data['gen_time']
+                avg_time = data['avg_time']
+                remaining_time = data['remaining_time']
+                eta_str = f"{remaining_time/60:.1f} minutes" if remaining_time > 60 else f"{remaining_time:.1f} seconds"
+                timing_info = f"Last generation: {gen_time:.2f}s | Average: {avg_time:.2f}s | ETA: {eta_str}"
+                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
 
-        if flag == 'file':
-            output_filename = data
-            if output_filename is None:
-                print("Warning: No output file was generated due to an error")
-                yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
-                continue
+            if flag == 'final_timing':
+                total_time = data['total_time']
+                timing_info = f"Total generation time: {total_time:.2f}s ({total_time/60:.2f} min)"
+                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
 
-            last_output = output_filename
-            base_name = os.path.basename(output_filename)
-            base_name_no_ext = os.path.splitext(base_name)[0]
-            is_intermediate = 'intermediate' in output_filename
+            if flag == 'file':
+                output_filename = data
+                if output_filename is None:
+                    print("Warning: No output file was generated due to an error")
+                    yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
+                    continue
 
-            if is_intermediate:
-                webm_filename = os.path.join(intermediate_webm_videos_folder, f"{base_name_no_ext}.webm")
-                gif_filename = os.path.join(intermediate_gif_videos_folder, f"{base_name_no_ext}.gif")
-                apng_filename = os.path.join(intermediate_apng_videos_folder, f"{base_name_no_ext}.png")
-                webp_filename = os.path.join(intermediate_webp_videos_folder, f"{base_name_no_ext}.webp")
-            else:
-                webm_filename = os.path.join(webm_videos_folder, f"{base_name_no_ext}.webm")
-                gif_filename = os.path.join(gif_videos_folder, f"{base_name_no_ext}.gif")
-                apng_filename = os.path.join(apng_videos_folder, f"{base_name_no_ext}.png")
-                webp_filename = os.path.join(webp_videos_folder, f"{base_name_no_ext}.webp")
+                last_output = output_filename
+                final_video = output_filename  # Update final video with the latest output
+                base_name = os.path.basename(output_filename)
+                base_name_no_ext = os.path.splitext(base_name)[0]
+                is_intermediate = 'intermediate' in output_filename
 
-            if not os.path.exists(webm_filename): webm_filename = None
-            if not os.path.exists(gif_filename): gif_filename = None
-            if not os.path.exists(apng_filename): apng_filename = None
-            if not os.path.exists(webp_filename): webp_filename = None
+                if is_intermediate:
+                    webm_filename = os.path.join(intermediate_webm_videos_folder, f"{base_name_no_ext}.webm")
+                    gif_filename = os.path.join(intermediate_gif_videos_folder, f"{base_name_no_ext}.gif")
+                    apng_filename = os.path.join(intermediate_apng_videos_folder, f"{base_name_no_ext}.png")
+                    webp_filename = os.path.join(intermediate_webp_videos_folder, f"{base_name_no_ext}.webp")
+                else:
+                    webm_filename = os.path.join(webm_videos_folder, f"{base_name_no_ext}.webm")
+                    gif_filename = os.path.join(gif_videos_folder, f"{base_name_no_ext}.gif")
+                    apng_filename = os.path.join(apng_videos_folder, f"{base_name_no_ext}.png")
+                    webp_filename = os.path.join(webp_videos_folder, f"{base_name_no_ext}.webp")
 
-            video_file = output_filename if output_filename is not None else None
-            if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
-                video_file = webm_filename
+                if not os.path.exists(webm_filename): webm_filename = None
+                if not os.path.exists(gif_filename): gif_filename = None
+                if not os.path.exists(apng_filename): apng_filename = None
+                if not os.path.exists(webp_filename): webp_filename = None
 
-            yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
+                video_file = output_filename if output_filename is not None else None
+                if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
+                    video_file = webm_filename
 
-            if video_file and not is_intermediate:
-                final_video = video_file
+                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts})" if use_multiline_prompts else ""
+                yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info + prompt_info
 
-        if flag == 'progress':
-            preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
+            if flag == 'progress':
+                preview, desc, html = data
+                
+                # Add prompt info to progress display if using multi-line prompts
+                if use_multiline_prompts:
+                    if html:
+                        # Extract the existing hint from html if possible
+                        import re
+                        hint_match = re.search(r'>(.*?)<br', html)
+                        if hint_match:
+                            hint = hint_match.group(1)
+                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts}: {current_prompt[:30]}{'...' if len(current_prompt) > 30 else ''})"
+                            html = html.replace(hint, new_hint)
+                    
+                    # Add prompt info to the description
+                    if desc:
+                        desc += f" (Prompt {prompt_idx+1}/{total_prompts})"
+                        
+                yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
 
-        if flag == 'end':
-            yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
-            break
+            if flag == 'end':
+                if prompt_idx == len(prompt_lines) - 1:  # If this is the last prompt
+                    yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+                else:
+                    # For intermediate prompts, keep the UI in generation mode
+                    yield final_video, gr.update(visible=False), f"Completed prompt {prompt_idx+1}/{total_prompts}", '', gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
+                break
+
+    # Only reach this point if all prompts are processed
+    yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
 
 
 # Modified batch_process function signature
@@ -1145,7 +1189,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache,
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
-                  selected_lora="None", lora_scale=1.0, convert_lora=True):
+                  selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False):
     global stream
 
     lora_path = get_lora_path_from_name(selected_lora)
@@ -1176,18 +1220,57 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
     for idx, image_path in enumerate(image_files):
         start_image_basename = os.path.basename(image_path)
         output_filename_base = os.path.splitext(start_image_basename)[0]
-        output_filepath_mp4 = os.path.join(output_folder, f"{output_filename_base}{'_1' if num_generations > 1 else ''}.mp4") # Check first generation only
-
-        if skip_existing and os.path.exists(output_filepath_mp4):
-            print(f"Skipping {image_path} - output already exists: {output_filepath_mp4}")
-            yield None, None, f"Skipping {idx+1}/{len(image_files)}: {start_image_basename} - already processed", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
-            continue
-
+        
+        # Get prompt lines before checking skip_existing
         current_prompt = prompt
         custom_prompt = get_prompt_from_txt_file(image_path)
         if custom_prompt:
             current_prompt = custom_prompt
             print(f"Using custom prompt from txt file for {image_path}: {current_prompt}")
+
+        # Process multi-line prompts if enabled
+        if batch_use_multiline_prompts and current_prompt.strip():
+            # Split prompt by lines using splitlines() for robustness, filter empty/short lines
+            prompt_lines = [line.strip() for line in current_prompt.splitlines()]
+            prompt_lines = [line for line in prompt_lines if len(line.strip()) >= 2]
+            
+            if not prompt_lines:
+                # If no valid prompts after filtering, use the original prompt as one line
+                prompt_lines = [current_prompt.strip()]
+        else:
+            # Use the regular prompt as a single line
+            prompt_lines = [current_prompt.strip()]
+        
+        total_prompts = len(prompt_lines)
+        print(f"DEBUG: Detected prompts: {prompt_lines}")
+        print(f"Processing {total_prompts} prompt(s) for image {idx+1}/{len(image_files)}")
+        
+        # Skip check should look for all expected files when multi-line prompts are enabled
+        skip_this_image = False
+        if skip_existing:
+            if batch_use_multiline_prompts:
+                # Check if all generations for all prompt lines exist
+                all_expected_files_exist = True
+                for p_idx in range(total_prompts):
+                    for g_idx in range(1, num_generations + 1):
+                        # Use consistent naming with both prompt and generation indices
+                        suffix = f"_p{p_idx+1}_g{g_idx}" if num_generations > 1 else f"_p{p_idx+1}"
+                        output_check_path = os.path.join(output_folder, f"{output_filename_base}{suffix}.mp4")
+                        if not os.path.exists(output_check_path):
+                            all_expected_files_exist = False
+                            break
+                    if not all_expected_files_exist:
+                        break
+                skip_this_image = all_expected_files_exist
+            else:
+                # Original check for single prompt
+                output_filepath_mp4 = os.path.join(output_folder, f"{output_filename_base}{'_1' if num_generations > 1 else ''}.mp4")
+                skip_this_image = os.path.exists(output_filepath_mp4)
+        
+        if skip_this_image:
+            print(f"Skipping {image_path} - output already exists")
+            yield None, None, f"Skipping {idx+1}/{len(image_files)}: {start_image_basename} - already processed", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+            continue
 
         # Load start image
         try:
@@ -1219,114 +1302,162 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             else:
                  print(f"No matching end frame found for {start_image_basename} in {batch_end_frame_folder}")
 
+        # Loop through each prompt
+        for prompt_idx, prompt_line in enumerate(prompt_lines):
+            # Reset generation counter for each prompt line
+            generation_count_for_image = 0
+            # Reset current_seed for each prompt line (important to maintain deterministic behavior)
+            if use_random_seed:
+                # Get a new random seed for each prompt line
+                current_seed = random.randint(1, 2147483647)
+                # Update UI with new seed
+                yield None, None, f"Using new random seed {current_seed} for prompt {prompt_idx+1}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, ""
+            
+            prompt_info = ""
+            if batch_use_multiline_prompts:
+                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts}: {prompt_line[:30]}{'...' if len(prompt_line) > 30 else ''})"
+                
+            yield None, None, f"Processing {idx+1}/{len(image_files)}: {start_image_basename} (End: {os.path.basename(end_image_path_str) if current_end_image is not None else 'No'}) with {num_generations} generation(s){prompt_info}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, ""
 
-        yield None, None, f"Processing {idx+1}/{len(image_files)}: {start_image_basename} (End: {os.path.basename(end_image_path_str) if current_end_image is not None else 'No'}) with {num_generations} generation(s)", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+            gen_start_time_batch = time.time() # Track start time for metadata
 
-        gen_start_time_batch = time.time() # Track start time for metadata
+            # Reset stream and run worker
+            stream = AsyncStream()
+            async_run(worker, input_image, current_end_image, prompt_line, n_prompt, current_seed, use_random_seed,
+                    total_second_length, latent_window_size, steps, cfg, gs, rs,
+                    gpu_memory_preservation, use_teacache, video_quality, export_gif,
+                    export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
+                    selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora)
 
-        # Reset stream and run worker
-        stream = AsyncStream()
-        async_run(worker, input_image, current_end_image, current_prompt, n_prompt, seed, use_random_seed,
-                 total_second_length, latent_window_size, steps, cfg, gs, rs,
-                 gpu_memory_preservation, use_teacache, video_quality, export_gif,
-                 export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
-                 selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora)
+            output_filename = None
+            last_output = None
+            all_outputs = {}
 
-        output_filename = None
-        last_output = None
-        all_outputs = {}
-        generation_count_for_image = 0 # Track generations for this specific image
+            while True:
+                flag, data = stream.output_queue.next()
 
-        while True:
-            flag, data = stream.output_queue.next()
+                if flag == 'seed_update':
+                    current_seed = data
+                    yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, gr.update()
 
-            if flag == 'seed_update':
-                current_seed = data
-                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, gr.update()
+                if flag == 'file':
+                    output_filename = data
+                    if output_filename:
+                        is_intermediate = 'intermediate' in output_filename
+                        if not is_intermediate:
+                            generation_count_for_image += 1 # Increment only for final outputs
+                            
+                            # Add prompt index to the suffix if using multi-line prompts
+                            if batch_use_multiline_prompts:
+                                # Always use both prompt index and generation index for consistency
+                                suffix = f"_p{prompt_idx+1}_g{generation_count_for_image}" if num_generations > 1 else f"_p{prompt_idx+1}"
+                            else:
+                                suffix = f"_{generation_count_for_image}" if num_generations > 1 else ""
+                            
+                            # Calculate the base name using the determined suffix AFTER the if/else
+                            modified_image_filename_base = f"{output_filename_base}{suffix}"
 
-            if flag == 'file':
-                output_filename = data
-                if output_filename:
-                    is_intermediate = 'intermediate' in output_filename
-                    if not is_intermediate:
-                        generation_count_for_image += 1 # Increment only for final outputs
-                        suffix = f"_{generation_count_for_image}" if num_generations > 1 else ""
-                        modified_image_filename_base = f"{output_filename_base}{suffix}"
+                            # Move MP4
+                            moved_file = move_and_rename_output_file(output_filename, output_folder, f"{modified_image_filename_base}.mp4")
+                            if moved_file:
+                                output_key = f'mp4_{generation_count_for_image}' if num_generations > 1 else 'mp4'
+                                all_outputs[output_key] = moved_file
+                                last_output = moved_file
+                                final_output = moved_file
 
-                        # Move MP4
-                        moved_file = move_and_rename_output_file(output_filename, output_folder, f"{modified_image_filename_base}.mp4")
-                        if moved_file:
-                            output_key = f'mp4_{generation_count_for_image}' if num_generations > 1 else 'mp4'
-                            all_outputs[output_key] = moved_file
-                            last_output = moved_file
-                            final_output = moved_file
+                                prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts})" if batch_use_multiline_prompts else ""
+                                yield last_output, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generated video {generation_count_for_image}/{num_generations}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
 
-                            yield last_output, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generated video {generation_count_for_image}/{num_generations}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                                # Save metadata
+                                if save_metadata:
+                                    gen_time = time.time() - gen_start_time_batch
+                                    generation_time_seconds = int(gen_time)
+                                    generation_time_formatted = format_time_human_readable(gen_time)
 
-                            # Save metadata
-                            if save_metadata:
-                                gen_time = time.time() - gen_start_time_batch
-                                generation_time_seconds = int(gen_time)
-                                generation_time_formatted = format_time_human_readable(gen_time)
+                                    metadata = {
+                                        "Prompt": prompt_line,
+                                        "Seed": current_seed,
+                                        "TeaCache": "Enabled" if use_teacache else "Disabled",
+                                        "Video Length (seconds)": total_second_length,
+                                        "FPS": fps,
+                                        "Steps": steps,
+                                        "Distilled CFG Scale": gs,
+                                        "Resolution": resolution,
+                                        "Generation Time": generation_time_formatted,
+                                        "Total Seconds": f"{generation_time_seconds} seconds",
+                                        "Start Frame": image_path,
+                                        "End Frame": end_image_path_str if current_end_image is not None else "None"
+                                    }
+                                    if batch_use_multiline_prompts:
+                                        metadata["Prompt Number"] = f"{prompt_idx+1}/{total_prompts}"
+                                        
+                                    if lora_path != "none":
+                                        lora_name = os.path.basename(lora_path)
+                                        metadata["LoRA"] = lora_name
+                                        metadata["LoRA Scale"] = lora_scale
+                                        metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
+                                    save_processing_metadata(moved_file, metadata)
 
-                                metadata = {
-                                    "Prompt": current_prompt,
-                                    "Seed": current_seed,
-                                    "TeaCache": "Enabled" if use_teacache else "Disabled",
-                                    "Video Length (seconds)": total_second_length,
-                                    "FPS": fps,
-                                    "Steps": steps,
-                                    "Distilled CFG Scale": gs,
-                                    "Resolution": resolution,
-                                    "Generation Time": generation_time_formatted,
-                                    "Total Seconds": f"{generation_time_seconds} seconds",
-                                    "Start Frame": image_path,
-                                    "End Frame": end_image_path_str if current_end_image is not None else "None"
-                                }
-                                if lora_path != "none":
-                                    lora_name = os.path.basename(lora_path)
-                                    metadata["LoRA"] = lora_name
-                                    metadata["LoRA Scale"] = lora_scale
-                                    metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
-                                save_processing_metadata(moved_file, metadata)
+                                # Handle other formats
+                                if export_gif:
+                                    gif_filename = os.path.splitext(output_filename)[0] + '.gif'
+                                    moved_gif = move_and_rename_output_file(gif_filename, output_folder, f"{modified_image_filename_base}.gif")
+                                    if moved_gif and save_metadata: save_processing_metadata(moved_gif, metadata)
+                                if export_apng:
+                                    apng_filename = os.path.splitext(output_filename)[0] + '.png'
+                                    moved_apng = move_and_rename_output_file(apng_filename, output_folder, f"{modified_image_filename_base}.png")
+                                    if moved_apng and save_metadata: save_processing_metadata(moved_apng, metadata)
+                                if export_webp:
+                                    webp_filename = os.path.splitext(output_filename)[0] + '.webp'
+                                    moved_webp = move_and_rename_output_file(webp_filename, output_folder, f"{modified_image_filename_base}.webp")
+                                    if moved_webp and save_metadata: save_processing_metadata(moved_webp, metadata)
+                                if video_quality == 'web_compatible':
+                                    webm_filename = os.path.splitext(output_filename)[0] + '.webm'
+                                    moved_webm = move_and_rename_output_file(webm_filename, output_folder, f"{modified_image_filename_base}.webm")
+                                    if moved_webm:
+                                        if save_metadata: save_processing_metadata(moved_webm, metadata)
+                                        last_output = moved_webm
+                                        final_output = moved_webm
 
-                            # Handle other formats
-                            if export_gif:
-                                gif_filename = os.path.splitext(output_filename)[0] + '.gif'
-                                moved_gif = move_and_rename_output_file(gif_filename, output_folder, f"{modified_image_filename_base}.gif")
-                                if moved_gif and save_metadata: save_processing_metadata(moved_gif, metadata)
-                            if export_apng:
-                                apng_filename = os.path.splitext(output_filename)[0] + '.png'
-                                moved_apng = move_and_rename_output_file(apng_filename, output_folder, f"{modified_image_filename_base}.png")
-                                if moved_apng and save_metadata: save_processing_metadata(moved_apng, metadata)
-                            if export_webp:
-                                webp_filename = os.path.splitext(output_filename)[0] + '.webp'
-                                moved_webp = move_and_rename_output_file(webp_filename, output_folder, f"{modified_image_filename_base}.webp")
-                                if moved_webp and save_metadata: save_processing_metadata(moved_webp, metadata)
-                            if video_quality == 'web_compatible':
-                                webm_filename = os.path.splitext(output_filename)[0] + '.webm'
-                                moved_webm = move_and_rename_output_file(webm_filename, output_folder, f"{modified_image_filename_base}.webm")
-                                if moved_webm:
-                                    if save_metadata: save_processing_metadata(moved_webm, metadata)
-                                    last_output = moved_webm
-                                    final_output = moved_webm
-
-                    else: # Intermediate file
-                         yield output_filename, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generating intermediate result", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                        else: # Intermediate file
+                            prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts})" if batch_use_multiline_prompts else ""
+                            yield output_filename, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generating intermediate result{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
 
 
-            if flag == 'progress':
-                preview, desc, html = data
-                current_progress = f"Processing {idx+1}/{len(image_files)}: {start_image_basename}"
-                if desc: current_progress += f" - {desc}"
-                progress_html = html if html else make_progress_bar_html(0, f"Processing file {idx+1} of {len(image_files)}")
-                video_update = last_output if last_output else gr.update()
-                yield video_update, gr.update(visible=True, value=preview), current_progress, progress_html, gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                if flag == 'progress':
+                    preview, desc, html = data
+                    current_progress = f"Processing {idx+1}/{len(image_files)}: {start_image_basename}"
+                    
+                    # Add prompt info to the progress text if using multi-line prompts
+                    if batch_use_multiline_prompts:
+                        prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts})"
+                        current_progress += prompt_status
+                        
+                    if desc: current_progress += f" - {desc}"
+                    
+                    progress_html = html if html else make_progress_bar_html(0, f"Processing file {idx+1} of {len(image_files)}")
+                    
+                    # Add prompt info to HTML if using multi-line prompts
+                    if batch_use_multiline_prompts and html:
+                        import re
+                        hint_match = re.search(r'>(.*?)<br', html)
+                        if hint_match:
+                            hint = hint_match.group(1)
+                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts})"
+                            progress_html = html.replace(hint, new_hint)
+                    
+                    video_update = last_output if last_output else gr.update()
+                    yield video_update, gr.update(visible=True, value=preview), current_progress, progress_html, gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
 
-            if flag == 'end':
-                video_update = last_output if last_output else gr.update()
-                yield video_update, gr.update(visible=False), f"Completed {idx+1}/{len(image_files)}: {start_image_basename}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
-                break # End loop for this image
+                if flag == 'end':
+                    video_update = last_output if last_output else gr.update()
+                    
+                    if prompt_idx == len(prompt_lines) - 1:  # If this is the last prompt for this image
+                        yield video_update, gr.update(visible=False), f"Completed {idx+1}/{len(image_files)}: {start_image_basename}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                    else:
+                        prompt_status = f" (Completed prompt {prompt_idx+1}/{total_prompts}, continuing to next prompt)"
+                        yield video_update, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                    break # End loop for this prompt
 
     yield final_output, gr.update(visible=False), f"Batch processing complete. Processed {len(image_files)} images.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
 
@@ -1350,7 +1481,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V22 - Start/End Frame - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V23 - Start/End Frame - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1362,7 +1493,8 @@ with block:
                         with gr.Column():
                             end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional)", height=320) # Added end_image
 
-                    prompt = gr.Textbox(label="Prompt", value='')
+                    prompt = gr.Textbox(label="Prompt", value='', lines=3) # Changed lines to 3 for multi-line
+                    use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="Process each line of the prompt as a separate generation")
                     example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
                     example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
@@ -1378,11 +1510,12 @@ with block:
                     # Added End Frame Folder for Batch
                     batch_end_frame_folder = gr.Textbox(label="End Frame Folder Path (Optional)", info="Folder containing matching end frames (same filename as start frame)")
                     batch_output_folder = gr.Textbox(label="Output Folder Path (optional)", info="Leave empty to use the default batch_outputs folder")
-                    batch_prompt = gr.Textbox(label="Default Prompt", value='', info="Used if no matching .txt file exists")
+                    batch_prompt = gr.Textbox(label="Default Prompt", value='', lines=3, info="Used if no matching .txt file exists") # Changed lines to 3
 
                     with gr.Row():
                         batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip files that already exist in the output folder")
                         batch_save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
+                        batch_use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="Process each line of the prompt as a separate generation")
 
                     with gr.Row():
                         batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
@@ -1483,7 +1616,7 @@ with block:
     lora_folder_btn.click(fn=open_loras_folder, outputs=[gr.Text(visible=False)])
 
     # Update inputs list for single image processing
-    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora]
+    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -1501,7 +1634,7 @@ with block:
     batch_ips = [batch_input_folder, batch_output_folder, batch_end_frame_folder, batch_prompt, n_prompt, seed, use_random_seed,
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                 use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
-                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora]
+                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora, batch_use_multiline_prompts]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     batch_end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
