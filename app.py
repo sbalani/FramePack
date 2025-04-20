@@ -458,7 +458,7 @@ def force_remove_lora_modules(model):
         return False
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0):
+def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True):
     # Declare global variables at the beginning of the function
     global transformer, text_encoder, text_encoder_2, image_encoder, vae
 
@@ -633,7 +633,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                     from diffusers_helper.load_lora import load_lora
                     transformer.to(gpu)
-                    current_transformer = load_lora(transformer, lora_path, lora_name)
+                    
+                    # Show conversion status in progress bar
+                    if convert_lora:
+                        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Converting LoRA {os.path.basename(selected_lora)} to Diffusers format...'))))
+                    
+                    # Use convert_lora parameter from UI
+                    current_transformer = load_lora(transformer, lora_path, lora_name, convert_to_diffusers=convert_lora)
 
                     print("Verifying all LoRA components are on GPU...")
                     for name, module in transformer.named_modules():
@@ -920,6 +926,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         lora_name = os.path.basename(selected_lora)
                         metadata["LoRA"] = lora_name
                         metadata["LoRA Scale"] = lora_scale
+                        metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
 
                     if output_filename: save_processing_metadata(output_filename, metadata)
                     if export_gif and os.path.exists(os.path.splitext(output_filename)[0] + '.gif'):
@@ -1042,7 +1049,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
 
 # Modified process function signature
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0):
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True):
     global stream
     assert input_image is not None, 'No start input image!' # Changed assertion message
 
@@ -1052,7 +1059,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
     stream = AsyncStream()
 
     # Pass end_image to worker
-    async_run(worker, input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale)
+    async_run(worker, input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora)
 
     output_filename = None
     webm_filename = None
@@ -1138,7 +1145,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache,
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
-                  selected_lora="None", lora_scale=1.0):
+                  selected_lora="None", lora_scale=1.0, convert_lora=True):
     global stream
 
     lora_path = get_lora_path_from_name(selected_lora)
@@ -1223,7 +1230,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                  total_second_length, latent_window_size, steps, cfg, gs, rs,
                  gpu_memory_preservation, use_teacache, video_quality, export_gif,
                  export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
-                 selected_lora=lora_path, lora_scale=lora_scale)
+                 selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora)
 
         output_filename = None
         last_output = None
@@ -1280,6 +1287,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     lora_name = os.path.basename(lora_path)
                                     metadata["LoRA"] = lora_name
                                     metadata["LoRA Scale"] = lora_scale
+                                    metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
                                 save_processing_metadata(moved_file, metadata)
 
                             # Handle other formats
@@ -1342,7 +1350,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V21 - Start/End Frame - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V22 - Start/End Frame - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1422,7 +1430,9 @@ with block:
                              lora_refresh_btn = gr.Button(value="🔄 Refresh", scale=1)
                              lora_folder_btn = gr.Button(value="📁 Open Folder", scale=1)
                         lora_scale = gr.Slider(label="LoRA Scale", minimum=0.0, maximum=2.0, value=1.0, step=0.01, info="Adjust the strength of the LoRA effect (0-2)")
-
+                
+                with gr.Row():
+                    convert_lora = gr.Checkbox(label="Convert LoRA to Diffusers Format - Add extra 20 GB GPU Inference Preserved Memory - I am still searching better solution", value=False, info="Enable to convert LoRA weights to the Diffusers format (recommended)")
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
@@ -1473,7 +1483,7 @@ with block:
     lora_folder_btn.click(fn=open_loras_folder, outputs=[gr.Text(visible=False)])
 
     # Update inputs list for single image processing
-    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale]
+    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -1491,7 +1501,7 @@ with block:
     batch_ips = [batch_input_folder, batch_output_folder, batch_end_frame_folder, batch_prompt, n_prompt, seed, use_random_seed,
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                 use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
-                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale]
+                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     batch_end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -1583,17 +1593,12 @@ def get_available_drives():
     print(f"Allowed Gradio paths: {existing_paths}")
     return existing_paths
 
+
+# Don't add port args when modifying
 block.launch(
     share=args.share,
     inbrowser=True,
-    server_name=args.server, # Use args for server name
-    server_port=args.port,   # Use args for port
-    allowed_paths=get_available_drives() # Allow access to detected drives/mounts
+    allowed_paths=get_available_drives() 
 )
 
-print("\n=== BATCH PROCESSING INFORMATION ===")
 print_supported_image_formats()
-print("Place text files with the same name as image files to use as custom prompts.")
-print("For example: image1.png and image1.txt for a custom prompt for image1.png")
-print("For batch end frames, ensure end frame images in the 'End Frame Folder' have the exact same filename as their corresponding start frames in the 'Input Folder Path'.")
-print("===================================\n")
