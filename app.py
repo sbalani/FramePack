@@ -342,7 +342,7 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
             # target_resolution = int(resolution)
             height, width = find_nearest_bucket(H, W, resolution=resolution)
             input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
-
+            print(f"Found best resolution bucket {width} x {height}")  
             try:
                 Image.fromarray(input_image_np).save(os.path.join(used_images_folder, f'{job_id}.png'))
                 print(f"Saved input image to {os.path.join(used_images_folder, f'{job_id}.png')}")
@@ -1142,7 +1142,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V15 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V16 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1201,8 +1201,23 @@ with block:
                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 
+                # Function to update memory based on resolution
+                def update_memory_for_resolution(res):
+                    if res == "1080":
+                        return 16
+                    elif res == "960":
+                        return 14
+                    elif res == "840":
+                        return 12
+                    elif res == "720":
+                        return 10
+                    else:  # 640 or below
+                        return 6
+                
+                # Connect resolution dropdown to update memory preservation
+                resolution.change(fn=update_memory_for_resolution, inputs=resolution, outputs=gpu_memory_preservation)
 
 
         with gr.Column():
