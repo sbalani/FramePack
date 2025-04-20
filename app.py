@@ -229,10 +229,24 @@ def get_prompt_from_txt_file(image_path):
             print(f"Error reading prompt file {txt_path}: {str(e)}")
     return None
 
+def format_time_human_readable(seconds):
+    """Format time in a human-readable format (e.g., 3 min 11 seconds, 1 hour 12 min 15 seconds)."""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    if hours > 0:
+        return f"{hours} hour{'s' if hours > 1 else ''} {minutes} min {seconds} seconds"
+    elif minutes > 0:
+        return f"{minutes} min {seconds} seconds"
+    else:
+        return f"{seconds} seconds"
+
 def save_processing_metadata(output_path, metadata):
     """Save processing metadata to a text file."""
     metadata_path = os.path.splitext(output_path)[0] + '_metadata.txt'
     try:
+        # Ensure directory exists before saving
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
         with open(metadata_path, 'w', encoding='utf-8') as f:
             for key, value in metadata.items():
                 f.write(f"{key}: {value}\n")
@@ -267,8 +281,8 @@ def move_and_rename_output_file(original_file, target_folder, original_image_fil
         return None
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640"):
-    total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
+def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30):
+    total_latent_sections = (total_second_length * fps) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     current_seed = seed
@@ -344,6 +358,8 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
             input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
             print(f"Found best resolution bucket {width} x {height}")  
             try:
+                # Ensure the used_images_folder exists
+                os.makedirs(used_images_folder, exist_ok=True)
                 Image.fromarray(input_image_np).save(os.path.join(used_images_folder, f'{job_id}.png'))
                 print(f"Saved input image to {os.path.join(used_images_folder, f'{job_id}.png')}")
             except Exception as e:
@@ -485,7 +501,7 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                     elapsed_str = f"{total_elapsed/60:.1f} min" if total_elapsed > 60 else f"{total_elapsed:.1f} sec"
                     
                     hint = f'Sampling {current_step}/{steps} (Gen {gen_idx+1}/{num_generations}, Seed {current_seed})'
-                    desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
+                    desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / fps) :.2f} seconds (FPS-{fps}). The video is being extended now ...'
                     time_info = f'Elapsed: {elapsed_str} | ETA: {eta_str}'
                     
                     # Print to command line
@@ -599,12 +615,16 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                 
                 # Pass video quality to the save function
                 try:
-                    save_bcthw_as_mp4(history_pixels, output_filename, fps=30, video_quality=video_quality)
+                    # Ensure output directory exists
+                    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
+                    save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, video_quality=video_quality)
                     print(f"Saved MP4 video to {output_filename}")
                     
                     # Also save as WebM if video quality is set to web_compatible
                     if video_quality == 'web_compatible':
-                        save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=30, video_quality=video_quality, format='webm')
+                        # Ensure WebM output directory exists
+                        os.makedirs(os.path.dirname(webm_output_filename), exist_ok=True)
+                        save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=fps, video_quality=video_quality, format='webm')
                         print(f"Saved WebM video to {webm_output_filename}")
                 except ConnectionResetError as e:
                     print(f"Connection Reset Error during video saving: {str(e)}")
@@ -620,14 +640,22 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
 
                 # Save metadata for final outputs if enabled and this is the last section
                 if save_metadata and is_last_section:
+                    # Calculate generation time for this video
+                    gen_time = time.time() - gen_start_time
+                    generation_time_seconds = int(gen_time)
+                    generation_time_formatted = format_time_human_readable(gen_time)
+                    
                     metadata = {
                         "Prompt": prompt,
                         "Seed": current_seed,
                         "TeaCache": "Enabled" if use_teacache else "Disabled",
                         "Video Length (seconds)": total_second_length,
+                        "FPS": fps,
                         "Steps": steps,
                         "Distilled CFG Scale": gs,
-                        "Resolution": resolution
+                        "Resolution": resolution,
+                        "Generation Time": generation_time_formatted,
+                        "Total Seconds": f"{generation_time_seconds} seconds"
                     }
                     save_processing_metadata(output_filename, metadata)
                     
@@ -652,7 +680,9 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                         else:
                             gif_filename = os.path.join(gif_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.gif')
                         try:
-                            save_bcthw_as_gif(history_pixels, gif_filename, fps=30)
+                            # Ensure GIF output directory exists
+                            os.makedirs(os.path.dirname(gif_filename), exist_ok=True)
+                            save_bcthw_as_gif(history_pixels, gif_filename, fps=fps)
                             print(f"Saved GIF animation to {gif_filename}")
                         except Exception as e:
                             print(f"Error saving GIF: {str(e)}")
@@ -663,7 +693,9 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                         else:
                             apng_filename = os.path.join(apng_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.png')
                         try:
-                            save_bcthw_as_apng(history_pixels, apng_filename, fps=30)
+                            # Ensure APNG output directory exists
+                            os.makedirs(os.path.dirname(apng_filename), exist_ok=True)
+                            save_bcthw_as_apng(history_pixels, apng_filename, fps=fps)
                             print(f"Saved APNG animation to {apng_filename}")
                         except Exception as e:
                             print(f"Error saving APNG: {str(e)}")
@@ -674,7 +706,9 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                         else:
                             webp_filename = os.path.join(webp_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webp')
                         try:
-                            save_bcthw_as_webp(history_pixels, webp_filename, fps=30)
+                            # Ensure WebP output directory exists
+                            os.makedirs(os.path.dirname(webp_filename), exist_ok=True)
+                            save_bcthw_as_webp(history_pixels, webp_filename, fps=fps)
                             print(f"Saved WebP animation to {webp_filename}")
                         except Exception as e:
                             print(f"Error saving WebP: {str(e)}")
@@ -785,7 +819,7 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
     return
 
 
-def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640"):
+def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -794,7 +828,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution)
+    async_run(worker, input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps)
 
     output_filename = None
     webm_filename = None
@@ -903,7 +937,7 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
 def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_random_seed, total_second_length, 
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, 
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False, 
-                  skip_existing=True, save_metadata=True, num_generations=1, resolution="640"):
+                  skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30):
     global stream
     
     # Check input folder
@@ -979,7 +1013,7 @@ def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_rando
         async_run(worker, input_image, current_prompt, n_prompt, seed, use_random_seed, 
                  total_second_length, latent_window_size, steps, cfg, gs, rs, 
                  gpu_memory_preservation, use_teacache, video_quality, export_gif, 
-                 export_apng, export_webp, num_generations=num_generations, resolution=resolution)
+                 export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps)
         
         # Get the results
         output_filename = None
@@ -1035,14 +1069,22 @@ def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_rando
                             
                             # Save metadata for this generation right after moving the file
                             if save_metadata:
+                                # Get the last timing info from the worker if available
+                                gen_time = time.time() - gen_start_time if 'gen_start_time' in locals() else None
+                                generation_time_seconds = int(gen_time) if gen_time else None
+                                generation_time_formatted = format_time_human_readable(gen_time) if gen_time else "Unknown"
+                                
                                 metadata = {
                                     "Prompt": current_prompt,
                                     "Seed": current_seed,
                                     "TeaCache": "Enabled" if use_teacache else "Disabled",
                                     "Video Length (seconds)": total_second_length,
+                                    "FPS": fps,
                                     "Steps": steps,
                                     "Distilled CFG Scale": gs,
-                                    "Resolution": resolution
+                                    "Resolution": resolution,
+                                    "Generation Time": generation_time_formatted,
+                                    "Total Seconds": f"{generation_time_seconds} seconds" if generation_time_seconds else "Unknown"
                                 }
                                 save_processing_metadata(moved_file, metadata)
                     # Display intermediate videos too (even though we don't move them to batch folder)
@@ -1142,7 +1184,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V16 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V17 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1180,7 +1222,7 @@ with block:
                 # Add number of generations slider and resolution in same row
                 with gr.Row():
                     num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence")
-                    resolution = gr.Dropdown(label="Resolution", choices=["1080","960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
+                    resolution = gr.Dropdown(label="Resolution", choices=["1320","1200","1080","960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
                 
                 # Group seed controls in one row
                 with gr.Row():
@@ -1190,7 +1232,10 @@ with block:
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                with gr.Row():
+                    fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Doesn't impact generation speed")
+                    total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 
                 # Put Steps and Distilled CFG Scale in the same row
@@ -1205,6 +1250,10 @@ with block:
                 
                 # Function to update memory based on resolution
                 def update_memory_for_resolution(res):
+                    if res == "1320":
+                        return 21
+                    if res == "1200":
+                        return 19
                     if res == "1080":
                         return 16
                     elif res == "960":
@@ -1277,7 +1326,7 @@ with block:
     block.load(None, js=video_info_js)
     
     # Update inputs list to include new parameters
-    ips = [input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution]
+    ips = [input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     end_button.click(fn=end_process, outputs=[start_button, end_button])
     
@@ -1301,7 +1350,7 @@ with block:
     batch_ips = [batch_input_folder, batch_output_folder, batch_prompt, n_prompt, seed, use_random_seed, 
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
                 use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing, 
-                batch_save_metadata, num_generations, resolution]
+                batch_save_metadata, num_generations, resolution, fps]
     
     batch_start_button.click(fn=batch_process, inputs=batch_ips, 
                             outputs=[result_video, preview_image, progress_desc, progress_bar, 
