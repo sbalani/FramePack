@@ -1184,7 +1184,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V18 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V19 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
