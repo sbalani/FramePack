@@ -1,5 +1,5 @@
 accelerate==1.6.0
-diffusers==0.33.1
+diffusers
 transformers==4.46.2
 gradio==5.23.0
 sentencepiece==0.2.0
@@ -14,3 +14,4 @@ einops
 opencv-contrib-python
 safetensors
 apng==0.3.4
+peft

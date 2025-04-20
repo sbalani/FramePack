@@ -5,6 +5,8 @@ import subprocess
 import platform
 import random
 import time  # Add time module for duration tracking
+import shutil
+import glob
 
 # Add this line to handle HF download errors
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
@@ -31,6 +33,7 @@ from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
+from diffusers_helper.load_lora import load_lora
 from diffusers_helper.bucket_tools import find_nearest_bucket
 
 
@@ -110,6 +113,7 @@ intermediate_gif_videos_folder = os.path.join(outputs_folder, 'intermediate_gif_
 intermediate_apng_videos_folder = os.path.join(outputs_folder, 'intermediate_apng_videos')
 intermediate_webp_videos_folder = os.path.join(outputs_folder, 'intermediate_webp_videos')
 intermediate_webm_videos_folder = os.path.join(outputs_folder, 'intermediate_webm_videos')
+loras_folder = os.path.join(current_dir, 'loras')  # Add loras folder
 
 # Ensure all directories exist with proper error handling
 for directory in [
@@ -123,7 +127,8 @@ for directory in [
     intermediate_gif_videos_folder, 
     intermediate_apng_videos_folder, 
     intermediate_webp_videos_folder,
-    intermediate_webm_videos_folder
+    intermediate_webm_videos_folder,
+    loras_folder  # Add loras folder to the list
 ]:
     try:
         os.makedirs(directory, exist_ok=True)
@@ -280,10 +285,188 @@ def move_and_rename_output_file(original_file, target_folder, original_image_fil
         print(f"Error moving/renaming file to {new_filepath}: {str(e)}")
         return None
 
+# Add function to scan for LoRA files
+def scan_lora_files():
+    """Scan the loras folder for LoRA files (.safetensors or .pt) and return a list of them."""
+    try:
+        safetensors_files = glob.glob(os.path.join(loras_folder, "**/*.safetensors"), recursive=True)
+        pt_files = glob.glob(os.path.join(loras_folder, "**/*.pt"), recursive=True)
+        all_lora_files = safetensors_files + pt_files
+        
+        # Format for dropdown: Use basename without extension as display name, full path as value
+        lora_options = [("None", "none")]  # Add "None" option
+        for lora_file in all_lora_files:
+            display_name = os.path.splitext(os.path.basename(lora_file))[0]
+            lora_options.append((display_name, lora_file))
+        
+        return lora_options
+    except Exception as e:
+        print(f"Error scanning LoRA files: {str(e)}")
+        return [("None", "none")]
+
+def get_lora_path_from_name(display_name):
+    """Convert a LoRA display name to its file path."""
+    if display_name == "None":
+        return "none"
+    
+    lora_options = scan_lora_files()
+    for name, path in lora_options:
+        if name == display_name:
+            return path
+    
+    # If not found, return none
+    print(f"Warning: LoRA '{display_name}' not found in options, using None")
+    return "none"
+
+def refresh_loras():
+    """Refresh the LoRA dropdown with newly scanned files."""
+    lora_options = scan_lora_files()
+    return gr.update(choices=[name for name, _ in lora_options], value="None")
+
+def open_loras_folder():
+    """Open the loras folder in the file explorer/finder."""
+    try:
+        if platform.system() == "Windows":
+            os.startfile(loras_folder)
+        elif platform.system() == "Darwin":  # macOS
+            subprocess.run(["open", loras_folder])
+        else:  # Linux
+            subprocess.run(["xdg-open", loras_folder])
+        return "Opened loras folder"
+    except Exception as e:
+        return f"Error opening folder: {str(e)}"
+
+# Add this helper function after all imports but before the worker function
+def safe_unload_lora(model, device=None):
+    """
+    Safely unload LoRA weights from the model, handling different model types.
+    
+    Args:
+        model: The model to unload LoRA weights from
+        device: Optional device to move the model to before unloading
+    """
+    if device is not None:
+        model.to(device)
+    
+    # Check if this is a DynamicSwap wrapped model
+    is_dynamic_swap = 'DynamicSwap' in model.__class__.__name__
+    
+    try:
+        # First try the standard unload_lora_weights method
+        if hasattr(model, "unload_lora_weights"):
+            print("Unloading LoRA using unload_lora_weights method")
+            model.unload_lora_weights()
+            return True
+        # Try peft's adapter handling if available
+        elif hasattr(model, "peft_config") and model.peft_config:
+            if hasattr(model, "disable_adapters"):
+                print("Unloading LoRA using disable_adapters method")
+                model.disable_adapters()
+                return True
+            # For PEFT models without disable_adapters method
+            elif hasattr(model, "active_adapters") and model.active_adapters:
+                print("Clearing active adapters list")
+                model.active_adapters = []
+                return True
+        # Special handling for DynamicSwap models
+        elif is_dynamic_swap:
+            print("DynamicSwap model detected, attempting to reset internal model state")
+            
+            # For DynamicSwap models, try to check if there's an internal model that has LoRA attributes
+            if hasattr(model, "model"):
+                internal_model = model.model
+                if hasattr(internal_model, "unload_lora_weights"):
+                    print("Unloading LoRA from internal model")
+                    internal_model.unload_lora_weights()
+                    return True
+                elif hasattr(internal_model, "peft_config") and internal_model.peft_config:
+                    if hasattr(internal_model, "disable_adapters"):
+                        print("Disabling adapters on internal model")
+                        internal_model.disable_adapters()
+                        return True
+            
+            # If all else fails with DynamicSwap, try to directly remove LoRA modules
+            print("Attempting direct LoRA module removal as fallback")
+            return force_remove_lora_modules(model)
+        else:
+            print("No LoRA adapter found to unload")
+            return True
+    except Exception as e:
+        print(f"Error during LoRA unloading: {str(e)}")
+        traceback.print_exc()
+        
+        # Last resort - try direct module removal
+        print("Attempting direct LoRA module removal after error")
+        return force_remove_lora_modules(model)
+    
+    return False
+
+def force_remove_lora_modules(model):
+    """
+    Force-remove LoRA modules by directly modifying the model's state.
+    This is a last-resort method when normal unloading fails.
+    
+    Args:
+        model: The model to remove LoRA modules from
+    
+    Returns:
+        bool: Whether the operation was successful
+    """
+    try:
+        # Look for any LoRA-related modules
+        lora_removed = False
+        for name, module in list(model.named_modules()):
+            # Check for typical PEFT/LoRA module names
+            if 'lora' in name.lower():
+                print(f"Found LoRA module: {name}")
+                lora_removed = True
+                
+                # Get parent module and attribute name
+                parent_name, _, attr_name = name.rpartition('.')
+                if parent_name:
+                    try:
+                        parent = model.get_submodule(parent_name)
+                        if hasattr(parent, attr_name):
+                            # Try to restore original module if possible
+                            if hasattr(module, 'original_module'):
+                                setattr(parent, attr_name, module.original_module)
+                                print(f"Restored original module for {name}")
+                            # Otherwise just try to reset the module
+                            else:
+                                print(f"Could not restore original module for {name}")
+                    except Exception as e:
+                        print(f"Error accessing parent module {parent_name}: {str(e)}")
+        
+        # Clear PEFT configuration
+        if hasattr(model, "peft_config"):
+            model.peft_config = None
+            print("Cleared peft_config")
+            lora_removed = True
+            
+        # Clear LoRA adapter references
+        if hasattr(model, "active_adapters"):
+            model.active_adapters = []
+            print("Cleared active_adapters")
+            lora_removed = True
+        
+        return lora_removed
+    except Exception as e:
+        print(f"Error during force LoRA removal: {str(e)}")
+        traceback.print_exc()
+        return False
+
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30):
+def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0):
+    # Declare global variables at the beginning of the function
+    global transformer, text_encoder, text_encoder_2, image_encoder, vae
+    
     total_latent_sections = (total_second_length * fps) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
+
+    # Clean up any previously loaded LoRA at the start of a new worker session
+    if hasattr(transformer, "peft_config") and transformer.peft_config:
+        print("Cleaning up previous LoRA weights at worker start")
+        safe_unload_lora(transformer, gpu)
 
     current_seed = seed
     all_outputs = {}
@@ -394,6 +577,66 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
             clip_l_pooler = clip_l_pooler.to(transformer.dtype)
             clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
             image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+
+            # Apply LoRA if selected
+            using_lora = False
+            previous_lora_loaded = hasattr(transformer, "peft_config") and transformer.peft_config
+            
+            if selected_lora != "none":
+                stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Loading LoRA {os.path.basename(selected_lora)}...'))))
+                try:
+                    # Get directory and filename from selected LoRA path
+                    lora_path, lora_name = os.path.split(selected_lora)
+                    if not lora_path:  # If only filename was provided
+                        lora_path = loras_folder
+                    
+                    # Unload any previously loaded LoRA before loading a new one
+                    if previous_lora_loaded:
+                        print("Unloading previously loaded LoRA before loading new one")
+                        lora_unload_success = safe_unload_lora(transformer, gpu)
+                        
+                        # If unloading failed and we're using DynamicSwap, we may need a clean model
+                        if not lora_unload_success and 'DynamicSwap' in transformer.__class__.__name__:
+                            print("LoRA unloading failed for DynamicSwap model - need to reload model")
+                            # We need to reload the transformer from scratch
+                            if not high_vram:
+                                # Properly unload the model
+                                unload_complete_models(
+                                    text_encoder, text_encoder_2, image_encoder, vae, transformer
+                                )
+                                
+                                # Recreate the transformer model
+                                from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+                                transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+                                transformer.high_quality_fp32_output_for_inference = True
+                                transformer.requires_grad_(False)
+                                if not high_vram:
+                                    from diffusers_helper.memory import DynamicSwapInstaller
+                                    DynamicSwapInstaller.install_model(transformer, device=gpu)
+                                else:
+                                    transformer.to(gpu)
+                                print("Successfully reloaded transformer model")
+                    
+                    # Load the transformer with LoRA
+                    from diffusers_helper.load_lora import load_lora
+                    
+                    # Make sure transformer is on the target device before loading LoRA
+                    transformer.to(gpu)
+                    current_transformer = load_lora(transformer, lora_path, lora_name)
+                    
+                    # Apply LoRA scale if different from 1.0
+                    if lora_scale != 1.0:
+                        print("LoRA scale not working at the moment")
+                        # Get all active adapters
+                        #if hasattr(current_transformer, 'active_adapters') and current_transformer.active_adapters:
+                            #for adapter_name in current_transformer.active_adapters:
+                                #current_transformer.set_adapter_scale(adapter_name, lora_scale)
+                    
+                    using_lora = True
+                    print(f"Successfully loaded LoRA: {lora_name} with scale: {lora_scale}")
+                except Exception as e:
+                    print(f"Error loading LoRA {selected_lora}: {str(e)}")
+                    traceback.print_exc()
 
             # Sampling
 
@@ -742,6 +985,11 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
             print(f"\nGeneration {gen_idx+1}/{num_generations} completed in {gen_time:.2f} seconds")
             if remaining_gens > 0:
                 print(f"Estimated time for remaining generations: {estimated_remaining_time/60:.1f} minutes")
+                
+                # Clean up LoRA before next generation if it was used
+                if using_lora and hasattr(transformer, "peft_config") and transformer.peft_config:
+                    print("Cleaning up LoRA weights before next generation")
+                    safe_unload_lora(transformer, gpu)
             
             # Push timing information to the queue
             stream.output_queue.push(('timing', {'gen_time': gen_time, 'avg_time': avg_gen_time, 'remaining_time': estimated_remaining_time}))
@@ -752,6 +1000,11 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
                 print("\n" + "="*50)
                 print("GENERATION ENDED BY USER")
                 print("="*50)
+                
+                # Clean up LoRA if it was used
+                if using_lora and hasattr(transformer, "peft_config") and transformer.peft_config:
+                    print("Cleaning up LoRA weights after user interruption")
+                    safe_unload_lora(transformer, gpu)
                 
                 # Make sure we unload models to free memory
                 if not high_vram:
@@ -769,6 +1022,11 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
         except ConnectionResetError as e:
             print(f"Connection Reset Error outside main processing loop: {str(e)}")
             print("Trying to continue with next generation...")
+            
+            # Clean up LoRA if it was used
+            if using_lora and hasattr(transformer, "peft_config") and transformer.peft_config:
+                print("Cleaning up LoRA weights after connection error")
+                safe_unload_lora(transformer, gpu)
             
             # Clean up memory
             if not high_vram:
@@ -792,6 +1050,11 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
             traceback.print_exc()
             print("="*50)
 
+            # Clean up LoRA if it was used
+            if using_lora and hasattr(transformer, "peft_config") and transformer.peft_config:
+                print("Cleaning up LoRA weights after generation error")
+                safe_unload_lora(transformer, gpu)
+
             if not high_vram:
                 try:
                     unload_complete_models(
@@ -812,6 +1075,11 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
     total_time = time.time() - start_time
     print(f"\nTotal generation time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
     
+    # Final cleanup of LoRA if it was used in any generation
+    if hasattr(transformer, "peft_config") and transformer.peft_config:
+        print("Final cleanup of LoRA weights at worker completion")
+        safe_unload_lora(transformer, gpu)
+    
     # Return the last used seed and timing info after all generations are complete
     stream.output_queue.push(('final_timing', {'total_time': total_time, 'generation_times': generation_times}))
     stream.output_queue.push(('final_seed', last_used_seed))
@@ -819,16 +1087,19 @@ def worker(input_image, prompt, n_prompt, seed, use_random_seed, total_second_le
     return
 
 
-def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30):
+def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0):
     global stream
     assert input_image is not None, 'No input image!'
+
+    # Convert LoRA display name to path
+    lora_path = get_lora_path_from_name(selected_lora)
 
     # Initial UI update - disable start button, enable end button
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps)
+    async_run(worker, input_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale)
 
     output_filename = None
     webm_filename = None
@@ -937,8 +1208,12 @@ def process(input_image, prompt, n_prompt, seed, use_random_seed, num_generation
 def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_random_seed, total_second_length, 
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, 
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False, 
-                  skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30):
+                  skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
+                  selected_lora="None", lora_scale=1.0):
     global stream
+    
+    # Convert LoRA display name to path
+    lora_path = get_lora_path_from_name(selected_lora)
     
     # Check input folder
     if not input_folder or not os.path.exists(input_folder):
@@ -1013,7 +1288,8 @@ def batch_process(input_folder, output_folder, prompt, n_prompt, seed, use_rando
         async_run(worker, input_image, current_prompt, n_prompt, seed, use_random_seed, 
                  total_second_length, latent_window_size, steps, cfg, gs, rs, 
                  gpu_memory_preservation, use_teacache, video_quality, export_gif, 
-                 export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps)
+                 export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
+                 selected_lora=lora_path, lora_scale=lora_scale)
         
         # Get the results
         output_filename = None
@@ -1184,7 +1460,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V19 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V20 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1246,6 +1522,35 @@ with block:
                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
+                # LoRA section - Add above GPU Memory Preservation as requested
+                gr.Markdown("### LoRA Settings")
+                with gr.Row():
+                    # First column for dropdown
+                    with gr.Column():
+                        # Initialize with a scan of the loras folder
+                        lora_options = scan_lora_files()
+                        selected_lora = gr.Dropdown(
+                            label="Select LoRA", 
+                            choices=[name for name, _ in lora_options],
+                            value="None",
+                            info="Select a LoRA to apply"
+                        )
+                    # Second column for buttons
+                    with gr.Column():
+                        with gr.Row():
+                            lora_refresh_btn = gr.Button(value="🔄 Refresh", scale=1)
+                            lora_folder_btn = gr.Button(value="📁 Open Folder", scale=1)
+                            lora_scale = gr.Slider(
+                            label="LoRA Scale", 
+                            minimum=0.0, 
+                            maximum=2.0, 
+                            value=1.0, 
+                            step=0.01,
+                            info="Adjust the strength of the LoRA effect (0-2)"
+                        )
+
+
+                # GPU Memory slider AFTER LoRA section
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 
                 # Function to update memory based on resolution
@@ -1269,7 +1574,6 @@ with block:
                 
                 # Connect resolution dropdown to update memory preservation
                 resolution.change(fn=update_memory_for_resolution, inputs=resolution, outputs=gpu_memory_preservation)
-
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -1299,36 +1603,12 @@ with block:
             export_apng = gr.Checkbox(label="Export as APNG", value=False, info="Save animation as Animated PNG (better quality than GIF but less compatible)")
             export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP (good balance of quality and file size)")
     
-    # Add JavaScript to show video information when loaded
-    video_info_js = """
-    function updateVideoInfo() {
-        const videoElement = document.querySelector('video');
-        if (videoElement) {
-            const info = document.getElementById('video-info');
-            videoElement.addEventListener('loadedmetadata', function() {
-                info.innerHTML = `<p>Resolution: ${videoElement.videoWidth}x${videoElement.videoHeight} | 
-                                   Duration: ${videoElement.duration.toFixed(2)}s | 
-                                   Format: ${videoElement.currentSrc.split('.').pop()}</p>`;
-            });
-        }
-    }
-    
-    // Run when page loads and after video updates
-    document.addEventListener('DOMContentLoaded', updateVideoInfo);
-    const observer = new MutationObserver(function(mutations) {
-        updateVideoInfo();
-    });
-    
-    observer.observe(document.documentElement, {
-        childList: true,
-        subtree: true
-    });
-    """
-    
-    block.load(None, js=video_info_js)
+    # Connect refresh button and folder button
+    lora_refresh_btn.click(fn=refresh_loras, outputs=[selected_lora])
+    lora_folder_btn.click(fn=open_loras_folder, outputs=[gr.Text(visible=False)])
     
     # Update inputs list to include new parameters
-    ips = [input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps]
+    ips = [input_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     end_button.click(fn=end_process, outputs=[start_button, end_button])
     
@@ -1348,17 +1628,45 @@ with block:
                                    inputs=[batch_output_folder], 
                                    outputs=[batch_output_folder_text])
     
-    # Connect batch processing start and end buttons
+    # Connect batch processing start and end buttons with updated parameters
     batch_ips = [batch_input_folder, batch_output_folder, batch_prompt, n_prompt, seed, use_random_seed, 
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
                 use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing, 
-                batch_save_metadata, num_generations, resolution, fps]
+                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale]
     
     batch_start_button.click(fn=batch_process, inputs=batch_ips, 
                             outputs=[result_video, preview_image, progress_desc, progress_bar, 
                                      batch_start_button, batch_end_button, seed, timing_display])
     
     batch_end_button.click(fn=end_process, outputs=[batch_start_button, batch_end_button])
+    
+    # Add JavaScript to show video information when loaded
+    video_info_js = """
+    function updateVideoInfo() {
+        const videoElement = document.querySelector('video');
+        if (videoElement) {
+            const info = document.getElementById('video-info');
+            videoElement.addEventListener('loadedmetadata', function() {
+                info.innerHTML = `<p>Resolution: ${videoElement.videoWidth}x${videoElement.videoHeight} | 
+                                 Duration: ${videoElement.duration.toFixed(2)}s | 
+                                 Format: ${videoElement.currentSrc.split('.').pop()}</p>`;
+            });
+        }
+    }
+    
+    // Run when page loads and after video updates
+    document.addEventListener('DOMContentLoaded', updateVideoInfo);
+    const observer = new MutationObserver(function(mutations) {
+        updateVideoInfo();
+    });
+    
+    observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+    });
+    """
+    
+    block.load(None, js=video_info_js)
 
 
 def get_available_drives():
