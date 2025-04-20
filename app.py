@@ -1142,7 +1142,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V13 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V14 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1180,7 +1180,7 @@ with block:
                 # Add number of generations slider and resolution in same row
                 with gr.Row():
                     num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence")
-                    resolution = gr.Dropdown(label="Resolution", choices=["720", "640", "480", "320", "240"], value="640", info="Output resolution (higher = better quality but slower)")
+                    resolution = gr.Dropdown(label="Resolution", choices=["960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
                 
                 # Group seed controls in one row
                 with gr.Row():
