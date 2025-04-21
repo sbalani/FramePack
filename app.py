@@ -113,6 +113,8 @@ intermediate_webp_videos_folder = os.path.join(outputs_folder, 'intermediate_web
 intermediate_webm_videos_folder = os.path.join(outputs_folder, 'intermediate_webm_videos')
 individual_frames_folder = os.path.join(outputs_folder, 'individual_frames')
 intermediate_individual_frames_folder = os.path.join(individual_frames_folder, 'intermediate_videos')
+last_frames_folder = os.path.join(outputs_folder, 'last_frames')  # Add last_frames folder
+intermediate_last_frames_folder = os.path.join(last_frames_folder, 'intermediate_videos')  # Add intermediate last frames folder
 loras_folder = os.path.join(current_dir, 'loras')  # Add loras folder
 
 # Ensure all directories exist with proper error handling
@@ -130,6 +132,8 @@ for directory in [
     intermediate_webm_videos_folder,
     individual_frames_folder,
     intermediate_individual_frames_folder,
+    last_frames_folder,  # Add last_frames folder to the list
+    intermediate_last_frames_folder,  # Add intermediate last frames folder to the list
     loras_folder  # Add loras folder to the list
 ]:
     try:
@@ -460,6 +464,39 @@ def force_remove_lora_modules(model):
         print(f"Error during force LoRA removal: {str(e)}")
         traceback.print_exc()
         return False
+
+print_supported_image_formats()
+
+def save_last_frame(frames, output_dir, filename_base):
+    """Save only the last frame from a video frames tensor
+    
+    Args:
+        frames: Tensor of frames in bcthw format
+        output_dir: Directory to save the last frame
+        filename_base: Base filename to use for the saved frame
+    """
+    try:
+        # Make sure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Extract only the last frame but keep the tensor structure (b,c,t,h,w)
+        # where t=1 to be compatible with save_individual_frames function
+        last_frame_tensor = frames[:, :, -1:, :, :]
+        
+        # Use the existing utils function to ensure consistent color processing
+        from diffusers_helper.utils import save_individual_frames
+        frame_paths = save_individual_frames(last_frame_tensor, output_dir, f"{filename_base}_last", return_frame_paths=True)
+        
+        if frame_paths and len(frame_paths) > 0:
+            print(f"Saved last frame to {frame_paths[0]}")
+            return frame_paths[0]
+        else:
+            print("No frames were saved")
+            return None
+    except Exception as e:
+        print(f"Error saving last frame: {str(e)}")
+        traceback.print_exc()
+        return None
 
 @torch.no_grad()
 def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
@@ -891,10 +928,26 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, video_quality=video_quality)
                     print(f"Saved MP4 video to {output_filename}")
 
+                    # Save last frame of main video if enabled
+                    if save_individual_frames_frames:
+                        frames_output_dir = os.path.join(
+                            intermediate_last_frames_folder if is_intermediate else last_frames_folder,
+                            os.path.splitext(os.path.basename(output_filename))[0]
+                        )
+                        save_last_frame(history_pixels, frames_output_dir, f"{job_id}_mp4")
+
                     if video_quality == 'web_compatible':
                         os.makedirs(os.path.dirname(webm_output_filename), exist_ok=True)
                         save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=fps, video_quality=video_quality, format='webm')
                         print(f"Saved WebM video to {webm_output_filename}")
+                        
+                        # Save last frame of webm video if enabled
+                        if save_individual_frames_frames:
+                            frames_output_dir = os.path.join(
+                                intermediate_last_frames_folder if is_intermediate else last_frames_folder,
+                                os.path.splitext(os.path.basename(webm_output_filename))[0]
+                            )
+                            save_last_frame(history_pixels, frames_output_dir, f"{job_id}_webm")
                         
                     # Save individual frames if enabled
                     if ((is_intermediate and save_intermediate_frames) or 
@@ -968,14 +1021,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             save_bcthw_as_gif(history_pixels, gif_filename, fps=fps)
                             print(f"Saved GIF animation to {gif_filename}")
                             
-                            # Save individual frames from GIF if enabled
+                            # Save last frame from GIF if enabled instead of individual frames
                             if save_individual_frames_frames:
                                 frames_output_dir = os.path.join(
-                                    intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
+                                    intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                                     os.path.splitext(os.path.basename(gif_filename))[0]
                                 )
-                                save_individual_frames(history_pixels, frames_output_dir, f"{job_id}_gif")
-                                print(f"Saved individual GIF frames to {frames_output_dir}")
+                                save_last_frame(history_pixels, frames_output_dir, f"{job_id}_gif")
                         except Exception as e: print(f"Error saving GIF: {str(e)}")
 
                     if export_apng:
@@ -985,14 +1037,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             save_bcthw_as_apng(history_pixels, apng_filename, fps=fps)
                             print(f"Saved APNG animation to {apng_filename}")
                             
-                            # Save individual frames from APNG if enabled
+                            # Save last frame from APNG if enabled instead of individual frames
                             if save_individual_frames_frames:
                                 frames_output_dir = os.path.join(
-                                    intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
+                                    intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                                     os.path.splitext(os.path.basename(apng_filename))[0]
                                 )
-                                save_individual_frames(history_pixels, frames_output_dir, f"{job_id}_apng")
-                                print(f"Saved individual APNG frames to {frames_output_dir}")
+                                save_last_frame(history_pixels, frames_output_dir, f"{job_id}_apng")
                         except Exception as e: print(f"Error saving APNG: {str(e)}")
 
                     if export_webp:
@@ -1002,14 +1053,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             save_bcthw_as_webp(history_pixels, webp_filename, fps=fps)
                             print(f"Saved WebP animation to {webp_filename}")
                             
-                            # Save individual frames from WebP if enabled
+                            # Save last frame from WebP if enabled instead of individual frames
                             if save_individual_frames_frames:
                                 frames_output_dir = os.path.join(
-                                    intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
+                                    intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                                     os.path.splitext(os.path.basename(webp_filename))[0]
                                 )
-                                save_individual_frames(history_pixels, frames_output_dir, f"{job_id}_webp")
-                                print(f"Saved individual WebP frames to {frames_output_dir}")
+                                save_last_frame(history_pixels, frames_output_dir, f"{job_id}_webp")
                         except Exception as e: print(f"Error saving WebP: {str(e)}")
                 except ConnectionResetError as e:
                     print(f"Connection Reset Error during additional format saving: {str(e)}")
@@ -1376,25 +1426,35 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             # Create individual frames folders for batch output if needed
             batch_individual_frames_folder = None
             batch_intermediate_individual_frames_folder = None
+            batch_last_frames_folder = None
+            batch_intermediate_last_frames_folder = None
             if batch_save_individual_frames or batch_save_intermediate_frames or batch_save_individual_frames_frames:
                 batch_individual_frames_folder = os.path.join(output_folder, 'individual_frames')
                 batch_intermediate_individual_frames_folder = os.path.join(batch_individual_frames_folder, 'intermediate_videos')
+                batch_last_frames_folder = os.path.join(output_folder, 'last_frames')
+                batch_intermediate_last_frames_folder = os.path.join(batch_last_frames_folder, 'intermediate_videos')
                 os.makedirs(batch_individual_frames_folder, exist_ok=True)
                 os.makedirs(batch_intermediate_individual_frames_folder, exist_ok=True)
-                print(f"Created individual frames folders for batch output: {batch_individual_frames_folder}")
+                os.makedirs(batch_last_frames_folder, exist_ok=True)
+                os.makedirs(batch_intermediate_last_frames_folder, exist_ok=True)
+                print(f"Created frames folders for batch output in: {output_folder}")
             
             # Custom function for batch worker that overrides the individual_frames_folder path
             def batch_worker_override(*args, **kwargs):
                 # Save original paths
-                global individual_frames_folder, intermediate_individual_frames_folder
+                global individual_frames_folder, intermediate_individual_frames_folder, last_frames_folder, intermediate_last_frames_folder
                 
                 orig_individual_frames = individual_frames_folder
                 orig_intermediate_individual_frames = intermediate_individual_frames_folder
+                orig_last_frames = last_frames_folder
+                orig_intermediate_last_frames = intermediate_last_frames_folder
                 
                 # Override with batch paths if they exist
                 if batch_individual_frames_folder:
                     individual_frames_folder = batch_individual_frames_folder
                     intermediate_individual_frames_folder = batch_intermediate_individual_frames_folder
+                    last_frames_folder = batch_last_frames_folder
+                    intermediate_last_frames_folder = batch_intermediate_last_frames_folder
                 
                 try:
                     # Call original worker
@@ -1405,6 +1465,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                     if batch_individual_frames_folder:
                         individual_frames_folder = orig_individual_frames
                         intermediate_individual_frames_folder = orig_intermediate_individual_frames
+                        last_frames_folder = orig_last_frames
+                        intermediate_last_frames_folder = orig_intermediate_last_frames
             
             async_run(batch_worker_override if (batch_save_individual_frames or batch_save_intermediate_frames or batch_save_individual_frames_frames) else worker, 
                     input_image, current_end_image, prompt_line, n_prompt, current_seed, use_random_seed,
@@ -1568,7 +1630,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V25 - Start/End Frame - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V26 - Start/End Frame - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1589,7 +1651,7 @@ with block:
                         save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
                         save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
                         save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        save_individual_frames_frames = gr.Checkbox(label="Save Individual Frames of Frames", value=False, info="Save each frame of individual frame animations")
+                        save_individual_frames_frames = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder")
 
                     with gr.Row():
                         start_button = gr.Button(value="Start Generation", variant='primary')
@@ -1610,7 +1672,7 @@ with block:
                     with gr.Row():
                         batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
                         batch_save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        batch_save_individual_frames_frames = gr.Checkbox(label="Save Individual Frames of Frames", value=False, info="Save each frame of individual frame animations")
+                        batch_save_individual_frames_frames = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder")
 
                     with gr.Row():
                         batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
