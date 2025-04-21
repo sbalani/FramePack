@@ -150,19 +150,6 @@ try:
 except Exception as e:
     print(f"Error creating batch outputs directory: {str(e)}")
 
-def open_outputs_folder():
-    """Opens the outputs folder in the file explorer/manager in a cross-platform way."""
-    try:
-        if platform.system() == "Windows":
-            os.startfile(outputs_folder)
-        elif platform.system() == "Darwin":  # macOS
-            subprocess.run(["open", outputs_folder])
-        else:  # Linux
-            subprocess.run(["xdg-open", outputs_folder])
-        return "Opened outputs folder"
-    except Exception as e:
-        return f"Error opening folder: {str(e)}"
-
 def open_folder(folder_path):
     """Opens the specified folder in the file explorer/manager in a cross-platform way."""
     try:
@@ -333,20 +320,6 @@ def refresh_loras():
     lora_options = scan_lora_files()
     return gr.update(choices=[name for name, _ in lora_options], value="None")
 
-def open_loras_folder():
-    """Open the loras folder in the file explorer/finder."""
-    try:
-        if platform.system() == "Windows":
-            os.startfile(loras_folder)
-        elif platform.system() == "Darwin":  # macOS
-            subprocess.run(["open", loras_folder])
-        else:  # Linux
-            subprocess.run(["xdg-open", loras_folder])
-        return "Opened loras folder"
-    except Exception as e:
-        return f"Error opening folder: {str(e)}"
-
-# Add this helper function after all imports but before the worker function
 def safe_unload_lora(model, device=None):
     """
     Safely unload LoRA weights from the model, handling different model types.
@@ -1771,7 +1744,7 @@ with block:
             export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP (good balance of quality and file size)")
 
     lora_refresh_btn.click(fn=refresh_loras, outputs=[selected_lora])
-    lora_folder_btn.click(fn=open_loras_folder, outputs=[gr.Text(visible=False)])
+    lora_folder_btn.click(fn=lambda: open_folder(loras_folder), outputs=[gr.Text(visible=False)])
 
     # Update inputs list for single image processing
     ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_individual_frames_frames]
