@@ -462,7 +462,7 @@ def force_remove_lora_modules(model):
         return False
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
+def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
     # Declare global variables at the beginning of the function
     global transformer, text_encoder, text_encoder_2, image_encoder, vae
 
@@ -738,9 +738,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                                 try: module.to(gpu)
                                 except Exception as e: print(f"Error moving LoRA module {name}: {str(e)}")
 
-                if use_teacache:
-                    transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+                if teacache_threshold > 0:
+                    print(f"Teacache: {teacache_threshold}")
+                    transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_threshold)
                 else:
+                    print("Teacache disabled")
                     transformer.initialize_teacache(enable_teacache=False)
 
                 sampling_start_time = time.time()
@@ -928,7 +930,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     metadata = {
                         "Prompt": prompt,
                         "Seed": current_seed,
-                        "TeaCache": "Enabled" if use_teacache else "Disabled",
+                        "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                         "Video Length (seconds)": total_second_length,
                         "FPS": fps,
                         "Steps": steps,
@@ -1094,7 +1096,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
 
 # Modified process function signature
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
     global stream
     assert input_image is not None, 'No start input image!' # Changed assertion message
 
@@ -1127,7 +1129,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
         yield None, None, f"Processing prompt {prompt_idx+1}/{total_prompts}", '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
         
         # Pass current prompt to worker
-        async_run(worker, input_image, end_image, current_prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora, save_individual_frames, save_intermediate_frames, save_individual_frames_frames)
+        async_run(worker, input_image, end_image, current_prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora, save_individual_frames, save_intermediate_frames, save_individual_frames_frames)
 
         output_filename = None
         webm_filename = None
@@ -1231,7 +1233,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
 
 # Modified batch_process function signature
 def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n_prompt, seed, use_random_seed, total_second_length,
-                  latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache,
+                  latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold,
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
                   selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False, 
@@ -1407,7 +1409,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             async_run(batch_worker_override if (batch_save_individual_frames or batch_save_intermediate_frames or batch_save_individual_frames_frames) else worker, 
                     input_image, current_end_image, prompt_line, n_prompt, current_seed, use_random_seed,
                     total_second_length, latent_window_size, steps, cfg, gs, rs,
-                    gpu_memory_preservation, use_teacache, video_quality, export_gif,
+                    gpu_memory_preservation, teacache_threshold, video_quality, export_gif,
                     export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
                     selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora,
                     save_individual_frames=batch_save_individual_frames,
@@ -1462,7 +1464,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     metadata = {
                                         "Prompt": prompt_line,
                                         "Seed": current_seed,
-                                        "TeaCache": "Enabled" if use_teacache else "Disabled",
+                                        "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                                         "Video Length (seconds)": total_second_length,
                                         "FPS": fps,
                                         "Steps": steps,
@@ -1566,7 +1568,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V24 - Start/End Frame - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V25 - Start/End Frame - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1627,7 +1629,7 @@ with block:
                     resolution = gr.Dropdown(label="Resolution", choices=["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
 
                 with gr.Row():
-                    use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                    teacache_threshold = gr.Slider(label='TeaCache Threshold', minimum=0.0, maximum=0.5, value=0.15, step=0.01, info='0 = Disabled, 0.15 = Default. Higher values = more caching but potentially less detail.')
                     seed = gr.Number(label="Seed", value=31337, precision=0)
                     use_random_seed = gr.Checkbox(label="Random Seed", value=True, info="Use random seeds instead of incrementing")
 
@@ -1710,7 +1712,7 @@ with block:
     lora_folder_btn.click(fn=open_loras_folder, outputs=[gr.Text(visible=False)])
 
     # Update inputs list for single image processing
-    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_individual_frames_frames]
+    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_individual_frames_frames]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -1727,7 +1729,7 @@ with block:
     # Update inputs list for batch processing
     batch_ips = [batch_input_folder, batch_output_folder, batch_end_frame_folder, batch_prompt, n_prompt, seed, use_random_seed,
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
-                use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
+                teacache_threshold, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
                 batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora, batch_use_multiline_prompts,
                 batch_save_individual_frames, batch_save_intermediate_frames, batch_save_individual_frames_frames]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
