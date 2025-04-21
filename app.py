@@ -25,7 +25,7 @@ from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp, save_bcthw_as_gif, save_bcthw_as_apng, save_bcthw_as_webp
+from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp, save_bcthw_as_gif, save_bcthw_as_apng, save_bcthw_as_webp, generate_new_timestamp, save_individual_frames
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
@@ -111,6 +111,8 @@ intermediate_gif_videos_folder = os.path.join(outputs_folder, 'intermediate_gif_
 intermediate_apng_videos_folder = os.path.join(outputs_folder, 'intermediate_apng_videos')
 intermediate_webp_videos_folder = os.path.join(outputs_folder, 'intermediate_webp_videos')
 intermediate_webm_videos_folder = os.path.join(outputs_folder, 'intermediate_webm_videos')
+individual_frames_folder = os.path.join(outputs_folder, 'individual_frames')
+intermediate_individual_frames_folder = os.path.join(individual_frames_folder, 'intermediate_videos')
 loras_folder = os.path.join(current_dir, 'loras')  # Add loras folder
 
 # Ensure all directories exist with proper error handling
@@ -126,6 +128,8 @@ for directory in [
     intermediate_apng_videos_folder,
     intermediate_webp_videos_folder,
     intermediate_webm_videos_folder,
+    individual_frames_folder,
+    intermediate_individual_frames_folder,
     loras_folder  # Add loras folder to the list
 ]:
     try:
@@ -458,7 +462,7 @@ def force_remove_lora_modules(model):
         return False
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True):
+def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
     # Declare global variables at the beginning of the function
     global transformer, text_encoder, text_encoder_2, image_encoder, vae
 
@@ -504,7 +508,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
         last_used_seed = current_seed
         stream.output_queue.push(('seed_update', current_seed))
 
-        job_id = generate_timestamp()
+        # Use the new naming scheme for job_id
+        job_id = generate_new_timestamp()
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Starting generation {gen_idx+1}/{num_generations} with seed {current_seed}...'))))
 
         try:
@@ -872,11 +877,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                 is_intermediate = not is_last_section
                 if is_intermediate:
-                    output_filename = os.path.join(intermediate_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.mp4')
-                    webm_output_filename = os.path.join(intermediate_webm_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webm')
+                    output_filename = os.path.join(intermediate_videos_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
+                    webm_output_filename = os.path.join(intermediate_webm_videos_folder, f'{job_id}_{total_generated_latent_frames}.webm')
                 else:
-                    output_filename = os.path.join(outputs_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.mp4')
-                    webm_output_filename = os.path.join(webm_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webm')
+                    output_filename = os.path.join(outputs_folder, f'{job_id}.mp4')  # Use only the timestamp as filename for final output
+                    webm_output_filename = os.path.join(webm_videos_folder, f'{job_id}.webm')
 
                 save_start_time = time.time()
                 try:
@@ -888,6 +893,19 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         os.makedirs(os.path.dirname(webm_output_filename), exist_ok=True)
                         save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=fps, video_quality=video_quality, format='webm')
                         print(f"Saved WebM video to {webm_output_filename}")
+                        
+                    # Save individual frames if enabled
+                    if ((is_intermediate and save_intermediate_frames) or 
+                        (not is_intermediate and save_individual_frames)):
+                        # Create a subfolder with the video filename
+                        frames_output_dir = os.path.join(
+                            intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
+                            os.path.splitext(os.path.basename(output_filename))[0]
+                        )
+                        # Use the filename base for individual frames
+                        from diffusers_helper.utils import save_individual_frames
+                        save_individual_frames(history_pixels, frames_output_dir, job_id)
+                        print(f"Saved individual frames to {frames_output_dir}")
                 except ConnectionResetError as e:
                     print(f"Connection Reset Error during video saving: {str(e)}")
                     print("Continuing with the process anyway...")
@@ -942,27 +960,54 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 # Save additional formats
                 try:
                     if export_gif:
-                        gif_filename = os.path.join(intermediate_gif_videos_folder if is_intermediate else gif_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.gif')
+                        gif_filename = os.path.join(intermediate_gif_videos_folder if is_intermediate else gif_videos_folder, f'{job_id}_{total_generated_latent_frames}.gif' if is_intermediate else f'{job_id}.gif')
                         try:
                             os.makedirs(os.path.dirname(gif_filename), exist_ok=True)
                             save_bcthw_as_gif(history_pixels, gif_filename, fps=fps)
                             print(f"Saved GIF animation to {gif_filename}")
+                            
+                            # Save individual frames from GIF if enabled
+                            if save_individual_frames_frames:
+                                frames_output_dir = os.path.join(
+                                    intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
+                                    os.path.splitext(os.path.basename(gif_filename))[0]
+                                )
+                                save_individual_frames(history_pixels, frames_output_dir, f"{job_id}_gif")
+                                print(f"Saved individual GIF frames to {frames_output_dir}")
                         except Exception as e: print(f"Error saving GIF: {str(e)}")
 
                     if export_apng:
-                        apng_filename = os.path.join(intermediate_apng_videos_folder if is_intermediate else apng_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.png')
+                        apng_filename = os.path.join(intermediate_apng_videos_folder if is_intermediate else apng_videos_folder, f'{job_id}_{total_generated_latent_frames}.png' if is_intermediate else f'{job_id}.png')
                         try:
                             os.makedirs(os.path.dirname(apng_filename), exist_ok=True)
                             save_bcthw_as_apng(history_pixels, apng_filename, fps=fps)
                             print(f"Saved APNG animation to {apng_filename}")
+                            
+                            # Save individual frames from APNG if enabled
+                            if save_individual_frames_frames:
+                                frames_output_dir = os.path.join(
+                                    intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
+                                    os.path.splitext(os.path.basename(apng_filename))[0]
+                                )
+                                save_individual_frames(history_pixels, frames_output_dir, f"{job_id}_apng")
+                                print(f"Saved individual APNG frames to {frames_output_dir}")
                         except Exception as e: print(f"Error saving APNG: {str(e)}")
 
                     if export_webp:
-                        webp_filename = os.path.join(intermediate_webp_videos_folder if is_intermediate else webp_videos_folder, f'{job_id}_seed{current_seed}_{total_generated_latent_frames}.webp')
+                        webp_filename = os.path.join(intermediate_webp_videos_folder if is_intermediate else webp_videos_folder, f'{job_id}_{total_generated_latent_frames}.webp' if is_intermediate else f'{job_id}.webp')
                         try:
                             os.makedirs(os.path.dirname(webp_filename), exist_ok=True)
                             save_bcthw_as_webp(history_pixels, webp_filename, fps=fps)
                             print(f"Saved WebP animation to {webp_filename}")
+                            
+                            # Save individual frames from WebP if enabled
+                            if save_individual_frames_frames:
+                                frames_output_dir = os.path.join(
+                                    intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
+                                    os.path.splitext(os.path.basename(webp_filename))[0]
+                                )
+                                save_individual_frames(history_pixels, frames_output_dir, f"{job_id}_webp")
+                                print(f"Saved individual WebP frames to {frames_output_dir}")
                         except Exception as e: print(f"Error saving WebP: {str(e)}")
                 except ConnectionResetError as e:
                     print(f"Connection Reset Error during additional format saving: {str(e)}")
@@ -1049,7 +1094,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
 
 # Modified process function signature
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False):
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
     global stream
     assert input_image is not None, 'No start input image!' # Changed assertion message
 
@@ -1082,7 +1127,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
         yield None, None, f"Processing prompt {prompt_idx+1}/{total_prompts}", '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
         
         # Pass current prompt to worker
-        async_run(worker, input_image, end_image, current_prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora)
+        async_run(worker, input_image, end_image, current_prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora, save_individual_frames, save_intermediate_frames, save_individual_frames_frames)
 
         output_filename = None
         webm_filename = None
@@ -1189,7 +1234,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache,
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
-                  selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False):
+                  selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False, 
+                  save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
     global stream
 
     lora_path = get_lora_path_from_name(selected_lora)
@@ -1324,11 +1370,49 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
 
             # Reset stream and run worker
             stream = AsyncStream()
-            async_run(worker, input_image, current_end_image, prompt_line, n_prompt, current_seed, use_random_seed,
+            
+            # Create individual frames folders for batch output if needed
+            batch_individual_frames_folder = None
+            batch_intermediate_individual_frames_folder = None
+            if batch_save_individual_frames or batch_save_intermediate_frames or batch_save_individual_frames_frames:
+                batch_individual_frames_folder = os.path.join(output_folder, 'individual_frames')
+                batch_intermediate_individual_frames_folder = os.path.join(batch_individual_frames_folder, 'intermediate_videos')
+                os.makedirs(batch_individual_frames_folder, exist_ok=True)
+                os.makedirs(batch_intermediate_individual_frames_folder, exist_ok=True)
+                print(f"Created individual frames folders for batch output: {batch_individual_frames_folder}")
+            
+            # Custom function for batch worker that overrides the individual_frames_folder path
+            def batch_worker_override(*args, **kwargs):
+                # Save original paths
+                global individual_frames_folder, intermediate_individual_frames_folder
+                
+                orig_individual_frames = individual_frames_folder
+                orig_intermediate_individual_frames = intermediate_individual_frames_folder
+                
+                # Override with batch paths if they exist
+                if batch_individual_frames_folder:
+                    individual_frames_folder = batch_individual_frames_folder
+                    intermediate_individual_frames_folder = batch_intermediate_individual_frames_folder
+                
+                try:
+                    # Call original worker
+                    result = worker(*args, **kwargs)
+                    return result
+                finally:
+                    # Restore original paths
+                    if batch_individual_frames_folder:
+                        individual_frames_folder = orig_individual_frames
+                        intermediate_individual_frames_folder = orig_intermediate_individual_frames
+            
+            async_run(batch_worker_override if (batch_save_individual_frames or batch_save_intermediate_frames or batch_save_individual_frames_frames) else worker, 
+                    input_image, current_end_image, prompt_line, n_prompt, current_seed, use_random_seed,
                     total_second_length, latent_window_size, steps, cfg, gs, rs,
                     gpu_memory_preservation, use_teacache, video_quality, export_gif,
                     export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
-                    selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora)
+                    selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora,
+                    save_individual_frames=batch_save_individual_frames,
+                    save_intermediate_frames=batch_save_intermediate_frames,
+                    save_individual_frames_frames=batch_save_individual_frames_frames)
 
             output_filename = None
             last_output = None
@@ -1482,7 +1566,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V23 - Start/End Frame - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V24 - Start/End Frame - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1501,6 +1585,9 @@ with block:
 
                     with gr.Row():
                         save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
+                        save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
+                        save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
+                        save_individual_frames_frames = gr.Checkbox(label="Save Individual Frames of Frames", value=False, info="Save each frame of individual frame animations")
 
                     with gr.Row():
                         start_button = gr.Button(value="Start Generation", variant='primary')
@@ -1517,6 +1604,11 @@ with block:
                         batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip files that already exist in the output folder")
                         batch_save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
                         batch_use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="Process each line of the prompt as a separate generation")
+
+                    with gr.Row():
+                        batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
+                        batch_save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
+                        batch_save_individual_frames_frames = gr.Checkbox(label="Save Individual Frames of Frames", value=False, info="Save each frame of individual frame animations")
 
                     with gr.Row():
                         batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
@@ -1617,7 +1709,7 @@ with block:
     lora_folder_btn.click(fn=open_loras_folder, outputs=[gr.Text(visible=False)])
 
     # Update inputs list for single image processing
-    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts]
+    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_individual_frames_frames]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -1635,7 +1727,8 @@ with block:
     batch_ips = [batch_input_folder, batch_output_folder, batch_end_frame_folder, batch_prompt, n_prompt, seed, use_random_seed,
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                 use_teacache, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
-                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora, batch_use_multiline_prompts]
+                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora, batch_use_multiline_prompts,
+                batch_save_individual_frames, batch_save_intermediate_frames, batch_save_individual_frames_frames]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     batch_end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])

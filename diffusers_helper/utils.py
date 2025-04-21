@@ -846,6 +846,58 @@ def generate_timestamp():
     return f"{timestamp}_{milliseconds}_{random_number}"
 
 
+def generate_new_timestamp():
+    """Generate a timestamp in the new format: YYYY_MM_DD_HH_MM_SS_mmm."""
+    now = datetime.datetime.now()
+    timestamp = now.strftime('%Y_%m_%d_%H_%M_%S')
+    milliseconds = f"{int(now.microsecond / 1000):03d}"
+    return f"{timestamp}_{milliseconds}"
+
+
+def save_individual_frames(x, output_dir, base_filename, return_frame_paths=False):
+    """
+    Save each individual frame from a video tensor as a separate image file.
+    
+    Args:
+        x: Input tensor of shape [batch, channels, time, height, width]
+        output_dir: Directory to save the individual frames
+        base_filename: Base filename for the individual frames
+        return_frame_paths: Whether to return the list of saved frame paths
+        
+    Returns:
+        List of saved frame paths (if return_frame_paths=True)
+    """
+    from PIL import Image
+    
+    b, c, t, h, w = x.shape
+    
+    per_row = b
+    for p in [6, 5, 4, 3, 2]:
+        if b % p == 0:
+            per_row = p
+            break
+    
+    # Create directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create normalized and rearranged tensor
+    x_normalized = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
+    x_uint8 = x_normalized.detach().cpu().to(torch.uint8)
+    x_rearranged = einops.rearrange(x_uint8, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
+    
+    # Save individual frames
+    frame_paths = []
+    for i in range(x_rearranged.shape[0]):
+        frame_path = os.path.join(output_dir, f"{base_filename}_frame_{i:04d}.png")
+        frame_paths.append(frame_path)
+        img = Image.fromarray(x_rearranged[i].numpy())
+        img.save(frame_path)
+        
+    if return_frame_paths:
+        return frame_paths
+    return None
+
+
 def write_PIL_image_with_png_info(image, metadata, path):
     from PIL.PngImagePlugin import PngInfo
 
