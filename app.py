@@ -1230,9 +1230,10 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
 
         # Process multi-line prompts if enabled
         if batch_use_multiline_prompts and current_prompt.strip():
-            # Split prompt by lines using splitlines() for robustness, filter empty/short lines
-            prompt_lines = [line.strip() for line in current_prompt.splitlines()]
-            prompt_lines = [line for line in prompt_lines if len(line.strip()) >= 2]
+            # Split specifically by newline character first, then strip and filter
+            potential_lines = current_prompt.split('\n')
+            prompt_lines = [line.strip() for line in potential_lines if line.strip()] # Strip and remove empty lines
+            prompt_lines = [line for line in prompt_lines if len(line) >= 2] # Filter short lines
             
             if not prompt_lines:
                 # If no valid prompts after filtering, use the original prompt as one line
