@@ -1,3 +1,4 @@
+
 from diffusers_helper.hf_login import login
 
 import os
@@ -10,6 +11,8 @@ import glob
 import re # Added for timestamp parsing
 import math
 from typing import Optional # Added for type hinting
+import sys # Added for RIFE
+import cv2 # Added for RIFE
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -565,7 +568,7 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
     return reversed_sections
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False): # Added flags at the end
+def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
     # Declare global variables at the beginning of the function
     global transformer, text_encoder, text_encoder_2, image_encoder, vae
     global individual_frames_folder, intermediate_individual_frames_folder, last_frames_folder, intermediate_last_frames_folder # Ensure these are accessible if modified
@@ -1094,11 +1097,12 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                 save_start_time = time.time()
                 try:
+                    # --- Existing MP4 Saving ---
                     os.makedirs(os.path.dirname(output_filename), exist_ok=True)
                     save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, video_quality=video_quality)
                     print(f"Saved MP4 video to {output_filename}")
 
-                    # Save last frame of main video if enabled
+                    # --- Existing Last Frame Saving (for MP4) ---
                     if save_last_frame_flag: # Use the flag
                         frames_output_dir = os.path.join(
                             intermediate_last_frames_folder if is_intermediate else last_frames_folder,
@@ -1106,6 +1110,71 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         )
                         save_last_frame(history_pixels, frames_output_dir, f"{job_id}_mp4")
 
+                    # --- START OF RIFE INTEGRATION ---
+                    if rife_enabled and output_filename and os.path.exists(output_filename):
+                        print(f"RIFE Enabled: Processing {output_filename}")
+                        try:
+                            # 1. Check source FPS (Optional but recommended)
+                            cap = cv2.VideoCapture(output_filename)
+                            source_fps = cap.get(cv2.CAP_PROP_FPS)
+                            cap.release()
+                            print(f"Source MP4 FPS: {source_fps:.2f}")
+
+                            # Only apply RIFE if source FPS is not excessively high (e.g., <= 60)
+                            if source_fps <= 60:
+                                # 2. Determine multiplier
+                                multiplier_val = "4" if rife_multiplier == "4x FPS" else "2"
+                                print(f"Using RIFE multiplier: {multiplier_val}x")
+
+                                # 3. Construct output filename
+                                rife_output_filename = os.path.splitext(output_filename)[0] + '_extra_FPS.mp4'
+                                print(f"RIFE output filename: {rife_output_filename}")
+
+                                # 4. Construct RIFE command
+                                rife_script_path = os.path.abspath(os.path.join(current_dir, "Practical-RIFE", "inference_video.py"))
+                                rife_model_path = os.path.abspath(os.path.join(current_dir, "Practical-RIFE", "train_log")) # Directory containing model files
+
+                                # Check if script and model dir exist
+                                if not os.path.exists(rife_script_path):
+                                     print(f"ERROR: RIFE script not found at {rife_script_path}")
+                                elif not os.path.exists(rife_model_path):
+                                    print(f"ERROR: RIFE model directory not found at {rife_model_path}")
+                                else:
+                                    # Use full paths and quotes for safety
+                                    cmd = (
+                                        f'"{sys.executable}" "{rife_script_path}" '
+                                        f'--model="{rife_model_path}" '
+                                        f'--multi={multiplier_val} '
+                                        f'--video="{os.path.abspath(output_filename)}" '
+                                        f'--output="{os.path.abspath(rife_output_filename)}"'
+                                    )
+                                    print(f"Executing RIFE command: {cmd}")
+
+                                    # 5. Execute command
+                                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=os.environ)
+
+                                    if result.returncode == 0:
+                                        if os.path.exists(rife_output_filename):
+                                            print(f"Successfully applied RIFE. Saved as: {rife_output_filename}")
+                                            # Optionally yield rife_output_filename if you want it displayed immediately
+                                            # stream.output_queue.push(('file', rife_output_filename)) # Example
+                                        else:
+                                             print(f"RIFE command succeeded but output file missing: {rife_output_filename}")
+                                             print(f"RIFE stdout:\n{result.stdout}")
+                                             print(f"RIFE stderr:\n{result.stderr}")
+                                    else:
+                                        print(f"Error applying RIFE (return code {result.returncode}).")
+                                        print(f"RIFE stdout:\n{result.stdout}")
+                                        print(f"RIFE stderr:\n{result.stderr}")
+                            else:
+                                print(f"Skipping RIFE because source FPS ({source_fps:.2f}) is > 60.")
+
+                        except Exception as rife_err:
+                            print(f"Error during RIFE processing for {output_filename}: {str(rife_err)}")
+                            traceback.print_exc()
+                    # --- END OF RIFE INTEGRATION ---
+
+                    # --- Existing WebM Saving ---
                     if video_quality == 'web_compatible':
                         os.makedirs(os.path.dirname(webm_output_filename), exist_ok=True)
                         save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=fps, video_quality=video_quality, format='webm')
@@ -1177,7 +1246,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         metadata["LoRA Scale"] = lora_scale
                         metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
 
+                    # Only save metadata for the original MP4 file
                     if output_filename: save_processing_metadata(output_filename, metadata)
+                    # Metadata saving for other formats (no change needed for RIFE here)
                     if export_gif and os.path.exists(os.path.splitext(output_filename)[0] + '.gif'):
                         save_processing_metadata(os.path.splitext(output_filename)[0] + '.gif', metadata)
                     if export_apng and os.path.exists(os.path.splitext(output_filename)[0] + '.png'):
@@ -1189,7 +1260,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 # --- END MODIFICATION for metadata ---
 
 
-                # Save additional formats
+                # Save additional formats (no change needed for RIFE)
                 try:
                     if export_gif:
                         gif_filename = os.path.join(intermediate_gif_videos_folder if is_intermediate else gif_videos_folder, f'{job_id}_{total_generated_latent_frames}.gif' if is_intermediate else f'{job_id}.gif')
@@ -1249,6 +1320,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 print(f"Saving operations completed in {save_time:.2f} seconds")
                 print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
+                # Yield the original filename to the UI
                 stream.output_queue.push(('file', output_filename))
 
                 if is_last_section:
@@ -1323,7 +1395,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
 
 # Modified process function signature
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False): # Matched param names
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
     global stream
     assert input_image is not None, 'No start input image!' # Changed assertion message
 
@@ -1369,11 +1441,13 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
 
         # Pass the use_multiline_prompts flag correctly to the worker
         # Also pass the other boolean flags correctly
+        # Pass RIFE params
         async_run(worker, input_image, end_image, prompt_to_worker, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora,
                   save_individual_frames_flag=save_individual_frames, # Pass flags with correct names
                   save_intermediate_frames_flag=save_intermediate_frames,
                   save_last_frame_flag=save_last_frame,
-                  use_multiline_prompts_flag=use_multiline_prompts)
+                  use_multiline_prompts_flag=use_multiline_prompts,
+                  rife_enabled=rife_enabled, rife_multiplier=rife_multiplier) # Pass RIFE params
         # --- MODIFICATION END ---
 
         output_filename = None
@@ -1488,7 +1562,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
                   selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False,
-                  batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False): # Matched param names
+                  batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False,
+                  rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
     global stream
 
     lora_path = get_lora_path_from_name(selected_lora)
@@ -1670,6 +1745,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             override_needed = batch_save_individual_frames or batch_save_intermediate_frames or batch_save_last_frame
 
             # Pass the correct prompt segment and the flag to the worker
+            # Pass RIFE params
             async_run(batch_worker_override if override_needed else worker,
                     input_image, current_end_image, current_prompt_segment, n_prompt, current_seed, use_random_seed,
                     total_second_length, latent_window_size, steps, cfg, gs, rs,
@@ -1679,7 +1755,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                     save_individual_frames_flag=batch_save_individual_frames, # Pass flags
                     save_intermediate_frames_flag=batch_save_intermediate_frames,
                     save_last_frame_flag=batch_save_last_frame,
-                    use_multiline_prompts_flag=batch_use_multiline_prompts) # Pass the flag
+                    use_multiline_prompts_flag=batch_use_multiline_prompts, # Pass the flag
+                    rife_enabled=rife_enabled, rife_multiplier=rife_multiplier) # Pass RIFE params
 
 
             output_filename = None
@@ -1693,7 +1770,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                     # Update the seed for the *next* potential generation within this prompt loop
                     current_seed = data
                     yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, gr.update()
-                
+
                 if flag == 'final_seed':
                      # This seed was the last one used for the *previous* completed generation
                      # We might want to use the seed from 'seed_update' if that's more relevant for the *next* step
@@ -1725,7 +1802,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                 prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if batch_use_multiline_prompts else ""
                                 yield last_output, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generated video {generation_count_for_image}/{num_generations}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
 
-                                # Save metadata
+                                # Save metadata for the original MP4
                                 if save_metadata:
                                     gen_time = time.time() - gen_start_time_batch
                                     generation_time_seconds = int(gen_time)
@@ -1760,7 +1837,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
                                     save_processing_metadata(moved_file, metadata)
 
-                                # Handle other formats
+                                # Handle other formats (no change for RIFE here)
                                 if export_gif:
                                     gif_filename = os.path.splitext(output_filename)[0] + '.gif'
                                     moved_gif = move_and_rename_output_file(gif_filename, output_folder, f"{modified_image_filename_base}.gif")
@@ -1780,6 +1857,19 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         if save_metadata: save_processing_metadata(moved_webm, metadata)
                                         last_output = moved_webm
                                         final_output = moved_webm
+
+                                # Move the RIFE-enhanced file if it exists (copy, don't rename to base)
+                                rife_original_path = os.path.splitext(output_filename)[0] + '_extra_FPS.mp4'
+                                if os.path.exists(rife_original_path):
+                                    # Create a filename like 'base_p1_g1_extra_FPS.mp4'
+                                    rife_target_filename = f"{modified_image_filename_base}_extra_FPS.mp4"
+                                    rife_target_path = os.path.join(output_folder, rife_target_filename)
+                                    try:
+                                        shutil.copy2(rife_original_path, rife_target_path)
+                                        print(f"Copied RIFE enhanced file to batch outputs: {rife_target_path}")
+                                    except Exception as e:
+                                        print(f"Error copying RIFE enhanced file to {rife_target_path}: {str(e)}")
+
 
                         else: # Intermediate file
                             prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if batch_use_multiline_prompts else ""
@@ -1987,17 +2077,27 @@ with block:
                 info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility"
             )
 
+                        # --- Start of RIFE UI Addition ---
+            gr.Markdown("### RIFE Frame Interpolation (MP4 Only)")
+            with gr.Row():
+                rife_enabled = gr.Checkbox(label="Enable RIFE (2x/4x FPS)", value=False, info="Increases FPS of generated MP4s using RIFE. Saves as '[filename]_extra_FPS.mp4'")
+                rife_multiplier = gr.Radio(choices=["2x FPS", "4x FPS"], label="RIFE FPS Multiplier", value="2x FPS", info="Choose the frame rate multiplication factor.")
+            # --- End of RIFE UI Addition ---
+
             gr.Markdown("### Additional Export Formats")
             gr.Markdown("Select additional formats to export alongside MP4:")
-            export_gif = gr.Checkbox(label="Export as GIF", value=False, info="Save animation as GIF (larger file size but widely compatible)")
-            export_apng = gr.Checkbox(label="Export as APNG", value=False, info="Save animation as Animated PNG (better quality than GIF but less compatible)")
-            export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP (good balance of quality and file size)")
+            with gr.Row():
+                export_gif = gr.Checkbox(label="Export as GIF", value=False, info="Save animation as GIF (larger file size but widely compatible)")
+                export_apng = gr.Checkbox(label="Export as APNG", value=False, info="Save animation as Animated PNG (better quality than GIF but less compatible)")
+                export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP (good balance of quality and file size)")
+
+
 
     lora_refresh_btn.click(fn=refresh_loras, outputs=[selected_lora])
     lora_folder_btn.click(fn=lambda: open_folder(loras_folder), outputs=[gr.Text(visible=False)])
 
     # Update inputs list for single image processing - match names with process function
-    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_last_frame]
+    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_last_frame, rife_enabled, rife_multiplier] # Added RIFE UI components
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -2016,7 +2116,8 @@ with block:
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                 teacache_threshold, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
                 batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora, batch_use_multiline_prompts,
-                batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame]
+                batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame,
+                rife_enabled, rife_multiplier] # Added RIFE UI components
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     batch_end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
