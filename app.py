@@ -7,9 +7,10 @@ import random
 import time  # Add time module for duration tracking
 import shutil
 import glob
+import re # Added for timestamp parsing
+import math
+from typing import Optional # Added for type hinting
 
-# Add this line to handle HF download errors
-os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 import gradio as gr
@@ -19,7 +20,6 @@ import einops
 import safetensors.torch as sf
 import numpy as np
 import argparse
-import math
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -138,7 +138,7 @@ for directory in [
 ]:
     try:
         os.makedirs(directory, exist_ok=True)
-        print(f"Created directory: {directory}")
+        # print(f"Created directory: {directory}") # Reduce console spam
     except Exception as e:
         print(f"Error creating directory {directory}: {str(e)}")
 
@@ -442,7 +442,7 @@ print_supported_image_formats()
 
 def save_last_frame(frames, output_dir, filename_base):
     """Save only the last frame from a video frames tensor
-    
+
     Args:
         frames: Tensor of frames in bcthw format
         output_dir: Directory to save the last frame
@@ -451,15 +451,15 @@ def save_last_frame(frames, output_dir, filename_base):
     try:
         # Make sure output directory exists
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Extract only the last frame but keep the tensor structure (b,c,t,h,w)
         # where t=1 to be compatible with save_individual_frames function
         last_frame_tensor = frames[:, :, -1:, :, :]
-        
+
         # Use the existing utils function to ensure consistent color processing
         from diffusers_helper.utils import save_individual_frames
         frame_paths = save_individual_frames(last_frame_tensor, output_dir, f"{filename_base}_last", return_frame_paths=True)
-        
+
         if frame_paths and len(frame_paths) > 0:
             print(f"Saved last frame to {frame_paths[0]}")
             return frame_paths[0]
@@ -471,10 +471,104 @@ def save_last_frame(frames, output_dir, filename_base):
         traceback.print_exc()
         return None
 
+def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, latent_window_size: int, fps: int) -> Optional[list[tuple[float, str]]]:
+    """
+    Parses prompts in the format '[seconds] prompt_text' per line.
+    Handles time reversal for the generation process.
+
+    Args:
+        prompt_text: The full prompt text, potentially multi-line.
+        total_duration: Total video duration in seconds.
+        latent_window_size: Latent window size (e.g., 9).
+        fps: Frames per second (e.g., 30).
+
+    Returns:
+        A list of tuples sorted by REVERSED start time: [(reversed_start_time, prompt), ...],
+        or None if the format is not detected or invalid.
+    """
+    lines = prompt_text.strip().split('\n')
+    sections = []
+    has_timestamps = False
+    default_prompt = None
+
+    # Regex to match '[seconds]' at the start of a line
+    pattern = r'^\s*\[(\d+(?:\.\d+)?)\]\s*(.*)'
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        match = re.match(pattern, line)
+        if match:
+            has_timestamps = True
+            try:
+                time_sec = float(match.group(1))
+                text = match.group(2).strip()
+                if text: # Only add if there's actual prompt text
+                    sections.append({"original_time": time_sec, "prompt": text})
+            except ValueError:
+                print(f"Warning: Invalid time format in line: {line}")
+                return None # Indicate failure if format is wrong
+        elif i == 0 and not has_timestamps:
+            # If the first line doesn't have a timestamp, consider it the default
+            # only if *no* timestamps are found later. We'll handle this after the loop.
+             default_prompt = line
+        elif has_timestamps:
+             # If we've already seen timestamps, ignore subsequent lines without them
+             print(f"Warning: Ignoring line without timestamp after timestamped lines detected: {line}")
+
+
+    if not has_timestamps:
+        # No timestamp format detected, return None to signal using the original prompt as is
+        return None
+
+    if not sections and default_prompt:
+         # Edge case: Only a default prompt line was found, but we were expecting timestamps.
+         # Treat as invalid timestamp format.
+         return None
+    elif not sections:
+         # No valid sections found at all
+         return None
+
+    # Sort by original time
+    sections.sort(key=lambda x: x["original_time"])
+
+    # Add a 0s section if one doesn't exist, using the first prompt found if needed
+    if not any(s['original_time'] == 0.0 for s in sections):
+        first_prompt = sections[0]['prompt'] if sections else "default prompt"
+        sections.insert(0, {"original_time": 0.0, "prompt": first_prompt})
+        sections.sort(key=lambda x: x["original_time"]) # Re-sort after insertion
+
+    # Calculate reversed start times (generation happens end-to-start)
+    # The start time of a reversed section corresponds to the end time of the original section
+    reversed_sections = []
+    for i in range(len(sections)):
+        original_start_time = sections[i]["original_time"]
+        # The *next* section's start time determines the *end* time of the current section
+        original_end_time = sections[i+1]["original_time"] if i + 1 < len(sections) else total_duration
+
+        # Reversed start time: When this section *starts* being generated (from the end)
+        reversed_start_time = total_duration - original_end_time
+        # Reversed end time: When this section *stops* being generated (from the end)
+        # reversed_end_time = total_duration - original_start_time # Not strictly needed for selection
+
+        # Ensure non-negative times
+        reversed_start_time = max(0.0, reversed_start_time)
+
+        reversed_sections.append((reversed_start_time, sections[i]["prompt"]))
+
+    # Sort by the reversed start time
+    reversed_sections.sort(key=lambda x: x[0])
+
+    print(f"Parsed and reversed timestamped prompts: {reversed_sections}")
+    return reversed_sections
+
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
+def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False): # Added flags at the end
     # Declare global variables at the beginning of the function
     global transformer, text_encoder, text_encoder_2, image_encoder, vae
+    global individual_frames_folder, intermediate_individual_frames_folder, last_frames_folder, intermediate_last_frames_folder # Ensure these are accessible if modified
 
     total_latent_sections = (total_second_length * fps) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
@@ -483,6 +577,24 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
     if hasattr(transformer, "peft_config") and transformer.peft_config:
         print("Cleaning up previous LoRA weights at worker start")
         safe_unload_lora(transformer, gpu)
+
+    # --- MODIFICATION START ---
+    # Check for timestamped prompts ONLY if multi-line is disabled
+    parsed_prompts = None
+    encoded_prompts = {} # Dictionary to store encoded prompts {prompt_text: (tensors)}
+    using_timestamped_prompts = False
+
+    if not use_multiline_prompts_flag: # Check the flag passed from process/batch_process
+        parsed_prompts = parse_simple_timestamped_prompt(prompt, total_second_length, latent_window_size, fps)
+        if parsed_prompts:
+            using_timestamped_prompts = True
+            print("Using timestamped prompts.")
+        else:
+            print("Timestamped prompt format not detected or invalid, using the entire prompt as one.")
+    else:
+        print("Multi-line prompts enabled, skipping timestamp parsing.")
+    # --- MODIFICATION END ---
+
 
     current_seed = seed
     all_outputs = {}
@@ -536,15 +648,53 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 fake_diffusers_current_device(text_encoder, gpu)
                 load_model_as_complete(text_encoder_2, target_device=gpu)
 
-            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            # --- MODIFICATION START ---
+            # Pre-encode prompts based on whether we parsed timestamps or not
+            if using_timestamped_prompts:
+                unique_prompts = set(p[1] for p in parsed_prompts)
+                stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Encoding {len(unique_prompts)} unique timestamped prompts...'))))
+                for p_text in unique_prompts:
+                    if p_text not in encoded_prompts:
+                         llama_vec_p, clip_l_pooler_p = encode_prompt_conds(p_text, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+                         llama_vec_p, llama_attention_mask_p = crop_or_pad_yield_mask(llama_vec_p, length=512)
+                         encoded_prompts[p_text] = (llama_vec_p, llama_attention_mask_p, clip_l_pooler_p)
+                print(f"Pre-encoded {len(encoded_prompts)} unique prompts.")
+                # Use the tensors from the *first* parsed prompt for negative prompt shape matching if needed
+                # Ensure parsed_prompts is not empty before accessing
+                if not parsed_prompts:
+                    raise ValueError("Timestamped prompts were detected but parsing resulted in an empty list.")
+                llama_vec, llama_attention_mask, clip_l_pooler = encoded_prompts[parsed_prompts[0][1]]
+            else:
+                # Original single prompt encoding
+                stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Encoding single prompt...'))))
+                llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+                llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+                # Store it for consistency, although not strictly needed if not timestamped
+                encoded_prompts[prompt] = (llama_vec, llama_attention_mask, clip_l_pooler)
 
-            if cfg == 1:
-                llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+            # Negative prompt encoding (remains mostly the same)
+            if cfg == 1.0: # Check against float
+                # Use zero tensors matching the shape of the (first) positive prompt
+                first_prompt_key = list(encoded_prompts.keys())[0]
+                ref_llama_vec = encoded_prompts[first_prompt_key][0]
+                ref_clip_l = encoded_prompts[first_prompt_key][2]
+                llama_vec_n, clip_l_pooler_n = torch.zeros_like(ref_llama_vec), torch.zeros_like(ref_clip_l)
+                # Need a zero mask too
+                ref_llama_mask = encoded_prompts[first_prompt_key][1]
+                llama_attention_mask_n = torch.zeros_like(ref_llama_mask)
             else:
                 llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+                llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
-            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-            llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+            # Dtype conversions
+            for p_text in encoded_prompts:
+                 l_vec, l_mask, c_pool = encoded_prompts[p_text]
+                 encoded_prompts[p_text] = (l_vec.to(transformer.dtype), l_mask, c_pool.to(transformer.dtype))
+
+            llama_vec_n = llama_vec_n.to(transformer.dtype)
+            clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
+            # --- MODIFICATION END ---
+
 
             # Determine bucket size based on start image
             H, W, C = input_image.shape
@@ -606,11 +756,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 image_encoder_last_hidden_state = (image_encoder_last_hidden_state + end_image_encoder_last_hidden_state) / 2.0
                 print("Combined start and end frame CLIP vision embeddings.")
 
-            # Dtype conversions (moved after potential combination)
-            llama_vec = llama_vec.to(transformer.dtype)
-            llama_vec_n = llama_vec_n.to(transformer.dtype)
-            clip_l_pooler = clip_l_pooler.to(transformer.dtype)
-            clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
+            # Dtype conversion for image encoder (moved after potential combination)
             image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
 
@@ -648,11 +794,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                     from diffusers_helper.load_lora import load_lora
                     transformer.to(gpu)
-                    
+
                     # Show conversion status in progress bar
                     if convert_lora:
                         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Converting LoRA {os.path.basename(selected_lora)} to Diffusers format...'))))
-                    
+
                     # Use convert_lora parameter from UI
                     current_transformer = load_lora(transformer, lora_path, lora_name, convert_to_diffusers=convert_lora)
 
@@ -696,8 +842,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
             else:
                 latent_paddings = list(base_latent_paddings) # Convert iterator to list
 
+            # --- MODIFICATION for latent_paddings loop ---
+            duration_per_section = (latent_window_size * 4 - 3) / fps
+            current_prompt_text_for_callback = prompt # Default for callback
+
             for i, latent_padding in enumerate(latent_paddings):
-                # is_last_section determines if we are generating the START of the video (padding 0)
                 is_last_section = latent_padding == 0
                 # is_first_section determines if we are generating the END of the video (highest padding)
                 is_first_section = (i == 0) # Check if it's the first item in the list/iterator
@@ -717,6 +866,42 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     return
 
                 print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
+
+                # --- MODIFICATION START ---
+                # Determine current prompt tensors based on time if using timestamped prompts
+                first_prompt_key = list(encoded_prompts.keys())[0]
+                active_llama_vec = encoded_prompts[first_prompt_key][0] # Default to first prompt
+                active_llama_mask = encoded_prompts[first_prompt_key][1]
+                active_clip_pooler = encoded_prompts[first_prompt_key][2]
+                current_prompt_text_for_callback = first_prompt_key # Default text
+
+                if using_timestamped_prompts:
+                    # Calculate current reversed time position
+                    # How many sections have been *completed* when generating from the end towards the start
+                    sections_completed_in_reverse = total_latent_sections - (latent_padding + 1)
+                    current_reversed_time = max(0.0, sections_completed_in_reverse * duration_per_section)
+
+                    # Find the active prompt for this reversed time
+                    selected_prompt_text = parsed_prompts[0][1] # Default to the earliest reversed time prompt
+                    for rev_time, p_text in parsed_prompts:
+                        if current_reversed_time >= rev_time:
+                            selected_prompt_text = p_text
+                        else:
+                            break # Stop once we pass the current time
+
+                    # Retrieve the encoded tensors
+                    active_llama_vec, active_llama_mask, active_clip_pooler = encoded_prompts[selected_prompt_text]
+                    current_prompt_text_for_callback = selected_prompt_text # Update for callback
+
+                    # Optional: Update the print statement here or in callback
+                    print(f'---> Reversed Time: {current_reversed_time:.2f}s, Using prompt: "{selected_prompt_text[:50]}..."')
+
+                else:
+                     # If not using timestamped prompts, use the single encoded prompt
+                     active_llama_vec, active_llama_mask, active_clip_pooler = encoded_prompts[prompt]
+                     current_prompt_text_for_callback = prompt
+                # --- MODIFICATION END ---
+
 
                 indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
                 clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
@@ -757,6 +942,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                 sampling_start_time = time.time()
 
+                # --- MODIFICATION for callback ---
                 def callback(d):
                     preview = d['denoised']
                     preview = vae_decode_fake(preview)
@@ -793,12 +979,19 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     elapsed_str = f"{total_elapsed/60:.1f} min" if total_elapsed > 60 else f"{total_elapsed:.1f} sec"
 
                     hint = f'Sampling {current_step}/{steps} (Gen {gen_idx+1}/{num_generations}, Seed {current_seed})'
-                    desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / fps) :.2f} seconds (FPS-{fps}). The video is being extended now ...'
+
+                    # --- MODIFICATION START for desc ---
+                    desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / fps) :.2f} seconds (FPS-{fps}).'
+                    if using_timestamped_prompts:
+                        desc += f' Current Prompt: "{current_prompt_text_for_callback[:50]}..."'
+                    # --- MODIFICATION END for desc ---
+
                     time_info = f'Elapsed: {elapsed_str} | ETA: {eta_str}'
 
                     print(f"\rProgress: {percentage}% | {hint} | {time_info}     ", end="")
                     stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, f"{hint}<br/>{time_info}"))))
                     return
+                # --- END MODIFICATION for callback ---
 
                 try:
                     if using_lora:
@@ -812,6 +1005,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                                     param.data = param.data.to(gpu)
                         print(f"Devices found for parameters: {devices_found}")
 
+                    # --- MODIFICATION for sample_hunyuan call ---
                     generated_latents = sample_hunyuan(
                         transformer=transformer,
                         sampler='unipc',
@@ -823,9 +1017,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         guidance_rescale=rs,
                         num_inference_steps=steps,
                         generator=rnd,
-                        prompt_embeds=llama_vec,
-                        prompt_embeds_mask=llama_attention_mask,
-                        prompt_poolers=clip_l_pooler,
+                        # Use the active tensors determined earlier
+                        prompt_embeds=active_llama_vec,
+                        prompt_embeds_mask=active_llama_mask,
+                        prompt_poolers=active_clip_pooler,
+                        # Negative prompts remain the same
                         negative_prompt_embeds=llama_vec_n,
                         negative_prompt_embeds_mask=llama_attention_mask_n,
                         negative_prompt_poolers=clip_l_pooler_n,
@@ -833,7 +1029,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         dtype=torch.bfloat16,
                         image_embeddings=image_encoder_last_hidden_state,
                         latent_indices=latent_indices,
-                        clean_latents=clean_latents, # Pass the potentially modified clean_latents
+                        clean_latents=clean_latents,
                         clean_latent_indices=clean_latent_indices,
                         clean_latents_2x=clean_latents_2x,
                         clean_latent_2x_indices=clean_latent_2x_indices,
@@ -841,6 +1037,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         clean_latent_4x_indices=clean_latent_4x_indices,
                         callback=callback,
                     )
+                    # --- END MODIFICATION for sample_hunyuan call ---
                 except ConnectionResetError as e:
                     print(f"Connection Reset Error caught during sampling: {str(e)}")
                     print("Continuing with the process anyway...")
@@ -902,7 +1099,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     print(f"Saved MP4 video to {output_filename}")
 
                     # Save last frame of main video if enabled
-                    if save_individual_frames_frames:
+                    if save_last_frame_flag: # Use the flag
                         frames_output_dir = os.path.join(
                             intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                             os.path.splitext(os.path.basename(output_filename))[0]
@@ -913,18 +1110,18 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         os.makedirs(os.path.dirname(webm_output_filename), exist_ok=True)
                         save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=fps, video_quality=video_quality, format='webm')
                         print(f"Saved WebM video to {webm_output_filename}")
-                        
+
                         # Save last frame of webm video if enabled
-                        if save_individual_frames_frames:
+                        if save_last_frame_flag: # Use the flag
                             frames_output_dir = os.path.join(
                                 intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                                 os.path.splitext(os.path.basename(webm_output_filename))[0]
                             )
                             save_last_frame(history_pixels, frames_output_dir, f"{job_id}_webm")
-                        
+
                     # Save individual frames if enabled
-                    if ((is_intermediate and save_intermediate_frames) or 
-                        (not is_intermediate and save_individual_frames)):
+                    if ((is_intermediate and save_intermediate_frames_flag) or # Use the flag
+                        (not is_intermediate and save_individual_frames_flag)): # Use the flag
                         # Create a subfolder with the video filename
                         frames_output_dir = os.path.join(
                             intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
@@ -944,17 +1141,22 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     output_filename = None
                     webm_output_filename = None
 
-                # Metadata saving logic remains the same (triggered on last section)
-                # Check if save_metadata is enabled (passed via process/batch_process)
-                # This check needs to be added in the calling functions if not already present
-                save_metadata_enabled = True # Assume true for now, should be passed
+                # Metadata saving logic
+                save_metadata_enabled = True # Assume true for now, should be passed ideally
+                # --- MODIFICATION for metadata ---
                 if save_metadata_enabled and is_last_section:
                     gen_time = time.time() - gen_start_time
                     generation_time_seconds = int(gen_time)
                     generation_time_formatted = format_time_human_readable(gen_time)
 
+                    # Determine the prompt to save in metadata
+                    metadata_prompt = prompt # Original full prompt by default
+                    if using_timestamped_prompts:
+                        # Save the original multi-line prompt with timestamps
+                        metadata_prompt = prompt
+
                     metadata = {
-                        "Prompt": prompt,
+                        "Prompt": metadata_prompt, # Use the chosen prompt representation
                         "Seed": current_seed,
                         "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                         "Video Length (seconds)": total_second_length,
@@ -965,7 +1167,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         "Generation Time": generation_time_formatted,
                         "Total Seconds": f"{generation_time_seconds} seconds",
                         "Start Frame Provided": True,
-                        "End Frame Provided": has_end_image
+                        "End Frame Provided": has_end_image,
+                        "Timestamped Prompts Used": using_timestamped_prompts, # Add flag
                     }
 
                     if selected_lora != "none":
@@ -983,6 +1186,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         save_processing_metadata(os.path.splitext(output_filename)[0] + '.webp', metadata)
                     if video_quality == 'web_compatible' and webm_output_filename and os.path.exists(webm_output_filename):
                         save_processing_metadata(webm_output_filename, metadata)
+                # --- END MODIFICATION for metadata ---
 
 
                 # Save additional formats
@@ -993,9 +1197,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             os.makedirs(os.path.dirname(gif_filename), exist_ok=True)
                             save_bcthw_as_gif(history_pixels, gif_filename, fps=fps)
                             print(f"Saved GIF animation to {gif_filename}")
-                            
-                            # Save last frame from GIF if enabled instead of individual frames
-                            if save_individual_frames_frames:
+
+                            # Save last frame from GIF if enabled
+                            if save_last_frame_flag: # Use the flag
                                 frames_output_dir = os.path.join(
                                     intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                                     os.path.splitext(os.path.basename(gif_filename))[0]
@@ -1009,9 +1213,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             os.makedirs(os.path.dirname(apng_filename), exist_ok=True)
                             save_bcthw_as_apng(history_pixels, apng_filename, fps=fps)
                             print(f"Saved APNG animation to {apng_filename}")
-                            
-                            # Save last frame from APNG if enabled instead of individual frames
-                            if save_individual_frames_frames:
+
+                            # Save last frame from APNG if enabled
+                            if save_last_frame_flag: # Use the flag
                                 frames_output_dir = os.path.join(
                                     intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                                     os.path.splitext(os.path.basename(apng_filename))[0]
@@ -1025,9 +1229,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             os.makedirs(os.path.dirname(webp_filename), exist_ok=True)
                             save_bcthw_as_webp(history_pixels, webp_filename, fps=fps)
                             print(f"Saved WebP animation to {webp_filename}")
-                            
-                            # Save last frame from WebP if enabled instead of individual frames
-                            if save_individual_frames_frames:
+
+                            # Save last frame from WebP if enabled
+                            if save_last_frame_flag: # Use the flag
                                 frames_output_dir = os.path.join(
                                     intermediate_last_frames_folder if is_intermediate else last_frames_folder,
                                     os.path.splitext(os.path.basename(webp_filename))[0]
@@ -1119,40 +1323,58 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
 
 # Modified process function signature
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False): # Matched param names
     global stream
     assert input_image is not None, 'No start input image!' # Changed assertion message
 
     lora_path = get_lora_path_from_name(selected_lora)
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
 
-    # Process multi-line prompts if enabled
+    # --- MODIFICATION START ---
+    # Decide which prompt text to use based on the multi-line flag
     if use_multiline_prompts and prompt.strip():
         # Split prompt by lines, filter empty lines and very short prompts (less than 2 chars)
         prompt_lines = [line.strip() for line in prompt.split('\n')]
         prompt_lines = [line for line in prompt_lines if len(line) >= 2]
-        
+
         if not prompt_lines:
-            # If no valid prompts after filtering, use the original prompt
+            # If no valid prompts after filtering, use the original prompt as one line
             prompt_lines = [prompt.strip()]
+        print(f"Multi-line enabled: Processing {len(prompt_lines)} prompts individually.")
     else:
-        # Use the regular prompt as a single line
+        # Use the regular prompt as a single line (timestamp parsing will happen in worker if applicable)
         prompt_lines = [prompt.strip()]
-    
-    total_prompts = len(prompt_lines)
-    print(f"Processing {total_prompts} prompt(s)")
-    
+        if not use_multiline_prompts:
+             print("Multi-line disabled: Passing full prompt to worker for potential timestamp parsing.")
+        else:
+             print("Multi-line enabled, but prompt seems empty or invalid, using as single line.")
+
+    total_prompts_or_loops = len(prompt_lines)
+    # --- MODIFICATION END ---
+
     final_video = None
-    
-    # Loop through each prompt
-    for prompt_idx, current_prompt in enumerate(prompt_lines):
+
+    # Loop through each prompt OR just once if multi-line is disabled
+    for prompt_idx, current_prompt_line in enumerate(prompt_lines):
         stream = AsyncStream()
-        
-        print(f"Processing prompt {prompt_idx+1}/{total_prompts}: {current_prompt}")
-        yield None, None, f"Processing prompt {prompt_idx+1}/{total_prompts}", '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
-        
-        # Pass current prompt to worker
-        async_run(worker, input_image, end_image, current_prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora, save_individual_frames, save_intermediate_frames, save_individual_frames_frames)
+
+        print(f"Starting processing loop {prompt_idx+1}/{total_prompts_or_loops}")
+        status_msg = f"Processing prompt {prompt_idx+1}/{total_prompts_or_loops}" if use_multiline_prompts else "Starting generation"
+        yield None, None, status_msg, '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
+
+        # --- MODIFICATION START ---
+        # Pass the CURRENT prompt line if multi-line is ON
+        # Pass the ORIGINAL full prompt if multi-line is OFF
+        prompt_to_worker = prompt if not use_multiline_prompts else current_prompt_line
+
+        # Pass the use_multiline_prompts flag correctly to the worker
+        # Also pass the other boolean flags correctly
+        async_run(worker, input_image, end_image, prompt_to_worker, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora,
+                  save_individual_frames_flag=save_individual_frames, # Pass flags with correct names
+                  save_intermediate_frames_flag=save_intermediate_frames,
+                  save_last_frame_flag=save_last_frame,
+                  use_multiline_prompts_flag=use_multiline_prompts)
+        # --- MODIFICATION END ---
 
         output_filename = None
         webm_filename = None
@@ -1219,12 +1441,12 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
                 if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
                     video_file = webm_filename
 
-                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts})" if use_multiline_prompts else ""
+                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if use_multiline_prompts else ""
                 yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info + prompt_info
 
             if flag == 'progress':
                 preview, desc, html = data
-                
+
                 # Add prompt info to progress display if using multi-line prompts
                 if use_multiline_prompts:
                     if html:
@@ -1233,24 +1455,30 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
                         hint_match = re.search(r'>(.*?)<br', html)
                         if hint_match:
                             hint = hint_match.group(1)
-                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts}: {current_prompt[:30]}{'...' if len(current_prompt) > 30 else ''})"
+                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts_or_loops}: {current_prompt_line[:30]}{'...' if len(current_prompt_line) > 30 else ''})"
                             html = html.replace(hint, new_hint)
-                    
+
                     # Add prompt info to the description
                     if desc:
-                        desc += f" (Prompt {prompt_idx+1}/{total_prompts})"
-                        
+                        desc += f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})"
+
+                # If NOT multi-line, the desc from worker already contains timestamp info if used
                 yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
 
+
             if flag == 'end':
-                if prompt_idx == len(prompt_lines) - 1:  # If this is the last prompt
+                if prompt_idx == len(prompt_lines) - 1:  # If this is the last prompt loop
                     yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
                 else:
-                    # For intermediate prompts, keep the UI in generation mode
-                    yield final_video, gr.update(visible=False), f"Completed prompt {prompt_idx+1}/{total_prompts}", '', gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
-                break
+                    # For intermediate prompts (only happens if multi-line is ON)
+                    yield final_video, gr.update(visible=False), f"Completed prompt {prompt_idx+1}/{total_prompts_or_loops}", '', gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
+                break # Exit the inner while loop
 
-    # Only reach this point if all prompts are processed
+        # If multi-line is disabled, we only run the outer loop once
+        if not use_multiline_prompts:
+            break
+
+    # Only reach this point if all prompts (if multi-line) are processed
     yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
 
 
@@ -1259,8 +1487,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold,
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
-                  selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False, 
-                  save_individual_frames=False, save_intermediate_frames=False, save_individual_frames_frames=False):
+                  selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False,
+                  batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False): # Matched param names
     global stream
 
     lora_path = get_lora_path_from_name(selected_lora)
@@ -1291,54 +1519,46 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
     for idx, image_path in enumerate(image_files):
         start_image_basename = os.path.basename(image_path)
         output_filename_base = os.path.splitext(start_image_basename)[0]
-        
-        # Get prompt lines before checking skip_existing
-        current_prompt = prompt
+
+        # --- MODIFICATION START ---
+        # Determine the base prompt text for this image
+        current_prompt_text = prompt # Default prompt from UI
         custom_prompt = get_prompt_from_txt_file(image_path)
         if custom_prompt:
-            current_prompt = custom_prompt
-            print(f"Using custom prompt from txt file for {image_path}: {current_prompt}")
+            current_prompt_text = custom_prompt
+            print(f"Using custom prompt from txt file for {image_path}")
 
-        # Process multi-line prompts if enabled
-        if batch_use_multiline_prompts and current_prompt.strip():
-            # Split specifically by newline character first, then strip and filter
-            potential_lines = current_prompt.split('\n')
-            prompt_lines = [line.strip() for line in potential_lines if line.strip()] # Strip and remove empty lines
-            prompt_lines = [line for line in prompt_lines if len(line) >= 2] # Filter short lines
-            
-            if not prompt_lines:
-                # If no valid prompts after filtering, use the original prompt as one line
-                prompt_lines = [current_prompt.strip()]
+        # Decide if we process lines separately or pass the whole text
+        if batch_use_multiline_prompts:
+            # Split into lines if multi-line is enabled
+            potential_lines = current_prompt_text.split('\n')
+            prompt_lines_or_fulltext = [line.strip() for line in potential_lines if line.strip()]
+            prompt_lines_or_fulltext = [line for line in prompt_lines_or_fulltext if len(line) >= 2]
+            if not prompt_lines_or_fulltext:
+                 prompt_lines_or_fulltext = [current_prompt_text.strip()] # Fallback
+            print(f"Batch multi-line enabled: Processing {len(prompt_lines_or_fulltext)} prompts for {start_image_basename}")
         else:
-            # Use the regular prompt as a single line
-            prompt_lines = [current_prompt.strip()]
-        
-        total_prompts = len(prompt_lines)
-        print(f"DEBUG: Detected prompts: {prompt_lines}")
-        print(f"Processing {total_prompts} prompt(s) for image {idx+1}/{len(image_files)}")
-        
-        # Skip check should look for all expected files when multi-line prompts are enabled
+            # If multi-line is disabled, use the whole text as a single item list
+            # The worker will handle potential timestamp parsing within this text
+            prompt_lines_or_fulltext = [current_prompt_text.strip()] # Pass the full text
+            print(f"Batch multi-line disabled: Passing full prompt text to worker for {start_image_basename}")
+
+        total_prompts_or_loops = len(prompt_lines_or_fulltext)
+        # --- MODIFICATION END ---
+
+
+        # Skip check logic - simplified for now
         skip_this_image = False
         if skip_existing:
+            # Check if the first generation output exists (might need refinement for multi-prompt/multi-gen)
+            output_check_base = os.path.join(output_folder, f"{output_filename_base}")
             if batch_use_multiline_prompts:
-                # Check if all generations for all prompt lines exist
-                all_expected_files_exist = True
-                for p_idx in range(total_prompts):
-                    for g_idx in range(1, num_generations + 1):
-                        # Use consistent naming with both prompt and generation indices
-                        suffix = f"_p{p_idx+1}_g{g_idx}" if num_generations > 1 else f"_p{p_idx+1}"
-                        output_check_path = os.path.join(output_folder, f"{output_filename_base}{suffix}.mp4")
-                        if not os.path.exists(output_check_path):
-                            all_expected_files_exist = False
-                            break
-                    if not all_expected_files_exist:
-                        break
-                skip_this_image = all_expected_files_exist
-            else:
-                # Original check for single prompt
-                output_filepath_mp4 = os.path.join(output_folder, f"{output_filename_base}{'_1' if num_generations > 1 else ''}.mp4")
-                skip_this_image = os.path.exists(output_filepath_mp4)
-        
+                output_check_path = f"{output_check_base}_p1{'_g1' if num_generations > 1 else ''}.mp4"
+            else: # Single prompt (potentially timestamped)
+                 output_check_path = f"{output_check_base}{'_1' if num_generations > 1 else ''}.mp4"
+            skip_this_image = os.path.exists(output_check_path)
+
+
         if skip_this_image:
             print(f"Skipping {image_path} - output already exists")
             yield None, None, f"Skipping {idx+1}/{len(image_files)}: {start_image_basename} - already processed", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
@@ -1374,34 +1594,39 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             else:
                  print(f"No matching end frame found for {start_image_basename} in {batch_end_frame_folder}")
 
-        # Loop through each prompt
-        for prompt_idx, prompt_line in enumerate(prompt_lines):
-            # Reset generation counter for each prompt line
+        # --- MODIFICATION START ---
+        # Loop through prompts/texts
+        for prompt_idx, current_prompt_segment in enumerate(prompt_lines_or_fulltext):
+            # Reset generation counter for each prompt line/text
             generation_count_for_image = 0
             # Reset current_seed for each prompt line (important to maintain deterministic behavior)
             if use_random_seed:
-                # Get a new random seed for each prompt line
                 current_seed = random.randint(1, 2147483647)
-                # Update UI with new seed
                 yield None, None, f"Using new random seed {current_seed} for prompt {prompt_idx+1}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, ""
-            
+            elif prompt_idx > 0: # Only increment seed for subsequent prompts if not random
+                current_seed += 1 # Should this happen per prompt or per image? Per prompt seems more consistent here.
+
             prompt_info = ""
             if batch_use_multiline_prompts:
-                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts}: {prompt_line[:30]}{'...' if len(prompt_line) > 30 else ''})"
-                
+                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops}: {current_prompt_segment[:30]}{'...' if len(current_prompt_segment) > 30 else ''})"
+            elif not batch_use_multiline_prompts:
+                 # Indicate potential timestamp parsing if multi-line is off
+                 prompt_info = " (Processing full text - potential timestamps)"
+
             yield None, None, f"Processing {idx+1}/{len(image_files)}: {start_image_basename} (End: {os.path.basename(end_image_path_str) if current_end_image is not None else 'No'}) with {num_generations} generation(s){prompt_info}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, ""
+
 
             gen_start_time_batch = time.time() # Track start time for metadata
 
             # Reset stream and run worker
             stream = AsyncStream()
-            
+
             # Create individual frames folders for batch output if needed
             batch_individual_frames_folder = None
             batch_intermediate_individual_frames_folder = None
             batch_last_frames_folder = None
             batch_intermediate_last_frames_folder = None
-            if batch_save_individual_frames or batch_save_intermediate_frames or batch_save_individual_frames_frames:
+            if batch_save_individual_frames or batch_save_intermediate_frames or batch_save_last_frame:
                 batch_individual_frames_folder = os.path.join(output_folder, 'individual_frames')
                 batch_intermediate_individual_frames_folder = os.path.join(batch_individual_frames_folder, 'intermediate_videos')
                 batch_last_frames_folder = os.path.join(output_folder, 'last_frames')
@@ -1411,24 +1636,24 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                 os.makedirs(batch_last_frames_folder, exist_ok=True)
                 os.makedirs(batch_intermediate_last_frames_folder, exist_ok=True)
                 print(f"Created frames folders for batch output in: {output_folder}")
-            
+
             # Custom function for batch worker that overrides the individual_frames_folder path
             def batch_worker_override(*args, **kwargs):
                 # Save original paths
                 global individual_frames_folder, intermediate_individual_frames_folder, last_frames_folder, intermediate_last_frames_folder
-                
+
                 orig_individual_frames = individual_frames_folder
                 orig_intermediate_individual_frames = intermediate_individual_frames_folder
                 orig_last_frames = last_frames_folder
                 orig_intermediate_last_frames = intermediate_last_frames_folder
-                
+
                 # Override with batch paths if they exist
                 if batch_individual_frames_folder:
                     individual_frames_folder = batch_individual_frames_folder
                     intermediate_individual_frames_folder = batch_intermediate_individual_frames_folder
                     last_frames_folder = batch_last_frames_folder
                     intermediate_last_frames_folder = batch_intermediate_last_frames_folder
-                
+
                 try:
                     # Call original worker
                     result = worker(*args, **kwargs)
@@ -1440,16 +1665,22 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                         intermediate_individual_frames_folder = orig_intermediate_individual_frames
                         last_frames_folder = orig_last_frames
                         intermediate_last_frames_folder = orig_intermediate_last_frames
-            
-            async_run(batch_worker_override if (batch_save_individual_frames or batch_save_intermediate_frames or batch_save_individual_frames_frames) else worker, 
-                    input_image, current_end_image, prompt_line, n_prompt, current_seed, use_random_seed,
+
+            # Determine if override is needed
+            override_needed = batch_save_individual_frames or batch_save_intermediate_frames or batch_save_last_frame
+
+            # Pass the correct prompt segment and the flag to the worker
+            async_run(batch_worker_override if override_needed else worker,
+                    input_image, current_end_image, current_prompt_segment, n_prompt, current_seed, use_random_seed,
                     total_second_length, latent_window_size, steps, cfg, gs, rs,
                     gpu_memory_preservation, teacache_threshold, video_quality, export_gif,
                     export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
                     selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora,
-                    save_individual_frames=batch_save_individual_frames,
-                    save_intermediate_frames=batch_save_intermediate_frames,
-                    save_individual_frames_frames=batch_save_individual_frames_frames)
+                    save_individual_frames_flag=batch_save_individual_frames, # Pass flags
+                    save_intermediate_frames_flag=batch_save_intermediate_frames,
+                    save_last_frame_flag=batch_save_last_frame,
+                    use_multiline_prompts_flag=batch_use_multiline_prompts) # Pass the flag
+
 
             output_filename = None
             last_output = None
@@ -1459,8 +1690,14 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                 flag, data = stream.output_queue.next()
 
                 if flag == 'seed_update':
+                    # Update the seed for the *next* potential generation within this prompt loop
                     current_seed = data
                     yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, gr.update()
+                
+                if flag == 'final_seed':
+                     # This seed was the last one used for the *previous* completed generation
+                     # We might want to use the seed from 'seed_update' if that's more relevant for the *next* step
+                     pass # Maybe ignore final_seed here, current_seed should be correct
 
                 if flag == 'file':
                     output_filename = data
@@ -1468,15 +1705,13 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                         is_intermediate = 'intermediate' in output_filename
                         if not is_intermediate:
                             generation_count_for_image += 1 # Increment only for final outputs
-                            
-                            # Add prompt index to the suffix if using multi-line prompts
+
+                            # Determine suffix based on multi-line and generation count
                             if batch_use_multiline_prompts:
-                                # Always use both prompt index and generation index for consistency
-                                suffix = f"_p{prompt_idx+1}_g{generation_count_for_image}" if num_generations > 1 else f"_p{prompt_idx+1}"
-                            else:
+                                suffix = f"_p{prompt_idx+1}" + (f"_g{generation_count_for_image}" if num_generations > 1 else "")
+                            else: # Single prompt text (potentially timestamped)
                                 suffix = f"_{generation_count_for_image}" if num_generations > 1 else ""
-                            
-                            # Calculate the base name using the determined suffix AFTER the if/else
+
                             modified_image_filename_base = f"{output_filename_base}{suffix}"
 
                             # Move MP4
@@ -1487,7 +1722,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                 last_output = moved_file
                                 final_output = moved_file
 
-                                prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts})" if batch_use_multiline_prompts else ""
+                                prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if batch_use_multiline_prompts else ""
                                 yield last_output, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generated video {generation_count_for_image}/{num_generations}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
 
                                 # Save metadata
@@ -1497,8 +1732,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     generation_time_formatted = format_time_human_readable(gen_time)
 
                                     metadata = {
-                                        "Prompt": prompt_line,
-                                        "Seed": current_seed,
+                                        "Prompt": current_prompt_segment, # Save the specific prompt/text used
+                                        "Seed": current_seed, # Use the seed that was just used for this generation
                                         "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                                         "Video Length (seconds)": total_second_length,
                                         "FPS": fps,
@@ -1508,11 +1743,16 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         "Generation Time": generation_time_formatted,
                                         "Total Seconds": f"{generation_time_seconds} seconds",
                                         "Start Frame": image_path,
-                                        "End Frame": end_image_path_str if current_end_image is not None else "None"
+                                        "End Frame": end_image_path_str if current_end_image is not None else "None",
+                                        "Multi-line Prompts Mode": batch_use_multiline_prompts, # Record mode
                                     }
+                                    # Indicate if timestamps might have been parsed (only possible if multi-line is off)
+                                    if not batch_use_multiline_prompts:
+                                         metadata["Timestamped Prompts Parsed"] = "[Check Worker Logs]" # Indicate potential use
+
                                     if batch_use_multiline_prompts:
-                                        metadata["Prompt Number"] = f"{prompt_idx+1}/{total_prompts}"
-                                        
+                                        metadata["Prompt Number"] = f"{prompt_idx+1}/{total_prompts_or_loops}"
+
                                     if lora_path != "none":
                                         lora_name = os.path.basename(lora_path)
                                         metadata["LoRA"] = lora_name
@@ -1542,44 +1782,51 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         final_output = moved_webm
 
                         else: # Intermediate file
-                            prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts})" if batch_use_multiline_prompts else ""
+                            prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if batch_use_multiline_prompts else ""
                             yield output_filename, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generating intermediate result{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
 
 
                 if flag == 'progress':
-                    preview, desc, html = data
+                    preview, desc, html = data # Desc now comes from worker potentially with prompt info
                     current_progress = f"Processing {idx+1}/{len(image_files)}: {start_image_basename}"
-                    
+
                     # Add prompt info to the progress text if using multi-line prompts
                     if batch_use_multiline_prompts:
-                        prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts})"
+                        prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})"
                         current_progress += prompt_status
-                        
+
+                    # If not multi-line, desc from worker already contains timestamp info if used
                     if desc: current_progress += f" - {desc}"
-                    
+
                     progress_html = html if html else make_progress_bar_html(0, f"Processing file {idx+1} of {len(image_files)}")
-                    
+
                     # Add prompt info to HTML if using multi-line prompts
                     if batch_use_multiline_prompts and html:
                         import re
                         hint_match = re.search(r'>(.*?)<br', html)
                         if hint_match:
                             hint = hint_match.group(1)
-                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts})"
+                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts_or_loops})"
                             progress_html = html.replace(hint, new_hint)
-                    
+
                     video_update = last_output if last_output else gr.update()
                     yield video_update, gr.update(visible=True, value=preview), current_progress, progress_html, gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
 
+
                 if flag == 'end':
                     video_update = last_output if last_output else gr.update()
-                    
-                    if prompt_idx == len(prompt_lines) - 1:  # If this is the last prompt for this image
+
+                    if prompt_idx == len(prompt_lines_or_fulltext) - 1:  # If this is the last prompt loop for this image
                         yield video_update, gr.update(visible=False), f"Completed {idx+1}/{len(image_files)}: {start_image_basename}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
-                    else:
-                        prompt_status = f" (Completed prompt {prompt_idx+1}/{total_prompts}, continuing to next prompt)"
+                    else: # Only happens if batch_use_multiline_prompts is True
+                        prompt_status = f" (Completed prompt {prompt_idx+1}/{total_prompts_or_loops}, continuing to next prompt)"
                         yield video_update, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
-                    break # End loop for this prompt
+                    break # End loop for this prompt/text
+
+            # If multi-line is disabled, we break after the first loop iteration
+            if not batch_use_multiline_prompts:
+                 break
+        # --- MODIFICATION END ---
 
     yield final_output, gr.update(visible=False), f"Batch processing complete. Processed {len(image_files)} images.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
 
@@ -1595,7 +1842,9 @@ def end_process():
 
 
 quick_prompts = [
-    'A character doing some simple body movements.','A talking man.'
+    'A character doing some simple body movements.','A talking man.',
+    '[0] A person stands still\n[2] The person waves hello\n[4] The person claps',
+    '[0] close up shot, cinematic\n[3] medium shot, cinematic\n[5] wide angle shot, cinematic'
 ]
 quick_prompts = [[x] for x in quick_prompts]
 
@@ -1603,7 +1852,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V26 - Start/End Frame - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V27 - Start/End Frame & Timestamp Prompts - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -1615,8 +1864,8 @@ with block:
                         with gr.Column():
                             end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional)", height=320) # Added end_image
 
-                    prompt = gr.Textbox(label="Prompt", value='', lines=3) # Changed lines to 3 for multi-line
-                    use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="Process each line of the prompt as a separate generation")
+                    prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on") # Changed lines to 4
+                    use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen. OFF: Try parsing '[secs] prompt' format.")
                     example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
                     example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
@@ -1624,7 +1873,7 @@ with block:
                         save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
                         save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
                         save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        save_individual_frames_frames = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder")
+                        save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder") # Renamed variable
 
                     with gr.Row():
                         start_button = gr.Button(value="Start Generation", variant='primary')
@@ -1635,17 +1884,17 @@ with block:
                     # Added End Frame Folder for Batch
                     batch_end_frame_folder = gr.Textbox(label="End Frame Folder Path (Optional)", info="Folder containing matching end frames (same filename as start frame)")
                     batch_output_folder = gr.Textbox(label="Output Folder Path (optional)", info="Leave empty to use the default batch_outputs folder")
-                    batch_prompt = gr.Textbox(label="Default Prompt", value='', lines=3, info="Used if no matching .txt file exists") # Changed lines to 3
+                    batch_prompt = gr.Textbox(label="Default Prompt", value='', lines=4, info="Used if no matching .txt file exists. Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF.") # Changed lines to 4
 
                     with gr.Row():
                         batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip files that already exist in the output folder")
                         batch_save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
-                        batch_use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="Process each line of the prompt as a separate generation")
+                        batch_use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line in prompt/.txt is a separate gen. OFF: Try parsing '[secs] prompt' format from full prompt/.txt.")
 
                     with gr.Row():
                         batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
                         batch_save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        batch_save_individual_frames_frames = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder")
+                        batch_save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder") # Renamed variable
 
                     with gr.Row():
                         batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
@@ -1660,7 +1909,7 @@ with block:
 
             with gr.Group():
                 with gr.Row():
-                    num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence")
+                    num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence (per prompt if multi-line is ON)")
                     resolution = gr.Dropdown(label="Resolution", choices=["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
 
                 with gr.Row():
@@ -1671,7 +1920,7 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)
 
                 with gr.Row():
-                    fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Doesn't impact generation speed")
+                    fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Directly changes how many frames are generated, 60 will make double frames")
                     total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
 
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)
@@ -1693,7 +1942,7 @@ with block:
                              lora_refresh_btn = gr.Button(value="🔄 Refresh", scale=1)
                              lora_folder_btn = gr.Button(value="📁 Open Folder", scale=1)
                         lora_scale = gr.Slider(label="LoRA Scale", minimum=0.0, maximum=2.0, value=1.0, step=0.01, info="Adjust the strength of the LoRA effect (0-2)")
-                
+
                 with gr.Row():
                     convert_lora = gr.Checkbox(label="Convert LoRA to Diffusers Format - Add extra 20 GB GPU Inference Preserved Memory - I am still searching better solution", value=False, info="Enable to convert LoRA weights to the Diffusers format (recommended)")
 
@@ -1720,6 +1969,7 @@ with block:
             Note on Sampling: Due to inverted sampling, the end part of the video is generated first, and the start part last.
             - **Start Frame Only:** If the start action isn't in the video initially, wait for the full generation.
             - **Start and End Frames:** The model attempts a smooth transition. The end frame's influence appears early in the generation process.
+            - **Timestamp Prompts (Multi-line OFF):** Prompts like `[2] wave hello` trigger *after* 2 seconds have passed in the *final* video (meaning they are generated earlier in the process).
             ''')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
@@ -1746,8 +1996,8 @@ with block:
     lora_refresh_btn.click(fn=refresh_loras, outputs=[selected_lora])
     lora_folder_btn.click(fn=lambda: open_folder(loras_folder), outputs=[gr.Text(visible=False)])
 
-    # Update inputs list for single image processing
-    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_individual_frames_frames]
+    # Update inputs list for single image processing - match names with process function
+    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_last_frame]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -1761,12 +2011,12 @@ with block:
     open_batch_end_folder.click(fn=lambda x: open_folder(x) if x else "No end frame folder specified", inputs=[batch_end_frame_folder], outputs=[batch_folder_status_text]) # Added for end frame folder
     open_batch_output_folder.click(fn=lambda x: open_folder(x if x else outputs_batch_folder), inputs=[batch_output_folder], outputs=[batch_folder_status_text])
 
-    # Update inputs list for batch processing
+    # Update inputs list for batch processing - match names with batch_process function
     batch_ips = [batch_input_folder, batch_output_folder, batch_end_frame_folder, batch_prompt, n_prompt, seed, use_random_seed,
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                 teacache_threshold, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
                 batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora, batch_use_multiline_prompts,
-                batch_save_individual_frames, batch_save_intermediate_frames, batch_save_individual_frames_frames]
+                batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     batch_end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -1863,7 +2113,7 @@ def get_available_drives():
 block.launch(
     share=args.share,
     inbrowser=True,
-    allowed_paths=get_available_drives() 
+    allowed_paths=get_available_drives()
 )
 
 print_supported_image_formats()
