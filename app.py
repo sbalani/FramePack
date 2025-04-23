@@ -122,6 +122,9 @@ loras_folder = os.path.join(current_dir, 'loras')  # Add loras folder
 presets_folder = os.path.join(current_dir, 'presets') # <-- ADDED FOR PRESETS
 last_used_preset_file = os.path.join(presets_folder, '_lastused.txt') # <-- ADDED FOR PRESETS
 
+# --- Add Global Stop Flag ---
+batch_stop_requested = False
+# --- End Add Global Stop Flag ---
 
 # Ensure all directories exist with proper error handling
 for directory in [
@@ -527,31 +530,55 @@ def load_preset_data(name: str) -> Optional[dict]:
 # --- Preset Functions END ---
 
 
-def save_last_frame(frames, output_dir, filename_base):
-    """Save only the last frame from a video frames tensor
+def save_last_frame_to_file(frames, output_dir, filename_base):
+    """Save only the last frame from a video frames tensor (bcthw format).
 
     Args:
         frames: Tensor of frames in bcthw format
-        output_dir: Directory to save the last frame
-        filename_base: Base filename to use for the saved frame
+        output_dir: Specific directory to save the last frame (subfolder within last_frames)
+        filename_base: Base filename to use for the saved frame (e.g., 'timestamp_lastframe')
     """
     try:
-        # Make sure output directory exists
+        # Make sure output directory exists (already done before calling, but safe)
         os.makedirs(output_dir, exist_ok=True)
-
+        
         # Extract only the last frame but keep the tensor structure (b,c,t,h,w)
         # where t=1 to be compatible with save_individual_frames function
-        last_frame_tensor = frames[:, :, -1:, :, :]
+        if frames is None:
+            print("Error: frames tensor is None")
+            return None
+            
+        # Check if frames has the expected shape (b,c,t,h,w)
+        if not (isinstance(frames, torch.Tensor) and len(frames.shape) == 5):
+            print(f"Error: Invalid frames tensor shape: {frames.shape if hasattr(frames, 'shape') else 'unknown'}")
+            return None
+            
+        try:
+            last_frame_tensor = frames[:, :, -1:, :, :]  # Slicing keeps the dimension
+        except Exception as slicing_error:
+            print(f"Error slicing last frame: {str(slicing_error)}")
+            print(f"Frames tensor shape: {frames.shape}")
+            return None
 
         # Use the existing utils function to ensure consistent color processing
-        from diffusers_helper.utils import save_individual_frames
-        frame_paths = save_individual_frames(last_frame_tensor, output_dir, f"{filename_base}_last", return_frame_paths=True)
+        try:
+            from diffusers_helper.utils import save_individual_frames  # Local import ok here
+            # Call save_individual_frames with the single frame tensor and the base name
+            # It will append '_0000.png' by default, resulting in filename_base_0000.png
+            frame_paths = save_individual_frames(last_frame_tensor, output_dir, filename_base, return_frame_paths=True)
+        except ImportError:
+            print("Error importing save_individual_frames, trying to import at global scope")
+            # Try to import at global scope if local import fails
+            import sys
+            sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'diffusers_helper'))
+            from utils import save_individual_frames
+            frame_paths = save_individual_frames(last_frame_tensor, output_dir, filename_base, return_frame_paths=True)
 
         if frame_paths and len(frame_paths) > 0:
             print(f"Saved last frame to {frame_paths[0]}")
             return frame_paths[0]
         else:
-            print("No frames were saved")
+            print("No frames were saved by save_individual_frames")
             return None
     except Exception as e:
         print(f"Error saving last frame: {str(e)}")
@@ -1186,13 +1213,24 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, video_quality=video_quality)
                     print(f"Saved MP4 video to {output_filename}")
 
-                    # --- Existing Last Frame Saving (for MP4) ---
-                    if save_last_frame_flag: # Use the flag
-                        frames_output_dir = os.path.join(
-                            intermediate_last_frames_folder if is_intermediate else last_frames_folder,
-                            os.path.splitext(os.path.basename(output_filename))[0]
-                        )
-                        save_last_frame(history_pixels, frames_output_dir, f"{job_id}_mp4")
+                    # --- SAVE LAST FRAME (MP4 ONLY) - Moved Here ---
+                    # Save last frame from the ORIGINAL history_pixels BEFORE RIFE
+                    if save_last_frame_flag is True and output_filename and os.path.exists(output_filename): # Check flag is True and MP4 exists
+                        try:
+                            print(f"Attempting to save last frame for {output_filename}")
+                            last_frame_base_name = os.path.splitext(os.path.basename(output_filename))[0]
+                            frames_output_dir = os.path.join(
+                                intermediate_last_frames_folder if is_intermediate else last_frames_folder,
+                                last_frame_base_name # Use video base name for subfolder
+                            )
+                            # Ensure the specific output directory for this frame exists
+                            os.makedirs(frames_output_dir, exist_ok=True)
+                            # Pass the specific dir and a simple filename base
+                            save_last_frame_to_file(history_pixels, frames_output_dir, f"{last_frame_base_name}_lastframe")
+                        except Exception as lf_err:
+                            print(f"Error saving last frame for {output_filename}: {str(lf_err)}")
+                            traceback.print_exc()
+                    # --- END SAVE LAST FRAME ---
 
                     # --- START OF RIFE INTEGRATION ---
                     if rife_enabled and output_filename and os.path.exists(output_filename):
@@ -1264,13 +1302,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         save_bcthw_as_mp4(history_pixels, webm_output_filename, fps=fps, video_quality=video_quality, format='webm')
                         print(f"Saved WebM video to {webm_output_filename}")
 
-                        # Save last frame of webm video if enabled
-                        if save_last_frame_flag: # Use the flag
-                            frames_output_dir = os.path.join(
-                                intermediate_last_frames_folder if is_intermediate else last_frames_folder,
-                                os.path.splitext(os.path.basename(webm_output_filename))[0]
-                            )
-                            save_last_frame(history_pixels, frames_output_dir, f"{job_id}_webm")
+                        # Save last frame of webm video if enabled --> REMOVED (Only MP4)
 
                     # Save individual frames if enabled
                     if ((is_intermediate and save_intermediate_frames_flag) or # Use the flag
@@ -1284,13 +1316,16 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         from diffusers_helper.utils import save_individual_frames
                         save_individual_frames(history_pixels, frames_output_dir, job_id)
                         print(f"Saved individual frames to {frames_output_dir}")
+
                 except ConnectionResetError as e:
                     print(f"Connection Reset Error during video saving: {str(e)}")
                     print("Continuing with the process anyway...")
                     output_filename = None
                     webm_output_filename = None
                 except Exception as e:
-                    print(f"Error saving MP4/WebM video: {str(e)}")
+                    # MODIFIED: Added traceback
+                    print(f"Error saving MP4/WebM video or associated last frame: {str(e)}") # Clarify potential error source
+                    traceback.print_exc() # Add traceback for better debugging
                     output_filename = None
                     webm_output_filename = None
 
@@ -1355,13 +1390,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             save_bcthw_as_gif(history_pixels, gif_filename, fps=fps)
                             print(f"Saved GIF animation to {gif_filename}")
 
-                            # Save last frame from GIF if enabled
-                            if save_last_frame_flag: # Use the flag
-                                frames_output_dir = os.path.join(
-                                    intermediate_last_frames_folder if is_intermediate else last_frames_folder,
-                                    os.path.splitext(os.path.basename(gif_filename))[0]
-                                )
-                                save_last_frame(history_pixels, frames_output_dir, f"{job_id}_gif")
+                            # REMOVED Last frame saving for GIF
+
                         except Exception as e: print(f"Error saving GIF: {str(e)}")
 
                     if export_apng:
@@ -1371,13 +1401,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             save_bcthw_as_apng(history_pixels, apng_filename, fps=fps)
                             print(f"Saved APNG animation to {apng_filename}")
 
-                            # Save last frame from APNG if enabled
-                            if save_last_frame_flag: # Use the flag
-                                frames_output_dir = os.path.join(
-                                    intermediate_last_frames_folder if is_intermediate else last_frames_folder,
-                                    os.path.splitext(os.path.basename(apng_filename))[0]
-                                )
-                                save_last_frame(history_pixels, frames_output_dir, f"{job_id}_apng")
+                            # REMOVED Last frame saving for APNG
+
                         except Exception as e: print(f"Error saving APNG: {str(e)}")
 
                     if export_webp:
@@ -1387,13 +1412,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             save_bcthw_as_webp(history_pixels, webp_filename, fps=fps)
                             print(f"Saved WebP animation to {webp_filename}")
 
-                            # Save last frame from WebP if enabled
-                            if save_last_frame_flag: # Use the flag
-                                frames_output_dir = os.path.join(
-                                    intermediate_last_frames_folder if is_intermediate else last_frames_folder,
-                                    os.path.splitext(os.path.basename(webp_filename))[0]
-                                )
-                                save_last_frame(history_pixels, frames_output_dir, f"{job_id}_webp")
+                            # REMOVED Last frame saving for WebP
+
                         except Exception as e: print(f"Error saving WebP: {str(e)}")
                 except ConnectionResetError as e:
                     print(f"Connection Reset Error during additional format saving: {str(e)}")
@@ -1671,6 +1691,12 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False,
                   rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
     global stream
+    global batch_stop_requested # Declare intent to use global flag
+
+    # --- Reset stop flag at the beginning of a new batch job ---
+    print("Resetting batch stop flag.")
+    batch_stop_requested = False
+    # --- End Reset ---
 
     lora_path = get_lora_path_from_name(selected_lora)
 
@@ -1697,7 +1723,15 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
     final_output = None
     current_seed = seed
 
+    # --- OUTER BATCH LOOP ---
     for idx, image_path in enumerate(image_files):
+        # --- Check stop flag at start of outer loop ---
+        if batch_stop_requested:
+            print("Batch stop requested. Exiting batch process.")
+            yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+            return # Exit the batch function completely
+        # --- End Check ---
+
         start_image_basename = os.path.basename(image_path)
         output_filename_base = os.path.splitext(start_image_basename)[0]
 
@@ -1776,8 +1810,15 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                  print(f"No matching end frame found for {start_image_basename} in {batch_end_frame_folder}")
 
         # --- MODIFICATION START ---
-        # Loop through prompts/texts
+        # --- INNER PROMPT LOOP (if multi-line enabled) ---
         for prompt_idx, current_prompt_segment in enumerate(prompt_lines_or_fulltext):
+            # --- Check stop flag at start of inner loop ---
+            if batch_stop_requested:
+                print("Batch stop requested during prompt loop. Exiting batch process.")
+                yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+                return # Exit the batch function completely
+            # --- End Check ---
+
             # Reset generation counter for each prompt line/text
             generation_count_for_image = 0
             # Reset current_seed for each prompt line (important to maintain deterministic behavior)
@@ -1850,6 +1891,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             # Determine if override is needed
             override_needed = batch_save_individual_frames or batch_save_intermediate_frames or batch_save_last_frame
 
+            # --- Run Worker ---
             # Pass the correct prompt segment and the flag to the worker
             # Pass RIFE params
             async_run(batch_worker_override if override_needed else worker,
@@ -1869,8 +1911,21 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             last_output = None
             all_outputs = {}
 
+            # --- WORKER LISTENING LOOP ---
             while True:
-                flag, data = stream.output_queue.next()
+                # --- Check stop flag inside worker listening loop (optional but safer) ---
+                # This helps if the worker finishes but the user clicked stop just before 'end' flag
+                if batch_stop_requested:
+                     print("Batch stop requested while waiting for worker. Ending loop.")
+                     # We might have already pushed 'end' to worker via end_process,
+                     # but breaking here ensures the batch loop stops promptly.
+                     break # Exit the 'while True' listening loop
+                # --- End Check ---
+
+                flag, data = stream.output_queue.next(timeout=0.5) # Add timeout to prevent blocking indefinitely if worker hangs
+
+                if flag is None: # Timeout occurred
+                    continue
 
                 if flag == 'seed_update':
                     # Update the seed for the *next* potential generation within this prompt loop
@@ -2025,23 +2080,53 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                         prompt_status = f" (Completed prompt {prompt_idx+1}/{total_prompts_or_loops}, continuing to next prompt)"
                         yield video_update, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
                     break # End loop for this prompt/text
+            # --- END WORKER LISTENING LOOP ---
+
+            # --- Check stop flag AGAIN after worker loop finishes ---
+            # This catches the case where stop was requested *during* the last worker processing
+            if batch_stop_requested:
+                print("Batch stop requested after worker finished. Exiting batch process.")
+                yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+                return # Exit the batch function completely
+            # --- End Check ---
 
             # If multi-line is disabled, we break after the first loop iteration
             if not batch_use_multiline_prompts:
                  break
-        # --- MODIFICATION END ---
+        # --- END INNER PROMPT LOOP ---
 
-    yield final_output, gr.update(visible=False), f"Batch processing complete. Processed {len(image_files)} images.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+        # --- Check stop flag after inner loop (redundant if checked inside, but safe) ---
+        if batch_stop_requested:
+            print("Batch stop requested after inner loop. Exiting batch process.")
+            yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+            return # Exit the batch function completely
+        # --- End Check ---
+    # --- END OUTER BATCH LOOP ---
+
+    # Final yield if loop completes normally
+    if not batch_stop_requested:
+        yield final_output, gr.update(visible=False), f"Batch processing complete. Processed {len(image_files)} images.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+    else:
+        # Ensure buttons are reset even if stopped at the very end
+         yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
 
 
 def end_process():
+    global batch_stop_requested # Declare intent to modify global flag
     print("\nSending end generation signal...")
     if 'stream' in globals() and stream:
         stream.input_queue.push('end')
-        print("End signal sent. Waiting for generation to stop safely...")
+        print("End signal sent to current worker.")
     else:
-        print("Stream not initialized, cannot send end signal.")
-    return gr.update(interactive=True), gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False) # Update both sets of buttons
+        print("Stream not initialized, cannot send end signal to worker.")
+
+    print("Setting batch stop flag...")
+    batch_stop_requested = True # Set the global flag
+
+    # Update buttons immediately
+    # Make Start buttons interactive again, End buttons non-interactive
+    updates = [gr.update(interactive=True), gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False)]
+    return updates
 
 
 quick_prompts = [
@@ -2076,7 +2161,7 @@ with block:
                         save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
                         save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
                         save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder") # Renamed variable
+                        save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations (MP4 Only)", value=False, info="Save only the last frame of each MP4 generation to the last_frames folder") # Renamed variable & updated info
 
                     with gr.Row():
                         start_button = gr.Button(value="Start Generation", variant='primary')
@@ -2097,7 +2182,7 @@ with block:
                     with gr.Row():
                         batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
                         batch_save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        batch_save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations", value=False, info="Save only the last frame of each generation to the last_frames folder") # Renamed variable
+                        batch_save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations (MP4 Only)", value=False, info="Save only the last frame of each MP4 generation to the last_frames folder") # Renamed variable & updated info
 
                     with gr.Row():
                         batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
@@ -2565,4 +2650,3 @@ block.launch(
     allowed_paths=get_available_drives()
 )
 
-print_supported_image_formats()
