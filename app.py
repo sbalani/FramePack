@@ -1265,6 +1265,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                 section_time = time.time() - sampling_start_time
                 print(f"\nSection completed in {section_time:.2f} seconds")
+                print(f"VAE decoding started (takes longer on higher resolution)... {'Using standard decoding' if high_vram else 'Using memory optimization: VAE offloading enabled'}")
 
                 if is_last_section:
                     generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
@@ -2293,7 +2294,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V38 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V39 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
