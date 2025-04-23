@@ -27,6 +27,7 @@ sdist/
 var/
 wheels/
 practical-rife
+presets
 share/python-wheels/
 *.egg-info/
 .installed.cfg

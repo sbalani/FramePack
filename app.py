@@ -12,6 +12,7 @@ import math
 from typing import Optional # Added for type hinting
 import sys # Added for RIFE
 import cv2 # Added for RIFE
+import json # <-- ADDED FOR PRESETS
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -118,6 +119,9 @@ intermediate_individual_frames_folder = os.path.join(individual_frames_folder, '
 last_frames_folder = os.path.join(outputs_folder, 'last_frames')  # Add last_frames folder
 intermediate_last_frames_folder = os.path.join(last_frames_folder, 'intermediate_videos')  # Add intermediate last frames folder
 loras_folder = os.path.join(current_dir, 'loras')  # Add loras folder
+presets_folder = os.path.join(current_dir, 'presets') # <-- ADDED FOR PRESETS
+last_used_preset_file = os.path.join(presets_folder, '_lastused.txt') # <-- ADDED FOR PRESETS
+
 
 # Ensure all directories exist with proper error handling
 for directory in [
@@ -134,9 +138,10 @@ for directory in [
     intermediate_webm_videos_folder,
     individual_frames_folder,
     intermediate_individual_frames_folder,
-    last_frames_folder,  # Add last_frames folder to the list
-    intermediate_last_frames_folder,  # Add intermediate last frames folder to the list
-    loras_folder  # Add loras folder to the list
+    last_frames_folder,
+    intermediate_last_frames_folder,
+    loras_folder,
+    presets_folder # <-- ADDED FOR PRESETS
 ]:
     try:
         os.makedirs(directory, exist_ok=True)
@@ -441,6 +446,86 @@ def force_remove_lora_modules(model):
         return False
 
 print_supported_image_formats()
+
+# --- Preset Functions START --- (Added for Presets)
+
+def get_preset_path(name: str) -> str:
+    """Constructs the full path for a preset file."""
+    # Sanitize name slightly to prevent path traversal issues, though Gradio input might handle some of this.
+    # A more robust sanitization might be needed depending on security requirements.
+    safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+    if not safe_name:
+        safe_name = "Unnamed_Preset"
+    return os.path.join(presets_folder, f"{safe_name}.json")
+
+def scan_presets() -> list[str]:
+    """Scans the presets folder for .json files and returns a list of names."""
+    presets = ["Default"] # Always include Default
+    try:
+        os.makedirs(presets_folder, exist_ok=True) # Ensure folder exists
+        for filename in os.listdir(presets_folder):
+            if filename.endswith(".json") and filename != "Default.json":
+                preset_name = os.path.splitext(filename)[0]
+                if preset_name != "_lastused": # Exclude internal file if saved as json
+                    presets.append(preset_name)
+    except Exception as e:
+        print(f"Error scanning presets folder: {e}")
+    return sorted(list(set(presets))) # Ensure Default is present and list is unique and sorted
+
+def save_last_used_preset_name(name: str):
+    """Saves the name of the last used preset."""
+    try:
+        with open(last_used_preset_file, 'w', encoding='utf-8') as f:
+            f.write(name)
+    except Exception as e:
+        print(f"Error saving last used preset name: {e}")
+
+def load_last_used_preset_name() -> Optional[str]:
+    """Loads the name of the last used preset."""
+    if os.path.exists(last_used_preset_file):
+        try:
+            with open(last_used_preset_file, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception as e:
+            print(f"Error loading last used preset name: {e}")
+    return None
+
+def create_default_preset_if_needed(components_values: dict):
+    """Creates Default.json if it doesn't exist, using current component values."""
+    default_path = get_preset_path("Default")
+    if not os.path.exists(default_path):
+        print("Default preset not found, creating...")
+        try:
+            # Filter out None values which might occur during initial setup if components aren't fully ready
+            # Although we will call this later with actual default values.
+            valid_values = {k: v for k, v in components_values.items() if v is not None}
+            if valid_values: # Only save if we have some values
+                with open(default_path, 'w', encoding='utf-8') as f:
+                    json.dump(valid_values, f, indent=4)
+                print("Created Default.json")
+            else:
+                print("Warning: Could not create Default.json - no valid component values provided.")
+        except Exception as e:
+            print(f"Error creating default preset: {e}")
+
+def load_preset_data(name: str) -> Optional[dict]:
+    """Loads preset data from a JSON file."""
+    if not name:
+        return None
+    preset_path = get_preset_path(name)
+    if os.path.exists(preset_path):
+        try:
+            with open(preset_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading preset '{name}': {e}")
+            return None
+    else:
+        print(f"Preset file not found: {preset_path}")
+        return None
+
+# --- Preset Functions END ---
+
 
 def save_last_frame(frames, output_dir, filename_base):
     """Save only the last frame from a video frames tensor
@@ -1524,7 +1609,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
                 prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if use_multiline_prompts else ""
                 final_video = rife_video_file  # Update final video with RIFE version
                 yield rife_video_file, gr.update(), gr.update(value=f"RIFE-enhanced video ready ({rife_multiplier})"), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info + prompt_info
-                
+
             if flag == 'progress':
                 preview, desc, html = data
 
@@ -1966,7 +2051,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V28 - Start/End Frame & Timestamp Prompts - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V29 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2031,7 +2116,7 @@ with block:
                     seed = gr.Number(label="Seed", value=31337, precision=0)
                     use_random_seed = gr.Checkbox(label="Random Seed", value=True, info="Use random seeds instead of incrementing")
 
-                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)
+                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True) # Made visible for preset saving/loading
 
                 with gr.Row():
                     fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Directly changes how many frames are generated, 60 will make double frames")
@@ -2062,6 +2147,7 @@ with block:
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
+                # --- Start of Resolution -> Memory Update ---
                 def update_memory_for_resolution(res):
                     if res == "1440": return 23
                     if res == "1320": return 21
@@ -2073,8 +2159,9 @@ with block:
                     elif res == "640": return 8
                     else: return 6
                 resolution.change(fn=update_memory_for_resolution, inputs=resolution, outputs=gpu_memory_preservation)
+                # --- End of Resolution -> Memory Update ---
 
-        with gr.Column():
+        with gr.Column(): # Right column for preview/results
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
             result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=True, height=512, loop=True)
             video_info = gr.HTML("<div id='video-info'>Generate a video to see information</div>")
@@ -2089,19 +2176,31 @@ with block:
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
             timing_display = gr.Markdown("", label="Time Information", elem_classes='no-generating-animation')
 
+            # --- Preset UI Section START --- (Inserted BEFORE Video Quality)
+            gr.Markdown("### Presets")
+            with gr.Row():
+                preset_dropdown = gr.Dropdown(label="Select Preset", choices=scan_presets(), value=load_last_used_preset_name() or "Default")
+                preset_load_button = gr.Button(value="Load Preset")
+                preset_refresh_button = gr.Button(value="🔄 Refresh")
+            with gr.Row():
+                preset_save_name = gr.Textbox(label="Save Preset As", placeholder="Enter preset name...")
+                preset_save_button = gr.Button(value="Save Current Settings")
+            preset_status_display = gr.Markdown("") # To show feedback
+            # --- Preset UI Section END ---
+
             gr.Markdown("### Folder Options")
             with gr.Row():
                 open_outputs_btn = gr.Button(value="Open Generations Folder")
                 open_batch_outputs_btn = gr.Button(value="Open Batch Outputs Folder")
 
-            video_quality = gr.Radio(
+            video_quality = gr.Radio( # <-- This comes AFTER the preset UI
                 label="Video Quality",
                 choices=["high", "medium", "low", "web_compatible"],
                 value="high",
                 info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility"
             )
 
-                        # --- Start of RIFE UI Addition ---
+            # --- Start of RIFE UI Addition ---
             gr.Markdown("### RIFE Frame Interpolation (MP4 Only)")
             with gr.Row():
                 rife_enabled = gr.Checkbox(label="Enable RIFE (2x/4x FPS)", value=False, info="Increases FPS of generated MP4s using RIFE. Saves as '[filename]_extra_FPS.mp4'")
@@ -2116,7 +2215,138 @@ with block:
                 export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP (good balance of quality and file size)")
 
 
+    # --- LIST OF COMPONENTS FOR PRESETS --- (Added for Presets)
+    # Define this list AFTER all relevant components have been created in the UI definition
+    # IMPORTANT: The order here MUST match the order in save_preset inputs and load_preset outputs!
+    # Exclude prompts and batch folders. Include n_prompt.
+    preset_components_list = [
+        use_multiline_prompts,          # Checkbox
+        save_metadata,                  # Checkbox
+        save_individual_frames,         # Checkbox
+        save_intermediate_frames,       # Checkbox
+        save_last_frame,                # Checkbox
+        batch_skip_existing,            # Checkbox
+        batch_save_metadata,            # Checkbox
+        batch_use_multiline_prompts,    # Checkbox
+        batch_save_individual_frames,   # Checkbox
+        batch_save_intermediate_frames, # Checkbox
+        batch_save_last_frame,          # Checkbox
+        num_generations,                # Slider (int)
+        resolution,                     # Dropdown (str)
+        teacache_threshold,             # Slider (float)
+        seed,                           # Number (int) - Note: Loading seed might often be overridden by 'Random Seed' checkbox
+        use_random_seed,                # Checkbox
+        n_prompt,                       # Textbox (str)
+        fps,                            # Slider (int)
+        total_second_length,            # Slider (float)
+        latent_window_size,             # Slider (int)
+        steps,                          # Slider (int)
+        gs,                             # Slider (float)
+        cfg,                            # Slider (float)
+        rs,                             # Slider (float)
+        selected_lora,                  # Dropdown (str - name)
+        lora_scale,                     # Slider (float)
+        convert_lora,                   # Checkbox
+        gpu_memory_preservation,        # Slider (float)
+        video_quality,                  # Radio (str)
+        rife_enabled,                   # Checkbox
+        rife_multiplier,                # Radio (str)
+        export_gif,                     # Checkbox
+        export_apng,                    # Checkbox
+        export_webp                     # Checkbox
+    ]
+    # Give components names/ids for easier debugging if needed (optional)
+    component_names_for_preset = [
+        "use_multiline_prompts", "save_metadata", "save_individual_frames", "save_intermediate_frames", "save_last_frame",
+        "batch_skip_existing", "batch_save_metadata", "batch_use_multiline_prompts", "batch_save_individual_frames", "batch_save_intermediate_frames", "batch_save_last_frame",
+        "num_generations", "resolution", "teacache_threshold", "seed", "use_random_seed", "n_prompt", "fps", "total_second_length",
+        "latent_window_size", "steps", "gs", "cfg", "rs", "selected_lora", "lora_scale", "convert_lora", "gpu_memory_preservation",
+        "video_quality", "rife_enabled", "rife_multiplier", "export_gif", "export_apng", "export_webp"
+    ]
+    # --------------------------------------
 
+
+    # --- Preset Action Functions START --- (Added for Presets)
+
+    def save_preset_action(name: str, *values):
+        """Saves the current settings (*values) to a preset file."""
+        if not name:
+            return gr.update(), gr.update(value="Preset name cannot be empty.") # Update dropdown, update status
+
+        preset_data = {}
+        if len(values) != len(component_names_for_preset):
+             msg = f"Error: Mismatched number of values ({len(values)}) and component names ({len(component_names_for_preset)})."
+             print(msg)
+             return gr.update(), gr.update(value=msg)
+
+        for i, comp_name in enumerate(component_names_for_preset):
+             preset_data[comp_name] = values[i]
+
+        preset_path = get_preset_path(name)
+        try:
+            with open(preset_path, 'w', encoding='utf-8') as f:
+                json.dump(preset_data, f, indent=4)
+            save_last_used_preset_name(name) # Remember this as last used
+            presets = scan_presets()
+            status_msg = f"Preset '{name}' saved successfully."
+            print(status_msg)
+            # Refresh dropdown and select the newly saved preset
+            return gr.update(choices=presets, value=name), gr.update(value=status_msg)
+        except Exception as e:
+            error_msg = f"Error saving preset '{name}': {e}"
+            print(error_msg)
+            return gr.update(), gr.update(value=error_msg) # Update status only
+
+    def load_preset_action(name: str):
+        """Loads settings from a preset file and updates the UI components."""
+        preset_data = load_preset_data(name)
+        if preset_data is None:
+             # Keep current values if loading fails, just show error
+             return [gr.update() for _ in preset_components_list] + [gr.update(value=f"Failed to load preset '{name}'.")]
+
+        # Prepare the list of updates
+        updates = []
+        found_lora = False
+        available_loras = [lora_name for lora_name, _ in scan_lora_files()] # Get current LoRA names
+
+        for i, comp_name in enumerate(component_names_for_preset):
+            if comp_name in preset_data:
+                value = preset_data[comp_name]
+                # Special handling for LoRA dropdown: check if the saved LoRA still exists
+                if comp_name == "selected_lora":
+                    if value in available_loras:
+                        updates.append(gr.update(value=value))
+                        found_lora = True
+                    else:
+                        print(f"Warning: Saved LoRA '{value}' not found in current LoRA list. Setting to 'None'.")
+                        updates.append(gr.update(value="None")) # Default to None if not found
+                else:
+                    updates.append(gr.update(value=value))
+            else:
+                print(f"Warning: Key '{comp_name}' not found in preset '{name}'. Skipping update for this component.")
+                updates.append(gr.update()) # No change for missing keys
+
+        if len(updates) != len(preset_components_list):
+             print(f"Error: Number of updates ({len(updates)}) does not match number of components ({len(preset_components_list)}).")
+             # Return no updates on critical error
+             return [gr.update() for _ in preset_components_list] + [gr.update(value=f"Error applying preset '{name}'. Mismatch in component count.")]
+
+        save_last_used_preset_name(name) # Remember this as last used
+        status_msg = f"Preset '{name}' loaded."
+        print(status_msg)
+        return updates + [gr.update(value=status_msg)] # Return updates for all components + status
+
+    def refresh_presets_action():
+        """Refreshes the preset dropdown list."""
+        presets = scan_presets()
+        last_used = load_last_used_preset_name()
+        selected = last_used if last_used in presets else "Default"
+        return gr.update(choices=presets, value=selected)
+
+    # --- Preset Action Functions END ---
+
+
+    # --- Gradio Event Wiring START ---
     lora_refresh_btn.click(fn=refresh_loras, outputs=[selected_lora])
     lora_folder_btn.click(fn=lambda: open_folder(loras_folder), outputs=[gr.Text(visible=False)])
 
@@ -2145,6 +2375,28 @@ with block:
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     batch_end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
+
+    # --- Preset Event Wiring START --- (Added for Presets)
+    preset_save_button.click(
+        fn=save_preset_action,
+        inputs=[preset_save_name] + preset_components_list, # Pass name and all component values
+        outputs=[preset_dropdown, preset_status_display] # Update dropdown and status
+    )
+
+    preset_load_button.click(
+        fn=load_preset_action,
+        inputs=[preset_dropdown], # Pass selected preset name
+        outputs=preset_components_list + [preset_status_display] # Update ALL components + status
+    )
+
+    preset_refresh_button.click(
+        fn=refresh_presets_action,
+        inputs=[],
+        outputs=[preset_dropdown] # Update dropdown
+    )
+    # --- Preset Event Wiring END ---
+    # --- Gradio Event Wiring END ---
+
 
     video_info_js = """
     function updateVideoInfo() {
@@ -2208,7 +2460,74 @@ with block:
     """
     # Add ID to the result_video component for easier JS selection
     result_video.elem_id = "result_video"
-    block.load(None, js=video_info_js)
+
+    # --- Startup Preset Loading START --- (Added for Presets)
+    # This function will run once when the Gradio app loads
+    def apply_preset_on_startup():
+        print("Applying preset on startup...")
+        # 1. Get current default values from UI definition to create Default.json if needed
+        initial_values = {}
+        for i, comp in enumerate(preset_components_list):
+             # Use getattr to safely access the 'value' attribute if it exists
+             default_value = getattr(comp, 'value', None)
+             initial_values[component_names_for_preset[i]] = default_value
+
+        create_default_preset_if_needed(initial_values)
+
+        # 2. Determine which preset to load (last used or default)
+        preset_to_load = load_last_used_preset_name()
+        available_presets = scan_presets() # Get current list
+
+        if preset_to_load not in available_presets:
+            print(f"Last used preset '{preset_to_load}' not found or invalid, loading 'Default'.")
+            preset_to_load = "Default"
+        else:
+            print(f"Loading last used preset: '{preset_to_load}'")
+
+        # 3. Load the preset data
+        preset_data = load_preset_data(preset_to_load)
+        if preset_data is None and preset_to_load != "Default":
+             print(f"Failed to load '{preset_to_load}', attempting to load 'Default'.")
+             preset_to_load = "Default"
+             preset_data = load_preset_data(preset_to_load)
+
+        if preset_data is None:
+             print("Critical Error: Failed to load 'Default' preset data. UI will use hardcoded defaults.")
+             # Return updates that essentially do nothing, relying on initial values
+             updates = [gr.update() for _ in preset_components_list]
+             return [gr.update(choices=available_presets, value="Default")] + updates
+             # return [gr.update(choices=available_presets, value="Default")] + [initial_values.get(name) for name in component_names_for_preset] # Alternative: Return actual initial values
+
+        # 4. Prepare updates based on loaded data
+        updates = []
+        available_loras = [lora_name for lora_name, _ in scan_lora_files()] # Get current LoRA names
+        for comp_name in component_names_for_preset:
+            if comp_name in preset_data:
+                value = preset_data[comp_name]
+                # Special LoRA check
+                if comp_name == "selected_lora":
+                     if value not in available_loras:
+                         print(f"Startup Warning: Saved LoRA '{value}' not found. Setting to 'None'.")
+                         value = "None"
+                updates.append(gr.update(value=value))
+            else:
+                # If a key is missing in the preset, keep the component's initial value
+                print(f"Startup Warning: Key '{comp_name}' missing in '{preset_to_load}'. Using component's default.")
+                updates.append(gr.update()) # No change
+
+        # 5. Return updates for the dropdown and all components
+        # The first output corresponds to preset_dropdown
+        return [gr.update(choices=available_presets, value=preset_to_load)] + updates
+
+    block.load(
+        fn=apply_preset_on_startup,
+        inputs=[],
+        outputs=[preset_dropdown] + preset_components_list # Update dropdown + all components
+    )
+    # --- Startup Preset Loading END ---
+
+    # Separate load for JS
+    block.load(None, None, None, js=video_info_js)
 
 
 def get_available_drives():
