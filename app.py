@@ -588,7 +588,7 @@ def save_last_frame_to_file(frames, output_dir, filename_base):
 def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, latent_window_size: int, fps: int) -> Optional[list[tuple[float, str]]]:
     """
     Parses prompts in the format '[seconds] prompt_text' per line.
-    Handles time reversal for the generation process.
+    No longer reverses the timestamps - processes them in the order written.
 
     Args:
         prompt_text: The full prompt text, potentially multi-line.
@@ -597,7 +597,7 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
         fps: Frames per second (e.g., 30).
 
     Returns:
-        A list of tuples sorted by REVERSED start time: [(reversed_start_time, prompt), ...],
+        A list of tuples sorted by start time: [(start_time, prompt), ...],
         or None if the format is not detected or invalid.
     """
     lines = prompt_text.strip().split('\n')
@@ -605,8 +605,8 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
     has_timestamps = False
     default_prompt = None
 
-    # Regex to match '[seconds]' at the start of a line
-    pattern = r'^\s*\[(\d+(?:\.\d+)?)\]\s*(.*)'
+    # Regex to match '[seconds]' at the start of a line - updated to handle both [0] and [0s] formats
+    pattern = r'^\s*\[(\d+(?:\.\d+)?(?:s)?)\]\s*(.*)'
 
     for i, line in enumerate(lines):
         line = line.strip()
@@ -617,7 +617,11 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
         if match:
             has_timestamps = True
             try:
-                time_sec = float(match.group(1))
+                time_str = match.group(1)
+                # Remove 's' suffix if present
+                if time_str.endswith('s'):
+                    time_str = time_str[:-1]
+                time_sec = float(time_str)
                 text = match.group(2).strip()
                 if text: # Only add if there's actual prompt text
                     sections.append({"original_time": time_sec, "prompt": text})
@@ -632,7 +636,7 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
              # If we've already seen timestamps, ignore subsequent lines without them
              print(f"Warning: Ignoring line without timestamp after timestamped lines detected: {line}")
 
-
+    # Rest of the function with modifications to prevent reversing
     if not has_timestamps:
         # No timestamp format detected, return None to signal using the original prompt as is
         return None
@@ -654,29 +658,15 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
         sections.insert(0, {"original_time": 0.0, "prompt": first_prompt})
         sections.sort(key=lambda x: x["original_time"]) # Re-sort after insertion
 
-    # Calculate reversed start times (generation happens end-to-start)
-    # The start time of a reversed section corresponds to the end time of the original section
-    reversed_sections = []
+    # Create the final sections list - NO LONGER REVERSING
+    final_sections = []
     for i in range(len(sections)):
-        original_start_time = sections[i]["original_time"]
-        # The *next* section's start time determines the *end* time of the current section
-        original_end_time = sections[i+1]["original_time"] if i + 1 < len(sections) else total_duration
+        start_time = sections[i]["original_time"]
+        prompt_text = sections[i]["prompt"]
+        final_sections.append((start_time, prompt_text))
 
-        # Reversed start time: When this section *starts* being generated (from the end)
-        reversed_start_time = total_duration - original_end_time
-        # Reversed end time: When this section *stops* being generated (from the end)
-        # reversed_end_time = total_duration - original_start_time # Not strictly needed for selection
-
-        # Ensure non-negative times
-        reversed_start_time = max(0.0, reversed_start_time)
-
-        reversed_sections.append((reversed_start_time, sections[i]["prompt"]))
-
-    # Sort by the reversed start time
-    reversed_sections.sort(key=lambda x: x[0])
-
-    print(f"Parsed and reversed timestamped prompts: {reversed_sections}")
-    return reversed_sections
+    print(f"Parsed timestamped prompts (in original order): {final_sections}")
+    return final_sections
 
 @torch.no_grad()
 def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
@@ -990,25 +980,52 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 current_prompt_text_for_callback = first_prompt_key # Default text
 
                 if using_timestamped_prompts:
-                    # Calculate current reversed time position
-                    # How many sections have been *completed* when generating from the end towards the start
-                    sections_completed_in_reverse = total_latent_sections - (latent_padding + 1)
-                    current_reversed_time = max(0.0, sections_completed_in_reverse * duration_per_section)
-
-                    # Find the active prompt for this reversed time
-                    selected_prompt_text = parsed_prompts[0][1] # Default to the earliest reversed time prompt
-                    for rev_time, p_text in parsed_prompts:
-                        if current_reversed_time >= rev_time:
+                    # Updated time calculation to properly handle frame generation
+                    # The video is generated backwards, from end to start
+                    # Determine progress through total video duration
+                    
+                    # Progress proportion (0.0 to 1.0) through the generation process
+                    # 0.0 = just starting (end of video), 1.0 = finished (start of video)
+                    progress_proportion = latent_padding / (total_latent_sections - 1) if total_latent_sections > 1 else 0
+                    
+                    # Convert to actual time in the video (0 = start of video, total_second_length = end)
+                    # For generation frame 0 (end of video), this would be total_second_length
+                    # For final generation frame, this would be 0
+                    current_video_time = total_second_length * (1.0 - progress_proportion)
+                    
+                    # DEBUG: Print all available prompts and current position
+                    print(f"\n===== PROMPT DEBUG INFO =====")
+                    print(f"Latent padding: {latent_padding} / {total_latent_sections}")
+                    print(f"Progress proportion: {progress_proportion:.2f}")
+                    print(f"Current video time: {current_video_time:.2f}s")
+                    print(f"Available prompts: {parsed_prompts}")
+                    
+                    # Find the appropriate prompt for the current time
+                    selected_prompt_text = parsed_prompts[0][1]  # Default to the first prompt
+                    last_matching_time = parsed_prompts[0][0]
+                    
+                    print(f"Starting with prompt at {last_matching_time}s: '{selected_prompt_text}'")
+                    
+                    for start_time, p_text in parsed_prompts:
+                        print(f"Checking timestamp {start_time}s with prompt '{p_text}'")
+                        if current_video_time >= start_time:
                             selected_prompt_text = p_text
+                            last_matching_time = start_time
+                            print(f"  - MATCH: Current time {current_video_time:.2f}s >= {start_time}s")
                         else:
-                            break # Stop once we pass the current time
-
+                            # Stop once we find a timestamp greater than current time
+                            print(f"  - NO MATCH: Current time {current_video_time:.2f}s < {start_time}s")
+                            break
+                    
+                    print(f"Final selected prompt at {last_matching_time}s: '{selected_prompt_text}'")
+                    print(f"===== END DEBUG INFO =====\n")
+                    
                     # Retrieve the encoded tensors
                     active_llama_vec, active_llama_mask, active_clip_pooler = encoded_prompts[selected_prompt_text]
                     current_prompt_text_for_callback = selected_prompt_text # Update for callback
 
-                    # Optional: Update the print statement here or in callback
-                    print(f'---> Reversed Time: {current_reversed_time:.2f}s, Using prompt: "{selected_prompt_text[:50]}..."')
+                    # Print the current time and selected prompt
+                    print(f'---> Video Time: {current_video_time:.2f}s, Using prompt: "{selected_prompt_text[:50]}..."')
 
                 else:
                      # If not using timestamped prompts, use the single encoded prompt
