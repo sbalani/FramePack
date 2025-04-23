@@ -1,4 +1,3 @@
-
 from diffusers_helper.hf_login import login
 
 import os
@@ -1156,8 +1155,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                                     if result.returncode == 0:
                                         if os.path.exists(rife_output_filename):
                                             print(f"Successfully applied RIFE. Saved as: {rife_output_filename}")
-                                            # Optionally yield rife_output_filename if you want it displayed immediately
-                                            # stream.output_queue.push(('file', rife_output_filename)) # Example
+                                            # Display the RIFE-enhanced video instead of the original
+                                            stream.output_queue.push(('rife_file', rife_output_filename))
                                         else:
                                              print(f"RIFE command succeeded but output file missing: {rife_output_filename}")
                                              print(f"RIFE stdout:\n{result.stdout}")
@@ -1518,6 +1517,14 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
                 prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if use_multiline_prompts else ""
                 yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info + prompt_info
 
+            if flag == 'rife_file':
+                # This is a RIFE-enhanced video file
+                rife_video_file = data
+                print(f"Displaying RIFE-enhanced video: {rife_video_file}")
+                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if use_multiline_prompts else ""
+                final_video = rife_video_file  # Update final video with RIFE version
+                yield rife_video_file, gr.update(), gr.update(value=f"RIFE-enhanced video ready ({rife_multiplier})"), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info + prompt_info
+                
             if flag == 'progress':
                 preview, desc, html = data
 
@@ -1542,7 +1549,13 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
 
             if flag == 'end':
                 if prompt_idx == len(prompt_lines) - 1:  # If this is the last prompt loop
-                    yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+                    # Check if there's a RIFE-enhanced version of the final video
+                    if rife_enabled and final_video and os.path.exists(os.path.splitext(final_video)[0] + '_extra_FPS.mp4'):
+                        rife_final_video = os.path.splitext(final_video)[0] + '_extra_FPS.mp4'
+                        print(f"Using RIFE-enhanced final video: {rife_final_video}")
+                        yield rife_final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+                    else:
+                        yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
                 else:
                     # For intermediate prompts (only happens if multi-line is ON)
                     yield final_video, gr.update(visible=False), f"Completed prompt {prompt_idx+1}/{total_prompts_or_loops}", '', gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
@@ -1553,7 +1566,13 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
             break
 
     # Only reach this point if all prompts (if multi-line) are processed
-    yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+    # Check if there's a RIFE-enhanced version of the final video
+    if rife_enabled and final_video and os.path.exists(os.path.splitext(final_video)[0] + '_extra_FPS.mp4'):
+        rife_final_video = os.path.splitext(final_video)[0] + '_extra_FPS.mp4'
+        print(f"Using RIFE-enhanced final video at process end: {rife_final_video}")
+        yield rife_final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+    else:
+        yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
 
 
 # Modified batch_process function signature
@@ -1867,6 +1886,11 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     try:
                                         shutil.copy2(rife_original_path, rife_target_path)
                                         print(f"Copied RIFE enhanced file to batch outputs: {rife_target_path}")
+                                        # Use the RIFE-enhanced video as the output if RIFE is enabled
+                                        if rife_enabled:
+                                            last_output = rife_target_path
+                                            final_output = rife_target_path
+                                            print(f"Using RIFE-enhanced video as the display output: {rife_target_path}")
                                     except Exception as e:
                                         print(f"Error copying RIFE enhanced file to {rife_target_path}: {str(e)}")
 
@@ -1942,7 +1966,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V27 - Start/End Frame & Timestamp Prompts - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V28 - Start/End Frame & Timestamp Prompts - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
