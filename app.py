@@ -2293,7 +2293,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V37 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V38 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2396,7 +2396,7 @@ with block:
                 with gr.Row():
                     convert_lora = gr.Checkbox(label="Convert LoRA to Diffusers Format - Add extra 20 GB GPU Inference Preserved Memory - I am still searching better solution", value=False, info="Enable to convert LoRA weights to the Diffusers format (recommended)")
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=0, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
                 # --- Start of Resolution -> Memory Update ---
                 def update_memory_for_resolution(res):
