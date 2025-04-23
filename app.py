@@ -2266,8 +2266,9 @@ with block:
                     # --- END ADDED ---
 
                     prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on") # Changed lines to 4
-                    use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen. OFF: Try parsing '[secs] prompt' format.")
-                    latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunks. Affects section count and duration (see info above prompt).") # Added info here
+                    with gr.Row():
+                        use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen. OFF: Try parsing '[secs] prompt' format.")
+                        latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunks. Affects section count and duration (see info above prompt).") # Added info here
                     example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
                     example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
