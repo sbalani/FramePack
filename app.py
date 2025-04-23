@@ -1315,7 +1315,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         "Video Length (seconds)": total_second_length,
                         "FPS": fps,
                         "Steps": steps,
+                        "CFG Scale": cfg, # Add explicit CFG Scale
                         "Distilled CFG Scale": gs,
+                        "Guidance Rescale": rs, # Add Guidance Rescale
                         "Resolution": resolution,
                         "Generation Time": generation_time_formatted,
                         "Total Seconds": f"{generation_time_seconds} seconds",
@@ -1919,7 +1921,9 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         "Video Length (seconds)": total_second_length,
                                         "FPS": fps,
                                         "Steps": steps,
+                                        "CFG Scale": cfg, # Add explicit CFG Scale
                                         "Distilled CFG Scale": gs,
+                                        "Guidance Rescale": rs, # Add Guidance Rescale
                                         "Resolution": resolution,
                                         "Generation Time": generation_time_formatted,
                                         "Total Seconds": f"{generation_time_seconds} seconds",
@@ -2051,7 +2055,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V29 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V30 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2128,8 +2132,9 @@ with block:
                     steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
                     gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
 
-                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)
-                rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)
+                with gr.Row():
+                    cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=True, info='You need more than CFG 1 for negative prompts')
+                    rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=True)
 
                 gr.Markdown("### LoRA Settings")
                 with gr.Row():
