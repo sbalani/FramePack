@@ -2247,7 +2247,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V34 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V35 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2267,6 +2267,7 @@ with block:
 
                     prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on") # Changed lines to 4
                     use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen. OFF: Try parsing '[secs] prompt' format.")
+                    latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunks. Affects section count and duration (see info above prompt).") # Added info here
                     example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
                     example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
@@ -2324,7 +2325,7 @@ with block:
                     fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Directly changes how many frames are generated, 60 will make double frames")
                     total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
 
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunks. Affects section count and duration (see info above prompt).") # Added info here
+
 
                 with gr.Row():
                     steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
