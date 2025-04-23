@@ -980,52 +980,64 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 current_prompt_text_for_callback = first_prompt_key # Default text
 
                 if using_timestamped_prompts:
-                    # Updated time calculation to properly handle frame generation
-                    # The video is generated backwards, from end to start
-                    # Determine progress through total video duration
-                    
-                    # Progress proportion (0.0 to 1.0) through the generation process
-                    # 0.0 = just starting (end of video), 1.0 = finished (start of video)
-                    progress_proportion = latent_padding / (total_latent_sections - 1) if total_latent_sections > 1 else 0
-                    
-                    # Convert to actual time in the video (0 = start of video, total_second_length = end)
-                    # For generation frame 0 (end of video), this would be total_second_length
-                    # For final generation frame, this would be 0
-                    current_video_time = total_second_length * (1.0 - progress_proportion)
-                    
+                    # ===>>> START OF THE REVISED CHANGE <<<===
+                    # Calculate the approximate video time corresponding to the *start* of the current latent section being generated.
+                    # Use the loop iteration index 'i' for progress, as 'latent_padding' is not linear w.r.t time.
+                    # Generation runs backward (i=0 is end frame, i=N-1 is start frame), so map 'i' to time accordingly.
+
+                    if total_latent_sections > 1:
+                        # Map loop iteration index 'i' (0 to N-1) to time (total_length -> 0)
+                        # Fraction of loop completed (forward): i / (total_latent_sections - 1)
+                        # Fraction of video remaining (backward): 1.0 - fraction_completed
+                        progress_fraction = i / (total_latent_sections - 1)
+                        current_video_time = total_second_length * (1.0 - progress_fraction)
+                    else:
+                        # If only one section, it essentially generates based on the initial state (time 0).
+                        current_video_time = 0.0
+                    # ===>>> END OF THE REVISED CHANGE <<<===
+
+
                     # DEBUG: Print all available prompts and current position
                     print(f"\n===== PROMPT DEBUG INFO =====")
-                    print(f"Latent padding: {latent_padding} / {total_latent_sections}")
-                    print(f"Progress proportion: {progress_proportion:.2f}")
-                    print(f"Current video time: {current_video_time:.2f}s")
+                    print(f"Iteration: {i} / {total_latent_sections - 1}") # Use i for clarity
+                    print(f"Latent padding value for this iteration: {latent_padding}") # Keep for info
+                    print(f"Current video time (mapped from iteration): {current_video_time:.2f}s")
                     print(f"Available prompts: {parsed_prompts}")
-                    
+
                     # Find the appropriate prompt for the current time
-                    selected_prompt_text = parsed_prompts[0][1]  # Default to the first prompt
+                    # The prompt active AT or BEFORE the current_video_time
+                    selected_prompt_text = parsed_prompts[0][1]  # Default to the first prompt ([0] time)
                     last_matching_time = parsed_prompts[0][0]
-                    
-                    print(f"Starting with prompt at {last_matching_time}s: '{selected_prompt_text}'")
-                    
+
+                    print(f"Checking against prompts...")
+                    # Iterate through prompts sorted by time [0s, 10s, 20s]
                     for start_time, p_text in parsed_prompts:
-                        print(f"Checking timestamp {start_time}s with prompt '{p_text}'")
-                        if current_video_time >= start_time:
-                            selected_prompt_text = p_text
-                            last_matching_time = start_time
-                            print(f"  - MATCH: Current time {current_video_time:.2f}s >= {start_time}s")
+                        # If the current video time we are generating FOR
+                        # is >= the timestamp of the prompt, that prompt is potentially active.
+                        # We take the LAST one that matches this condition.
+                        print(f"  - Checking time {start_time:.2f}s ('{p_text[:20]}...') vs current_video_time {current_video_time:.2f}s")
+                        # Add a small epsilon to handle floating point comparisons near timestamps
+                        epsilon = 1e-4
+                        if current_video_time >= (start_time - epsilon):
+                             selected_prompt_text = p_text
+                             last_matching_time = start_time
+                             print(f"    - MATCH: Current time {current_video_time:.2f}s >= {start_time}s. Tentative selection: '{selected_prompt_text[:20]}...'")
                         else:
-                            # Stop once we find a timestamp greater than current time
-                            print(f"  - NO MATCH: Current time {current_video_time:.2f}s < {start_time}s")
-                            break
-                    
-                    print(f"Final selected prompt at {last_matching_time}s: '{selected_prompt_text}'")
+                            # Since prompts are sorted, once we find a timestamp > current_video_time,
+                            # we know the previous one was the correct one to use.
+                            print(f"    - NO MATCH: Current time {current_video_time:.2f}s < {start_time}s. Stopping search.")
+                            break # Stop searching
+
+                    print(f"Final selected prompt active at/before {current_video_time:.2f}s is the one from {last_matching_time}s: '{selected_prompt_text}'")
                     print(f"===== END DEBUG INFO =====\n")
-                    
+
                     # Retrieve the encoded tensors
                     active_llama_vec, active_llama_mask, active_clip_pooler = encoded_prompts[selected_prompt_text]
                     current_prompt_text_for_callback = selected_prompt_text # Update for callback
 
                     # Print the current time and selected prompt
-                    print(f'---> Video Time: {current_video_time:.2f}s, Using prompt: "{selected_prompt_text[:50]}..."')
+                    print(f'---> Generating section corresponding to video time >= {last_matching_time:.2f}s, Using prompt: "{selected_prompt_text[:50]}..."')
+                    
 
                 else:
                      # If not using timestamped prompts, use the single encoded prompt
@@ -2157,7 +2169,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V30 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V31 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
