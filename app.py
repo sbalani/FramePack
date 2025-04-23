@@ -1274,7 +1274,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
                 if not high_vram:
-                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
                     load_model_as_complete(vae, target_device=gpu)
 
                 vae_start_time = time.time()
@@ -2294,7 +2294,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V39 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V40 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
