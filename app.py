@@ -1,3 +1,5 @@
+# --- START OF FILE app.py ---
+
 from diffusers_helper.hf_login import login
 
 import os
@@ -541,18 +543,18 @@ def save_last_frame_to_file(frames, output_dir, filename_base):
     try:
         # Make sure output directory exists (already done before calling, but safe)
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Extract only the last frame but keep the tensor structure (b,c,t,h,w)
         # where t=1 to be compatible with save_individual_frames function
         if frames is None:
             print("Error: frames tensor is None")
             return None
-            
+
         # Check if frames has the expected shape (b,c,t,h,w)
         if not (isinstance(frames, torch.Tensor) and len(frames.shape) == 5):
             print(f"Error: Invalid frames tensor shape: {frames.shape if hasattr(frames, 'shape') else 'unknown'}")
             return None
-            
+
         try:
             last_frame_tensor = frames[:, :, -1:, :, :]  # Slicing keeps the dimension
         except Exception as slicing_error:
@@ -667,6 +669,56 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
 
     print(f"Parsed timestamped prompts (in original order): {final_sections}")
     return final_sections
+
+# Function to update iteration info (moved before worker)
+def update_iteration_info(vid_len_s, fps_val, win_size):
+    """Calculates and formats information about generation sections."""
+    if not all([isinstance(vid_len_s, (int, float)), isinstance(fps_val, int), isinstance(win_size, int)]):
+        return "Calculating..." # Handle potential None values during startup
+
+    if fps_val <= 0 or win_size <= 0:
+        return "Invalid FPS or Latent Window Size."
+
+    try:
+        # Calculate total sections based on the worker logic (rounded up)
+        total_frames_needed = vid_len_s * fps_val
+        frames_per_latent_window = win_size * 4
+        total_latent_sections = int(math.ceil(total_frames_needed / frames_per_latent_window))
+        total_latent_sections = max(total_latent_sections, 1) # Ensure at least 1 section
+
+        # Calculate duration added per step (after the first)
+        # Each step generates win_size * 4 - 3 frames, but overlaps.
+        # The number of *new* frames added per step (excluding the first) is approximately win_size * 2
+        # Let's refine this based on how the padding works - the number of new latents added is `latent_window_size`
+        # and each latent corresponds to 4 frames in pixel space.
+        # However, the `soft_append` uses an overlap of `latent_window_size * 4 - 3`.
+        # The actual number of unique pixel frames added per step is more complex due to blending.
+        # Let's estimate based on the number of non-overlapped latents, which is `latent_window_size`.
+        # Each latent -> 4 frames. BUT this might be misleading.
+        # A safer estimate might be based on the total length divided by the number of steps.
+        # Number of steps is `total_latent_sections`.
+        # Duration per step = total_duration / total_latent_sections (approximately)
+
+        # Revised calculation based on how many frames each section *effectively* adds
+        # The first section generates `win_size * 4 - 3` frames.
+        # Subsequent sections generate `win_size * 4 - 3` but overlap significantly.
+        # The effective *new* frames added per step is roughly `win_size * 2`.
+        new_frames_per_step = win_size * 2
+        duration_per_step_seconds = new_frames_per_step / fps_val if fps_val > 0 else 0
+
+        # Worker calculation for sections (for comparison)
+        worker_total_latent_sections = int(max(round((vid_len_s * fps_val) / (win_size * 4)), 1)) if win_size > 0 else 1
+
+        info_text = (
+            f"**Generation Info:** Approx. **{worker_total_latent_sections}** section(s) will be generated.\n"
+            f"Each section (after the first) adds ~**{duration_per_step_seconds:.2f} seconds** of video time "
+            f"(corresponding to {new_frames_per_step} new frames at {fps_val} FPS).\n"
+            f"*Use this duration to estimate timings for '[seconds] prompt' format.*"
+        )
+        return info_text
+    except Exception as e:
+        print(f"Error calculating iteration info: {e}")
+        return "Error calculating info."
 
 @torch.no_grad()
 def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
@@ -1037,7 +1089,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                     # Print the current time and selected prompt
                     print(f'---> Generating section corresponding to video time >= {last_matching_time:.2f}s, Using prompt: "{selected_prompt_text[:50]}..."')
-                    
+
 
                 else:
                      # If not using timestamped prompts, use the single encoded prompt
@@ -1378,6 +1430,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                         "Video Length (seconds)": total_second_length,
                         "FPS": fps,
+                        "Latent Window Size": latent_window_size, # <-- ADDED
                         "Steps": steps,
                         "CFG Scale": cfg, # Add explicit CFG Scale
                         "Distilled CFG Scale": gs,
@@ -2004,6 +2057,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                                         "Video Length (seconds)": total_second_length,
                                         "FPS": fps,
+                                        "Latent Window Size": latent_window_size, # <-- ADDED
                                         "Steps": steps,
                                         "CFG Scale": cfg, # Add explicit CFG Scale
                                         "Distilled CFG Scale": gs,
@@ -2169,7 +2223,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V32 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V33 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2180,6 +2234,10 @@ with block:
                             input_image = gr.Image(sources='upload', type="numpy", label="Start Frame", height=320)
                         with gr.Column():
                             end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional)", height=320) # Added end_image
+
+                    # --- ADDED Iteration Info Display ---
+                    iteration_info_display = gr.Markdown("Calculating generation info...", elem_id="iteration-info-display")
+                    # --- END ADDED ---
 
                     prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on") # Changed lines to 4
                     use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen. OFF: Try parsing '[secs] prompt' format.")
@@ -2240,7 +2298,7 @@ with block:
                     fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Directly changes how many frames are generated, 60 will make double frames")
                     total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
 
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunks. Affects section count and duration (see info above prompt).") # Added info here
 
                 with gr.Row():
                     steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
@@ -2289,8 +2347,8 @@ with block:
             Note on Sampling: Due to inverted sampling, the end part of the video is generated first, and the start part last.
             - **Start Frame Only:** If the start action isn't in the video initially, wait for the full generation.
             - **Start and End Frames:** The model attempts a smooth transition. The end frame's influence appears early in the generation process.
-            - **Timestamp Prompts (Multi-line OFF):** Prompts like `[2] wave hello` trigger *after* 2 seconds have passed in the *final* video (meaning they are generated earlier in the process).
-            ''')
+            - **Timestamp Prompts (Multi-line OFF):** Prompts like `[2] wave hello` trigger *after* 2 seconds have passed in the *final* video (meaning they are generated earlier in the process). Use the **Generation Info** above for timing estimates.
+            ''') # Added pointer to Generation Info
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
             timing_display = gr.Markdown("", label="Time Information", elem_classes='no-generating-animation')
@@ -2358,7 +2416,7 @@ with block:
         n_prompt,                       # Textbox (str)
         fps,                            # Slider (int)
         total_second_length,            # Slider (float)
-        latent_window_size,             # Slider (int)
+        latent_window_size,             # Slider (int) # <-- Already included
         steps,                          # Slider (int)
         gs,                             # Slider (float)
         cfg,                            # Slider (float)
@@ -2427,8 +2485,10 @@ with block:
         updates = []
         found_lora = False
         available_loras = [lora_name for lora_name, _ in scan_lora_files()] # Get current LoRA names
+        loaded_values = {} # Store loaded values for iteration info update
 
         for i, comp_name in enumerate(component_names_for_preset):
+            comp_initial_value = getattr(preset_components_list[i], 'value', None) # Get component default
             if comp_name in preset_data:
                 value = preset_data[comp_name]
                 # Special handling for LoRA dropdown: check if the saved LoRA still exists
@@ -2438,22 +2498,34 @@ with block:
                         found_lora = True
                     else:
                         print(f"Warning: Saved LoRA '{value}' not found in current LoRA list. Setting to 'None'.")
+                        value = "None" # Update value before adding update
                         updates.append(gr.update(value="None")) # Default to None if not found
                 else:
                     updates.append(gr.update(value=value))
+                loaded_values[comp_name] = value # Store the value that will be used
             else:
                 print(f"Warning: Key '{comp_name}' not found in preset '{name}'. Skipping update for this component.")
-                updates.append(gr.update()) # No change for missing keys
+                updates.append(gr.update(value=comp_initial_value)) # No change for missing keys, use default
+                loaded_values[comp_name] = comp_initial_value # Store default value
 
         if len(updates) != len(preset_components_list):
              print(f"Error: Number of updates ({len(updates)}) does not match number of components ({len(preset_components_list)}).")
              # Return no updates on critical error
-             return [gr.update() for _ in preset_components_list] + [gr.update(value=f"Error applying preset '{name}'. Mismatch in component count.")]
+             return [gr.update() for _ in preset_components_list] + [gr.update(value=f"Error applying preset '{name}'. Mismatch in component count.")] + [gr.update()] # Add update for info display
 
         save_last_used_preset_name(name) # Remember this as last used
         status_msg = f"Preset '{name}' loaded."
         print(status_msg)
-        return updates + [gr.update(value=status_msg)] # Return updates for all components + status
+
+        # Calculate iteration info based on loaded values
+        vid_len = loaded_values.get('total_second_length', 5)
+        fps_val = loaded_values.get('fps', 30)
+        win_size = loaded_values.get('latent_window_size', 9)
+        info_text = update_iteration_info(vid_len, fps_val, win_size)
+
+        # Return updates for all components + status + iteration info display
+        return updates + [gr.update(value=status_msg)] + [gr.update(value=info_text)]
+
 
     def refresh_presets_action():
         """Refreshes the preset dropdown list."""
@@ -2505,7 +2577,7 @@ with block:
     preset_load_button.click(
         fn=load_preset_action,
         inputs=[preset_dropdown], # Pass selected preset name
-        outputs=preset_components_list + [preset_status_display] # Update ALL components + status
+        outputs=preset_components_list + [preset_status_display] + [iteration_info_display] # Update ALL components + status + info display
     )
 
     preset_refresh_button.click(
@@ -2514,6 +2586,18 @@ with block:
         outputs=[preset_dropdown] # Update dropdown
     )
     # --- Preset Event Wiring END ---
+
+    # --- ADDED Change Listeners for Iteration Info ---
+    iteration_info_inputs = [total_second_length, fps, latent_window_size]
+    for comp in iteration_info_inputs:
+        comp.change(
+            fn=update_iteration_info,
+            inputs=iteration_info_inputs,
+            outputs=iteration_info_display,
+            queue=False # No need to queue this simple update
+        )
+    # --- END ADDED ---
+
     # --- Gradio Event Wiring END ---
 
 
@@ -2580,10 +2664,10 @@ with block:
     # Add ID to the result_video component for easier JS selection
     result_video.elem_id = "result_video"
 
-    # --- Startup Preset Loading START --- (Added for Presets)
+    # --- Startup Loading START (Combined Preset & Iteration Info) ---
     # This function will run once when the Gradio app loads
-    def apply_preset_on_startup():
-        print("Applying preset on startup...")
+    def apply_preset_and_init_info_on_startup():
+        print("Applying preset and initializing info on startup...")
         # 1. Get current default values from UI definition to create Default.json if needed
         initial_values = {}
         for i, comp in enumerate(preset_components_list):
@@ -2610,42 +2694,50 @@ with block:
              preset_to_load = "Default"
              preset_data = load_preset_data(preset_to_load)
 
-        if preset_data is None:
-             print("Critical Error: Failed to load 'Default' preset data. UI will use hardcoded defaults.")
-             # Return updates that essentially do nothing, relying on initial values
-             updates = [gr.update() for _ in preset_components_list]
-             return [gr.update(choices=available_presets, value="Default")] + updates
-             # return [gr.update(choices=available_presets, value="Default")] + [initial_values.get(name) for name in component_names_for_preset] # Alternative: Return actual initial values
+        # 4. Prepare updates based on loaded data or defaults
+        preset_updates = []
+        loaded_values = {} # Store loaded values to pass to info update
 
-        # 4. Prepare updates based on loaded data
-        updates = []
-        available_loras = [lora_name for lora_name, _ in scan_lora_files()] # Get current LoRA names
-        for comp_name in component_names_for_preset:
-            if comp_name in preset_data:
-                value = preset_data[comp_name]
-                # Special LoRA check
-                if comp_name == "selected_lora":
-                     if value not in available_loras:
-                         print(f"Startup Warning: Saved LoRA '{value}' not found. Setting to 'None'.")
-                         value = "None"
-                updates.append(gr.update(value=value))
-            else:
-                # If a key is missing in the preset, keep the component's initial value
-                print(f"Startup Warning: Key '{comp_name}' missing in '{preset_to_load}'. Using component's default.")
-                updates.append(gr.update()) # No change
+        if preset_data:
+            available_loras = [lora_name for lora_name, _ in scan_lora_files()]
+            for i, comp_name in enumerate(component_names_for_preset):
+                comp_initial_value = initial_values.get(comp_name) # Get initial value for fallback
+                if comp_name in preset_data:
+                    value = preset_data[comp_name]
+                    if comp_name == "selected_lora" and value not in available_loras:
+                        print(f"Startup Warning: Saved LoRA '{value}' not found. Setting to 'None'.")
+                        value = "None"
+                    preset_updates.append(gr.update(value=value))
+                    loaded_values[comp_name] = value # Store loaded value
+                else:
+                    # If a key is missing in the preset, keep the component's initial value
+                    print(f"Startup Warning: Key '{comp_name}' missing in '{preset_to_load}'. Using component's default.")
+                    preset_updates.append(gr.update(value=comp_initial_value)) # Use initial value if missing
+                    loaded_values[comp_name] = comp_initial_value # Store initial value
+        else: # Failed to load Default preset
+             print("Critical Error: Failed to load 'Default' preset data. Using hardcoded defaults.")
+             preset_updates = [gr.update(value=initial_values.get(name)) for name in component_names_for_preset]
+             loaded_values = initial_values # Use initial values
 
-        # 5. Return updates for the dropdown and all components
+        # 5. Calculate initial iteration info using loaded/default values
+        initial_vid_len = loaded_values.get('total_second_length', 5) # Use loaded or default
+        initial_fps = loaded_values.get('fps', 30)
+        initial_win_size = loaded_values.get('latent_window_size', 9)
+        initial_info_text = update_iteration_info(initial_vid_len, initial_fps, initial_win_size)
+
+        # 6. Return updates for the dropdown, all components, and the info display
         # The first output corresponds to preset_dropdown
-        return [gr.update(choices=available_presets, value=preset_to_load)] + updates
+        return [gr.update(choices=available_presets, value=preset_to_load)] + preset_updates + [initial_info_text]
 
     block.load(
-        fn=apply_preset_on_startup,
+        fn=apply_preset_and_init_info_on_startup,
         inputs=[],
-        outputs=[preset_dropdown] + preset_components_list # Update dropdown + all components
+        # Update dropdown, all preset components, AND the new info display
+        outputs=[preset_dropdown] + preset_components_list + [iteration_info_display]
     )
-    # --- Startup Preset Loading END ---
+    # --- Startup Loading END ---
 
-    # Separate load for JS
+    # Separate load for JS (remains the same)
     block.load(None, None, None, js=video_info_js)
 
 
@@ -2679,3 +2771,4 @@ block.launch(
     allowed_paths=get_available_drives()
 )
 
+# --- END OF FILE app.py ---
