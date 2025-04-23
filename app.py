@@ -1117,9 +1117,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         post_processing_eta = expected_frames * estimated_vae_time_per_frame + estimated_save_time
                         eta_seconds += post_processing_eta
 
-                    eta_str = f"{eta_seconds/60:.1f} min" if eta_seconds > 60 else f"{eta_seconds:.1f} sec"
+                    eta_str = format_time_human_readable(eta_seconds)
                     total_elapsed = time.time() - start_time
-                    elapsed_str = f"{total_elapsed/60:.1f} min" if total_elapsed > 60 else f"{total_elapsed:.1f} sec"
+                    elapsed_str = format_time_human_readable(total_elapsed)
 
                     hint = f'Sampling {current_step}/{steps} (Gen {gen_idx+1}/{num_generations}, Seed {current_seed})'
 
@@ -2169,7 +2169,7 @@ quick_prompts = [[x] for x in quick_prompts]
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V31 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V32 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
