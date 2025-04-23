@@ -1,5 +1,3 @@
-# --- START OF FILE app.py ---
-
 from diffusers_helper.hf_login import login
 
 import os
@@ -670,55 +668,43 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
     print(f"Parsed timestamped prompts (in original order): {final_sections}")
     return final_sections
 
-# Function to update iteration info (moved before worker)
+# --- Updated Function ---
 def update_iteration_info(vid_len_s, fps_val, win_size):
     """Calculates and formats information about generation sections."""
     if not all([isinstance(vid_len_s, (int, float)), isinstance(fps_val, int), isinstance(win_size, int)]):
-        return "Calculating..." # Handle potential None values during startup
+        return "Calculating..."
 
     if fps_val <= 0 or win_size <= 0:
         return "Invalid FPS or Latent Window Size."
 
     try:
-        # Calculate total sections based on the worker logic (rounded up)
-        total_frames_needed = vid_len_s * fps_val
-        frames_per_latent_window = win_size * 4
-        total_latent_sections = int(math.ceil(total_frames_needed / frames_per_latent_window))
+        # Calculate total sections using the same logic as the worker
+        # Note: The worker uses round(), let's use ceil() for a slightly more conservative estimate if needed,
+        # but sticking to round() matches the worker's loop count precisely.
+        # total_frames_needed = vid_len_s * fps_val
+        # frames_per_latent_window = win_size * 4
+        # total_latent_sections = int(math.ceil(total_frames_needed / frames_per_latent_window)) # Alternative: ceil
+        total_latent_sections = int(max(round((vid_len_s * fps_val) / (win_size * 4)), 1)) if win_size > 0 else 1
         total_latent_sections = max(total_latent_sections, 1) # Ensure at least 1 section
 
-        # Calculate duration added per step (after the first)
-        # Each step generates win_size * 4 - 3 frames, but overlaps.
-        # The number of *new* frames added per step (excluding the first) is approximately win_size * 2
-        # Let's refine this based on how the padding works - the number of new latents added is `latent_window_size`
-        # and each latent corresponds to 4 frames in pixel space.
-        # However, the `soft_append` uses an overlap of `latent_window_size * 4 - 3`.
-        # The actual number of unique pixel frames added per step is more complex due to blending.
-        # Let's estimate based on the number of non-overlapped latents, which is `latent_window_size`.
-        # Each latent -> 4 frames. BUT this might be misleading.
-        # A safer estimate might be based on the total length divided by the number of steps.
-        # Number of steps is `total_latent_sections`.
-        # Duration per step = total_duration / total_latent_sections (approximately)
+        # Calculate the *average* duration generated per section
+        duration_per_section_seconds = vid_len_s / total_latent_sections if total_latent_sections > 0 else 0
 
-        # Revised calculation based on how many frames each section *effectively* adds
-        # The first section generates `win_size * 4 - 3` frames.
-        # Subsequent sections generate `win_size * 4 - 3` but overlap significantly.
-        # The effective *new* frames added per step is roughly `win_size * 2`.
-        new_frames_per_step = win_size * 2
-        duration_per_step_seconds = new_frames_per_step / fps_val if fps_val > 0 else 0
-
-        # Worker calculation for sections (for comparison)
-        worker_total_latent_sections = int(max(round((vid_len_s * fps_val) / (win_size * 4)), 1)) if win_size > 0 else 1
+        # Calculate total frames generated in one section (for info)
+        frames_in_one_section = win_size * 4 - 3
 
         info_text = (
-            f"**Generation Info:** Approx. **{worker_total_latent_sections}** section(s) will be generated.\n"
-            f"Each section (after the first) adds ~**{duration_per_step_seconds:.2f} seconds** of video time "
-            f"(corresponding to {new_frames_per_step} new frames at {fps_val} FPS).\n"
-            f"*Use this duration to estimate timings for '[seconds] prompt' format.*"
+            f"**Generation Info:** Approx. **{total_latent_sections}** section(s) will be generated.\n"
+            f"Each section represents ~**{duration_per_section_seconds:.2f} seconds** of the final video time.\n"
+            f"(One section processes {frames_in_one_section} frames internally with overlap at {fps_val} FPS).\n"
+            f"*Use the **{duration_per_section_seconds:.2f}s per section** estimate for '[seconds] prompt' timings.*"
         )
         return info_text
     except Exception as e:
         print(f"Error calculating iteration info: {e}")
         return "Error calculating info."
+# --- End Updated Function ---
+
 
 @torch.no_grad()
 def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
@@ -757,7 +743,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
     last_used_seed = seed
 
     # Timing variables
-    start_time = time.time()
+    start_time = time.time() # Overall start time for the whole worker call (for total time calculation)
     generation_times = []
 
     # Post-processing time estimates (in seconds)
@@ -770,7 +756,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
     for gen_idx in range(num_generations):
         # Track start time for current generation
-        gen_start_time = time.time()
+        gen_start_time = time.time() # <<<--- START TIME FOR THIS SPECIFIC GENERATION
 
         if stream.input_queue.top() == 'end':
             stream.output_queue.push(('end', None))
@@ -1041,7 +1027,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         # Map loop iteration index 'i' (0 to N-1) to time (total_length -> 0)
                         # Fraction of loop completed (forward): i / (total_latent_sections - 1)
                         # Fraction of video remaining (backward): 1.0 - fraction_completed
-                        progress_fraction = i / (total_latent_sections - 1)
+                        progress_fraction = i / (total_latent_sections - 1) if total_latent_sections > 1 else 0.0 # Avoid div by zero if only 1 section
                         current_video_time = total_second_length * (1.0 - progress_fraction)
                     else:
                         # If only one section, it essentially generates based on the initial state (time 0).
@@ -1063,21 +1049,21 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                     print(f"Checking against prompts...")
                     # Iterate through prompts sorted by time [0s, 10s, 20s]
-                    for start_time, p_text in parsed_prompts:
+                    for start_time_prompt, p_text in parsed_prompts:
                         # If the current video time we are generating FOR
                         # is >= the timestamp of the prompt, that prompt is potentially active.
                         # We take the LAST one that matches this condition.
-                        print(f"  - Checking time {start_time:.2f}s ('{p_text[:20]}...') vs current_video_time {current_video_time:.2f}s")
+                        print(f"  - Checking time {start_time_prompt:.2f}s ('{p_text[:20]}...') vs current_video_time {current_video_time:.2f}s")
                         # Add a small epsilon to handle floating point comparisons near timestamps
                         epsilon = 1e-4
-                        if current_video_time >= (start_time - epsilon):
+                        if current_video_time >= (start_time_prompt - epsilon):
                              selected_prompt_text = p_text
-                             last_matching_time = start_time
-                             print(f"    - MATCH: Current time {current_video_time:.2f}s >= {start_time}s. Tentative selection: '{selected_prompt_text[:20]}...'")
+                             last_matching_time = start_time_prompt
+                             print(f"    - MATCH: Current time {current_video_time:.2f}s >= {start_time_prompt}s. Tentative selection: '{selected_prompt_text[:20]}...'")
                         else:
                             # Since prompts are sorted, once we find a timestamp > current_video_time,
                             # we know the previous one was the correct one to use.
-                            print(f"    - NO MATCH: Current time {current_video_time:.2f}s < {start_time}s. Stopping search.")
+                            print(f"    - NO MATCH: Current time {current_video_time:.2f}s < {start_time_prompt}s. Stopping search.")
                             break # Stop searching
 
                     print(f"Final selected prompt active at/before {current_video_time:.2f}s is the one from {last_matching_time}s: '{selected_prompt_text}'")
@@ -1135,7 +1121,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     print("Teacache disabled")
                     transformer.initialize_teacache(enable_teacache=False)
 
-                sampling_start_time = time.time()
+                sampling_start_time = time.time() # Start time for this specific sampling step
 
                 # --- MODIFICATION for callback ---
                 def callback(d):
@@ -1155,7 +1141,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     current_step = d['i'] + 1
                     percentage = int(100.0 * current_step / steps)
 
-                    elapsed_time = time.time() - sampling_start_time
+                    elapsed_time = time.time() - sampling_start_time # Elapsed time for *this specific sampling step*
                     time_per_step = elapsed_time / current_step if current_step > 0 else 0
                     remaining_steps = steps - current_step
                     eta_seconds = time_per_step * remaining_steps
@@ -1170,7 +1156,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         eta_seconds += post_processing_eta
 
                     eta_str = format_time_human_readable(eta_seconds)
-                    total_elapsed = time.time() - start_time
+                    total_elapsed = time.time() - gen_start_time # <-- CORRECTED: Use current gen start time
                     elapsed_str = format_time_human_readable(total_elapsed)
 
                     hint = f'Sampling {current_step}/{steps} (Gen {gen_idx+1}/{num_generations}, Seed {current_seed})'
@@ -1414,9 +1400,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 save_metadata_enabled = True # Assume true for now, should be passed ideally
                 # --- MODIFICATION for metadata ---
                 if save_metadata_enabled and is_last_section:
-                    gen_time = time.time() - gen_start_time
-                    generation_time_seconds = int(gen_time)
-                    generation_time_formatted = format_time_human_readable(gen_time)
+                    gen_time_current = time.time() - gen_start_time # Use gen_start_time for current gen time
+                    generation_time_seconds = int(gen_time_current)
+                    generation_time_formatted = format_time_human_readable(gen_time_current)
 
                     # Determine the prompt to save in metadata
                     metadata_prompt = prompt # Original full prompt by default
@@ -1514,20 +1500,22 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 if is_last_section:
                     break # End of generation loop
 
-            gen_time = time.time() - gen_start_time
-            generation_times.append(gen_time)
+            # --- Generation Loop Timing ---
+            gen_time_completed = time.time() - gen_start_time # Use gen_start_time for correct duration
+            generation_times.append(gen_time_completed)
             avg_gen_time = sum(generation_times) / len(generation_times)
             remaining_gens = num_generations - (gen_idx + 1)
             estimated_remaining_time = avg_gen_time * remaining_gens
 
-            print(f"\nGeneration {gen_idx+1}/{num_generations} completed in {gen_time:.2f} seconds")
+            print(f"\nGeneration {gen_idx+1}/{num_generations} completed in {gen_time_completed:.2f} seconds")
             if remaining_gens > 0:
                 print(f"Estimated time for remaining generations: {estimated_remaining_time/60:.1f} minutes")
                 if using_lora and hasattr(transformer, "peft_config") and transformer.peft_config:
                     print("Cleaning up LoRA weights before next generation")
                     safe_unload_lora(transformer, gpu)
 
-            stream.output_queue.push(('timing', {'gen_time': gen_time, 'avg_time': avg_gen_time, 'remaining_time': estimated_remaining_time}))
+            stream.output_queue.push(('timing', {'gen_time': gen_time_completed, 'avg_time': avg_gen_time, 'remaining_time': estimated_remaining_time}))
+            # --- End Generation Loop Timing ---
 
         except KeyboardInterrupt as e:
             if str(e) == 'User ends the task.':
@@ -1569,14 +1557,14 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 return
             continue # Continue to next generation
 
-    total_time = time.time() - start_time
-    print(f"\nTotal generation time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+    total_time_worker = time.time() - start_time # Use overall worker start time for total duration
+    print(f"\nTotal worker time: {total_time_worker:.2f} seconds ({total_time_worker/60:.2f} minutes)")
 
     if hasattr(transformer, "peft_config") and transformer.peft_config:
         print("Final cleanup of LoRA weights at worker completion")
         safe_unload_lora(transformer, gpu)
 
-    stream.output_queue.push(('final_timing', {'total_time': total_time, 'generation_times': generation_times}))
+    stream.output_queue.push(('final_timing', {'total_time': total_time_worker, 'generation_times': generation_times}))
     stream.output_queue.push(('final_seed', last_used_seed))
     stream.output_queue.push(('end', None))
     return
@@ -2047,9 +2035,9 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
 
                                 # Save metadata for the original MP4
                                 if save_metadata:
-                                    gen_time = time.time() - gen_start_time_batch
-                                    generation_time_seconds = int(gen_time)
-                                    generation_time_formatted = format_time_human_readable(gen_time)
+                                    gen_time_batch_current = time.time() - gen_start_time_batch # Use batch start time for this image/prompt combo
+                                    generation_time_seconds = int(gen_time_batch_current)
+                                    generation_time_formatted = format_time_human_readable(gen_time_batch_current)
 
                                     metadata = {
                                         "Prompt": current_prompt_segment, # Save the specific prompt/text used
@@ -2219,11 +2207,47 @@ quick_prompts = [
 ]
 quick_prompts = [[x] for x in quick_prompts]
 
+# --- Function to auto-set Latent Window Size ---
+def auto_set_window_size(fps_val: int, current_lws: int):
+    """Calculates Latent Window Size for ~1 second sections."""
+    if not isinstance(fps_val, int) or fps_val <= 0:
+        print("Invalid FPS for auto window size calculation.")
+        return gr.update() # No change if FPS is invalid
+
+    try:
+        # Target LWS ≈ fps / 4
+        target_lws = round(fps_val / 4)
+
+        # Get min/max from the actual slider component (safer)
+        # Note: Accessing component properties directly might be fragile.
+        # It's better if min/max are hardcoded or passed if needed.
+        # Let's assume min=1, max=33 based on the slider definition.
+        min_lws = 1
+        max_lws = 33 # Hardcoded based on slider definition
+
+        # Clamp the value within the slider's range
+        calculated_lws = max(min_lws, min(target_lws, max_lws))
+
+        print(f"Auto-setting Latent Window Size for {fps_val} FPS. Target: {target_lws}, Clamped: {calculated_lws}")
+
+        # Only update if the value is different
+        if calculated_lws != current_lws:
+            return gr.update(value=calculated_lws)
+        else:
+            # If the value is already correct, don't trigger an unnecessary update loop
+            print(f"Latent Window Size is already optimal ({current_lws}) for ~1s sections.")
+            return gr.update() # No change needed
+
+    except Exception as e:
+        print(f"Error calculating auto window size: {e}")
+        return gr.update() # No change on error
+# --- End Auto-set Function ---
+
 
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V33 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V34 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2235,8 +2259,10 @@ with block:
                         with gr.Column():
                             end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional)", height=320) # Added end_image
 
-                    # --- ADDED Iteration Info Display ---
-                    iteration_info_display = gr.Markdown("Calculating generation info...", elem_id="iteration-info-display")
+                    # --- ADDED Iteration Info Display + Button ---
+                    with gr.Row():
+                        iteration_info_display = gr.Markdown("Calculating generation info...", elem_id="iteration-info-display") # Give more space
+                        auto_set_lws_button = gr.Button(value="Set Window for ~1s Sections", scale=1) # Add button
                     # --- END ADDED ---
 
                     prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on") # Changed lines to 4
@@ -2347,7 +2373,7 @@ with block:
             Note on Sampling: Due to inverted sampling, the end part of the video is generated first, and the start part last.
             - **Start Frame Only:** If the start action isn't in the video initially, wait for the full generation.
             - **Start and End Frames:** The model attempts a smooth transition. The end frame's influence appears early in the generation process.
-            - **Timestamp Prompts (Multi-line OFF):** Prompts like `[2] wave hello` trigger *after* 2 seconds have passed in the *final* video (meaning they are generated earlier in the process). Use the **Generation Info** above for timing estimates.
+            - **Timestamp Prompts (Multi-line OFF):** Prompts like `[2] wave hello` trigger *after* 2 seconds have passed in the *final* video (meaning they are generated earlier in the process). Use the **Generation Info** (duration per section) above for timing estimates.
             ''') # Added pointer to Generation Info
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
@@ -2587,7 +2613,16 @@ with block:
     )
     # --- Preset Event Wiring END ---
 
-    # --- ADDED Change Listeners for Iteration Info ---
+    # --- Auto Set Latent Window Size Button Wiring ---
+    auto_set_lws_button.click(
+        fn=auto_set_window_size,
+        inputs=[fps, latent_window_size], # Pass current FPS and LWS
+        outputs=[latent_window_size]      # Update the LWS slider
+    )
+    # --- End Auto Set Wiring ---
+
+    # --- Change Listeners for Iteration Info ---
+    # (fps and latent_window_size changes trigger this)
     iteration_info_inputs = [total_second_length, fps, latent_window_size]
     for comp in iteration_info_inputs:
         comp.change(
@@ -2596,7 +2631,7 @@ with block:
             outputs=iteration_info_display,
             queue=False # No need to queue this simple update
         )
-    # --- END ADDED ---
+    # --- END Iteration Info Listeners ---
 
     # --- Gradio Event Wiring END ---
 
@@ -2771,4 +2806,3 @@ block.launch(
     allowed_paths=get_available_drives()
 )
 
-# --- END OF FILE app.py ---
