@@ -671,31 +671,34 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
 # --- Updated Function ---
 def update_iteration_info(vid_len_s, fps_val, win_size):
     """Calculates and formats information about generation sections."""
+    # (Keep the initial validation and calculation parts the same)
     if not all([isinstance(vid_len_s, (int, float)), isinstance(fps_val, int), isinstance(win_size, int)]):
-        return "Calculating..."
-
+         return "Calculating..."
     if fps_val <= 0 or win_size <= 0:
-        return "Invalid FPS or Latent Window Size."
+         return "Invalid FPS or Latent Window Size."
 
     try:
         # Calculate total sections using the same logic as the worker
         total_frames_needed = vid_len_s * fps_val
-        frames_per_section = win_size * 4  # This is the key relationship
-        
-        # Calculate total sections needed
-        total_latent_sections = int(max(round(total_frames_needed / frames_per_section), 1))
-        
-        # Calculate the exact duration generated per section
-        # Each section covers exactly (win_size * 4) / fps seconds of video
-        # For example, with win_size=7.5 and fps=30, each section is exactly 1 second
-        section_duration_seconds = frames_per_section / fps_val
-        
-        # Calculate total frames generated in one section (including overlaps)
+        frames_per_section_calc = win_size * 4 # Used for section count and duration timing
+
+        # Calculate total sections needed (ensure division by zero doesn't happen)
+        total_latent_sections = 0
+        if frames_per_section_calc > 0:
+            total_latent_sections = int(max(round(total_frames_needed / frames_per_section_calc), 1))
+        else:
+             return "Invalid parameters leading to zero frames per section." # Handle division by zero case
+
+
+        # Calculate the exact duration represented per section for timing
+        section_duration_seconds = frames_per_section_calc / fps_val
+
+        # Calculate total frames generated in one section (including overlaps) for info
         frames_in_one_section = win_size * 4 - 3
 
         # Create message highlighting exact timing if properly configured
         timing_description = ""
-        if abs(section_duration_seconds - 1.0) < 0.01:  # Within 0.01 of exactly 1 second
+        if abs(section_duration_seconds - 1.0) < 0.01: # Within 0.01 of exactly 1 second
             timing_description = "**precisely 1.0 second**"
         else:
             timing_description = f"~**{section_duration_seconds:.2f} seconds**"
@@ -706,16 +709,26 @@ def update_iteration_info(vid_len_s, fps_val, win_size):
             f"(One section processes {frames_in_one_section} frames internally with overlap at {fps_val} FPS).\n"
             f"*Use the **{section_duration_seconds:.2f}s per section** estimate for '[seconds] prompt' timings.*"
         )
-        
-        # Add a tip for getting exactly 1-second sections
-        if abs(section_duration_seconds - 1.0) > 0.01:
-            ideal_win_size = fps_val / 4
-            if ideal_win_size.is_integer() and 1 <= ideal_win_size <= 33:
-                info_text += f"\n\n*Tip: Set Latent Window Size to **{int(ideal_win_size)}** for exact 1-second sections at {fps_val} FPS.*"
-            
+
+        # --- CORRECTED TIP ---
+        # Calculate the ideal LWS for 1s sections at this FPS
+        ideal_lws_float = fps_val / 4.0
+        ideal_lws_int = round(ideal_lws_float)
+        ideal_lws_clamped = max(1, min(ideal_lws_int, 33)) # Clamp to slider range [1, 33]
+
+        # Check if the *current* setting is NOT already the ideal one for ~1s sections
+        if win_size != ideal_lws_clamped:
+            # Check if the ideal clamped LWS *would* result in near 1s sections
+            ideal_duration = (ideal_lws_clamped * 4) / fps_val
+            if abs(ideal_duration - 1.0) < 0.01:
+                 info_text += f"\n\n*Tip: Set Latent Window Size to **{ideal_lws_clamped}** for (near) exact 1-second sections at {fps_val} FPS.*"
+            # else: # Optional: Add note if even the ideal int LWS isn't close to 1s
+            #    info_text += f"\n\n*Note: Exact 1-second sections may not be achievable with integer Latent Window Sizes at {fps_val} FPS.*"
+
         return info_text
     except Exception as e:
         print(f"Error calculating iteration info: {e}")
+        traceback.print_exc() # Add traceback
         return "Error calculating info."
 # --- End Updated Function ---
 
@@ -2235,35 +2248,44 @@ def auto_set_window_size(fps_val: int, current_lws: int):
         return gr.update() # No change if FPS is invalid
 
     try:
-        # For 1-second sections, we need:
-        # frames_per_latent_window = LWS * 4 = fps
-        # so LWS = fps / 4
-        # To ensure exact 1-second sections, this should be a clean division
-        target_lws = fps_val // 4 - 1  # Integer division ensures consistent timing
+        # Calculate the ideal float value for LWS to get exactly 1s sections
+        # section_duration = (LWS * 4) / fps = 1.0  => LWS = fps / 4.0
+        ideal_lws_float = fps_val / 4.0
+
+        # Round to the nearest integer, as LWS must be integer
+        target_lws = round(ideal_lws_float)
 
         # Get min/max from the actual slider component (safer)
-        # Note: Accessing component properties directly might be fragile.
-        # It's better if min/max are hardcoded or passed if needed.
-        # Let's assume min=1, max=33 based on the slider definition.
         min_lws = 1
-        max_lws = 33 # Hardcoded based on slider definition
+        max_lws = 33 # Hardcoded based on slider definition in UI
 
         # Clamp the value within the slider's range
         calculated_lws = max(min_lws, min(target_lws, max_lws))
 
-        print(f"Auto-setting Latent Window Size for {fps_val} FPS. Target: {target_lws}, Clamped: {calculated_lws}")
-        print(f"This will generate exactly 1-second sections for timestamped prompts.")
+        # Calculate the actual duration this LWS will give
+        resulting_duration = (calculated_lws * 4) / fps_val
+
+        print(f"Auto-setting LWS: Ideal float LWS for 1s sections={ideal_lws_float:.2f}, Rounded integer LWS={target_lws}, Clamped LWS={calculated_lws}")
+        print(f"--> Resulting section duration with LWS={calculated_lws} at {fps_val} FPS will be: {resulting_duration:.3f} seconds")
+
+        # Provide feedback on exactness
+        if abs(resulting_duration - 1.0) < 0.01: # Allow small tolerance
+            print("This setting provides (near) exact 1-second sections.")
+        else:
+            print(f"Note: This is the closest integer LWS to achieve 1-second sections.")
+
 
         # Only update if the value is different
         if calculated_lws != current_lws:
             return gr.update(value=calculated_lws)
         else:
             # If the value is already correct, don't trigger an unnecessary update loop
-            print(f"Latent Window Size is already optimal ({current_lws}) for 1s sections.")
+            print(f"Latent Window Size is already optimal ({current_lws}) for ~1s sections.")
             return gr.update() # No change needed
 
     except Exception as e:
         print(f"Error calculating auto window size: {e}")
+        traceback.print_exc() # Add traceback
         return gr.update() # No change on error
 # --- End Auto-set Function ---
 
@@ -2271,7 +2293,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V36 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V37 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
