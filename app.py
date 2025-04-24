@@ -2026,7 +2026,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                      break # Exit the 'while True' listening loop
                 # --- End Check ---
 
-                flag, data = stream.output_queue.next(timeout=0.5) # Add timeout to prevent blocking indefinitely if worker hangs
+                flag, data = stream.output_queue.next() # Add timeout to prevent blocking indefinitely if worker hangs
 
                 if flag is None: # Timeout occurred
                     continue
@@ -2294,7 +2294,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V40 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V41 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
