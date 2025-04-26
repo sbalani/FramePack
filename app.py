@@ -1121,6 +1121,15 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                          print(f"Trying to disable adapters (this is not an error if you did not select any LoRA): {e}")
                 # --- End Apply LoRA Scale ---
 
+                # --- Initialize TeaCache based on threshold value ---
+                if teacache_threshold > 0.0:
+                    print(f"TeaCache: Enabled (Threshold: {teacache_threshold})")
+                    transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_threshold)
+                else:
+                    print("TeaCache: Disabled")
+                    transformer.initialize_teacache(enable_teacache=False)
+                # --- End Initialize TeaCache ---
+
                 sampling_start_time = time.time()
 
                 # --- Callback definition (No changes here) ---
@@ -2167,7 +2176,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V43 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V44 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
