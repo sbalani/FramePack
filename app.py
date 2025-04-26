@@ -1107,9 +1107,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                 # --- Apply LoRA Scale (Existing position is fine now) ---
                 if adapter_name_to_use != "None":
-                    try:
-                        print(f"Worker: Applying scale {lora_scale} to adapter '{adapter_name_to_use}'")
+                    try:                        
                         set_adapters(transformer, [adapter_name_to_use], [lora_scale])
+                        print(f"Worker: Applied scale {lora_scale} to adapter '{adapter_name_to_use}'")
                     except Exception as e:
                          print(f"Worker ERROR applying LoRA scale: {e}")
                          traceback.print_exc()
@@ -1118,7 +1118,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                          # print("Worker: Ensuring adapters are disabled (target is None)")
                          transformer.disable_adapters()
                      except Exception as e:
-                         print(f"Worker WARNING: Error trying to disable adapters: {e}")
+                         print(f"Trying to disable adapters (this is not an error if you did not select any LoRA): {e}")
                 # --- End Apply LoRA Scale ---
 
                 sampling_start_time = time.time()
@@ -2167,7 +2167,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V42 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V43 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2263,7 +2263,7 @@ with block:
                         lora_scale = gr.Slider(label="LoRA Scale", minimum=0.0, maximum=9.0, value=1.0, step=0.01, info="Adjust the strength of the LoRA effect (0-2)")
 
                 with gr.Row():
-                    gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=0, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                    gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower on big VRAM but you need to have it large enough to not use shared VRAM (on low VRAM machines) or it will be extremely slower)", minimum=0, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. Do not set this very low that will cause shared VRAM usage")
 
                     def update_memory_for_resolution(res):
                         if res == "1440": return 23
