@@ -36,7 +36,7 @@ from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
-from diffusers_helper.load_lora import load_lora
+from diffusers_helper.load_lora import load_lora, set_adapters # <-- IMPORT set_adapters
 from diffusers_helper.bucket_tools import find_nearest_bucket
 
 
@@ -734,7 +734,8 @@ def update_iteration_info(vid_len_s, fps_val, win_size):
 
 
 @torch.no_grad()
-def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, convert_lora=True, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
+def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30, selected_lora="none", lora_scale=1.0, save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
+    # Removed convert_lora from signature
     # Declare global variables at the beginning of the function
     global transformer, text_encoder, text_encoder_2, image_encoder, vae
     global individual_frames_folder, intermediate_individual_frames_folder, last_frames_folder, intermediate_last_frames_folder # Ensure these are accessible if modified
@@ -958,18 +959,15 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                                     from diffusers_helper.memory import DynamicSwapInstaller
                                     DynamicSwapInstaller.install_model(transformer, device=gpu)
                                 else:
-                                    transformer.to(gpu)
+                                     transformer.to(gpu)
                                 print("Successfully reloaded transformer model")
 
-                    from diffusers_helper.load_lora import load_lora
                     transformer.to(gpu)
 
-                    # Show conversion status in progress bar
-                    if convert_lora:
-                        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Converting LoRA {os.path.basename(selected_lora)} to Diffusers format...'))))
-
-                    # Use convert_lora parameter from UI
-                    current_transformer = load_lora(transformer, lora_path, lora_name, convert_to_diffusers=convert_lora)
+                    # Load LoRA - conversion is handled internally by load_lora -> _convert_hunyuan_video_lora_to_diffusers
+                    current_transformer = load_lora(transformer, lora_path, lora_name)
+                    adapter_name = os.path.splitext(lora_name)[0] # Get adapter name from filename
+                    print(f"LoRA '{adapter_name}' loaded. Applying scale: {lora_scale}")
 
                     print("Verifying all LoRA components are on GPU...")
                     for name, module in transformer.named_modules():
@@ -982,14 +980,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                                 print(f"Force moving LoRA parameter {name} from {param.device} to {gpu}")
                                 param.data = param.data.to(gpu)
 
-                    if lora_scale != 1.0:
-                        print("LoRA scale not working at the moment")
-                        # if hasattr(current_transformer, 'active_adapters') and current_transformer.active_adapters:
-                            # for adapter_name in current_transformer.active_adapters:
-                                # current_transformer.set_adapter_scale(adapter_name, lora_scale)
+                    # Apply the scale using set_adapters
+                    # Pass adapter_name and lora_scale within lists as expected by set_adapters
+                    set_adapters(transformer, [adapter_name], [lora_scale])
+                    print(f"Scale {lora_scale} applied to LoRA adapter '{adapter_name}'.")
 
                     using_lora = True
-                    print(f"Successfully loaded LoRA: {lora_name} with scale: {lora_scale}")
+                    print(f"Successfully loaded and configured LoRA: {lora_name} with scale: {lora_scale}")
                 except Exception as e:
                     print(f"Error loading LoRA {selected_lora}: {str(e)}")
                     traceback.print_exc()
@@ -1054,11 +1051,11 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         # Calculate exact seconds per section based on frame relationship
                         # Each section corresponds to (latent_window_size * 4) / fps seconds of video time
                         section_duration_seconds = (latent_window_size * 4) / fps
-                        
+
                         # Map loop iteration index 'i' (0 to N-1) to time (total_length -> 0)
                         # With proper settings (LWS = fps/4), each section represents exactly 1 second
                         current_video_time = total_second_length - (i * section_duration_seconds)
-                        
+
                         # Ensure we don't go below 0
                         if current_video_time < 0:
                             current_video_time = 0.0
@@ -1467,7 +1464,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         lora_name = os.path.basename(selected_lora)
                         metadata["LoRA"] = lora_name
                         metadata["LoRA Scale"] = lora_scale
-                        metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
+                        # metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled" # Removed
 
                     # Only save metadata for the original MP4 file
                     if output_filename: save_processing_metadata(output_filename, metadata)
@@ -1605,7 +1602,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
 
 # Modified process function signature
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, convert_lora=True, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, selected_lora="None", lora_scale=1.0, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False, rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
+    # Removed convert_lora from signature
     global stream
     assert input_image is not None, 'No start input image!' # Changed assertion message
 
@@ -1652,7 +1650,7 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
         # Pass the use_multiline_prompts flag correctly to the worker
         # Also pass the other boolean flags correctly
         # Pass RIFE params
-        async_run(worker, input_image, end_image, prompt_to_worker, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, convert_lora,
+        async_run(worker, input_image, end_image, prompt_to_worker, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps, lora_path, lora_scale, # Removed convert_lora
                   save_individual_frames_flag=save_individual_frames, # Pass flags with correct names
                   save_intermediate_frames_flag=save_intermediate_frames,
                   save_last_frame_flag=save_last_frame,
@@ -1791,7 +1789,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold,
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
-                  selected_lora="None", lora_scale=1.0, convert_lora=True, batch_use_multiline_prompts=False,
+                  selected_lora="None", lora_scale=1.0, batch_use_multiline_prompts=False, # Removed convert_lora
                   batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False,
                   rife_enabled=False, rife_multiplier="2x FPS"): # Added RIFE params
     global stream
@@ -2001,9 +1999,9 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             async_run(batch_worker_override if override_needed else worker,
                     input_image, current_end_image, current_prompt_segment, n_prompt, current_seed, use_random_seed,
                     total_second_length, latent_window_size, steps, cfg, gs, rs,
-                    gpu_memory_preservation, teacache_threshold, video_quality, export_gif,
+                    gpu_memory_preservation, teacache_threshold, video_quality, export_gif, # Removed convert_lora
                     export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
-                    selected_lora=lora_path, lora_scale=lora_scale, convert_lora=convert_lora,
+                    selected_lora=lora_path, lora_scale=lora_scale,
                     save_individual_frames_flag=batch_save_individual_frames, # Pass flags
                     save_intermediate_frames_flag=batch_save_intermediate_frames,
                     save_last_frame_flag=batch_save_last_frame,
@@ -2102,7 +2100,6 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         lora_name = os.path.basename(lora_path)
                                         metadata["LoRA"] = lora_name
                                         metadata["LoRA Scale"] = lora_scale
-                                        metadata["LoRA Conversion"] = "Enabled" if convert_lora else "Disabled"
                                     save_processing_metadata(moved_file, metadata)
 
                                 # Handle other formats (no change for RIFE here)
@@ -2294,7 +2291,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V41 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V42 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
@@ -2395,23 +2392,21 @@ with block:
                         lora_scale = gr.Slider(label="LoRA Scale", minimum=0.0, maximum=2.0, value=1.0, step=0.01, info="Adjust the strength of the LoRA effect (0-2)")
 
                 with gr.Row():
-                    convert_lora = gr.Checkbox(label="Convert LoRA to Diffusers Format - Add extra 20 GB GPU Inference Preserved Memory - I am still searching better solution", value=False, info="Enable to convert LoRA weights to the Diffusers format (recommended)")
+                    gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=0, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=0, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
-
-                # --- Start of Resolution -> Memory Update ---
-                def update_memory_for_resolution(res):
-                    if res == "1440": return 23
-                    if res == "1320": return 21
-                    if res == "1200": return 19
-                    if res == "1080": return 16
-                    elif res == "960": return 14
-                    elif res == "840": return 12
-                    elif res == "720": return 10
-                    elif res == "640": return 8
-                    else: return 6
-                resolution.change(fn=update_memory_for_resolution, inputs=resolution, outputs=gpu_memory_preservation)
-                # --- End of Resolution -> Memory Update ---
+                    # --- Start of Resolution -> Memory Update ---
+                    def update_memory_for_resolution(res):
+                        if res == "1440": return 23
+                        if res == "1320": return 21
+                        if res == "1200": return 19
+                        if res == "1080": return 16
+                        elif res == "960": return 14
+                        elif res == "840": return 12
+                        elif res == "720": return 10
+                        elif res == "640": return 8
+                        else: return 6
+                    resolution.change(fn=update_memory_for_resolution, inputs=resolution, outputs=gpu_memory_preservation)
+                    # --- End of Resolution -> Memory Update ---
 
         with gr.Column(): # Right column for preview/results
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -2498,7 +2493,7 @@ with block:
         rs,                             # Slider (float)
         selected_lora,                  # Dropdown (str - name)
         lora_scale,                     # Slider (float)
-        convert_lora,                   # Checkbox
+        # convert_lora removed
         gpu_memory_preservation,        # Slider (float)
         video_quality,                  # Radio (str)
         rife_enabled,                   # Checkbox
@@ -2512,8 +2507,9 @@ with block:
         "use_multiline_prompts", "save_metadata", "save_individual_frames", "save_intermediate_frames", "save_last_frame",
         "batch_skip_existing", "batch_save_metadata", "batch_use_multiline_prompts", "batch_save_individual_frames", "batch_save_intermediate_frames", "batch_save_last_frame",
         "num_generations", "resolution", "teacache_threshold", "seed", "use_random_seed", "n_prompt", "fps", "total_second_length",
-        "latent_window_size", "steps", "gs", "cfg", "rs", "selected_lora", "lora_scale", "convert_lora", "gpu_memory_preservation",
-        "video_quality", "rife_enabled", "rife_multiplier", "export_gif", "export_apng", "export_webp"
+        "latent_window_size", "steps", "gs", "cfg", "rs", "selected_lora", "lora_scale",
+        # convert_lora removed
+        "gpu_memory_preservation", "video_quality", "rife_enabled", "rife_multiplier", "export_gif", "export_apng", "export_webp"
     ]
     # --------------------------------------
 
@@ -2579,14 +2575,19 @@ with block:
                     updates.append(gr.update(value=value))
                 loaded_values[comp_name] = value # Store the value that will be used
             else:
-                print(f"Warning: Key '{comp_name}' not found in preset '{name}'. Skipping update for this component.")
-                updates.append(gr.update(value=comp_initial_value)) # No change for missing keys, use default
-                loaded_values[comp_name] = comp_initial_value # Store default value
+                # If key exists in older preset but not current list (like convert_lora), it's ignored here
+                # If key is missing from preset file but exists in current list, use default
+                if comp_name not in preset_data:
+                     print(f"Warning: Key '{comp_name}' not found in preset '{name}'. Using component's current/default value.")
+                     updates.append(gr.update()) # No change for missing keys
+                     loaded_values[comp_name] = getattr(preset_components_list[i], 'value', None) # Store current/default value
 
+        # Check if the number of updates matches the component list (should always match now)
         if len(updates) != len(preset_components_list):
              print(f"Error: Number of updates ({len(updates)}) does not match number of components ({len(preset_components_list)}).")
              # Return no updates on critical error
              return [gr.update() for _ in preset_components_list] + [gr.update(value=f"Error applying preset '{name}'. Mismatch in component count.")] + [gr.update()] # Add update for info display
+
 
         save_last_used_preset_name(name) # Remember this as last used
         status_msg = f"Preset '{name}' loaded."
@@ -2617,7 +2618,7 @@ with block:
     lora_folder_btn.click(fn=lambda: open_folder(loras_folder), outputs=[gr.Text(visible=False)])
 
     # Update inputs list for single image processing - match names with process function
-    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, convert_lora, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_last_frame, rife_enabled, rife_multiplier] # Added RIFE UI components
+    ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps, selected_lora, lora_scale, use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_last_frame, rife_enabled, rife_multiplier] # Removed convert_lora
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
     # End button needs to update both sets of start/end buttons
     end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
@@ -2634,8 +2635,8 @@ with block:
     # Update inputs list for batch processing - match names with batch_process function
     batch_ips = [batch_input_folder, batch_output_folder, batch_end_frame_folder, batch_prompt, n_prompt, seed, use_random_seed,
                 total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
-                teacache_threshold, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
-                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, convert_lora, batch_use_multiline_prompts,
+                teacache_threshold, video_quality, export_gif, export_apng, export_webp, batch_skip_existing, # Removed convert_lora
+                batch_save_metadata, num_generations, resolution, fps, selected_lora, lora_scale, batch_use_multiline_prompts,
                 batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame,
                 rife_enabled, rife_multiplier] # Added RIFE UI components
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
@@ -2854,4 +2855,3 @@ block.launch(
     inbrowser=True,
     allowed_paths=get_available_drives()
 )
-
