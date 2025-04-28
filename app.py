@@ -1369,6 +1369,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                     metadata = {
                         "Prompt": metadata_prompt,
+                        "Negative Prompt": n_prompt,
                         "Seed": current_seed,
                         "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                         "Video Length (seconds)": total_second_length,
@@ -1999,6 +2000,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     generation_time_formatted = format_time_human_readable(gen_time_batch_current)
                                     metadata = {
                                         "Prompt": current_prompt_segment,
+                                        "Negative Prompt": n_prompt,
                                         "Seed": current_seed,
                                         "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
                                         "Video Length (seconds)": total_second_length,
@@ -2176,7 +2178,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V44 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V45 - https://www.patreon.com/posts/126855226')
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
