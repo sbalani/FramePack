@@ -9,10 +9,11 @@ import shutil
 import glob
 import re # Added for timestamp parsing
 import math
-from typing import Optional # Added for type hinting
+from typing import Optional, Dict, Any # Added for type hinting
 import sys # Added for RIFE
 import cv2 # Added for RIFE
 import json # <-- ADDED FOR PRESETS
+from natsort import natsorted # <-- ADDED FOR BATCH SORTING
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -46,12 +47,20 @@ args = parser.parse_args()
 
 print(args)
 
+# --- Model Names ---
+MODEL_NAME_ORIGINAL = 'lllyasviel/FramePackI2V_HY'
+MODEL_NAME_F1 = 'lllyasviel/FramePack_F1_I2V_HY_20250503'
+MODEL_DISPLAY_NAME_ORIGINAL = "Original FramePack"
+MODEL_DISPLAY_NAME_F1 = "FramePack F1"
+DEFAULT_MODEL_NAME = MODEL_DISPLAY_NAME_ORIGINAL
+
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = False # Set high_vram based on actual memory if needed free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
+# --- Load common components ---
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
@@ -61,8 +70,21 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+# --- Load initial transformer (default) ---
+print(f"Loading initial transformer model: {DEFAULT_MODEL_NAME}")
+transformer: HunyuanVideoTransformer3DModelPacked # Type hint
+if DEFAULT_MODEL_NAME == MODEL_DISPLAY_NAME_ORIGINAL:
+    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(MODEL_NAME_ORIGINAL, torch_dtype=torch.bfloat16).cpu()
+    active_model_name = MODEL_DISPLAY_NAME_ORIGINAL
+elif DEFAULT_MODEL_NAME == MODEL_DISPLAY_NAME_F1:
+    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(MODEL_NAME_F1, torch_dtype=torch.bfloat16).cpu()
+    active_model_name = MODEL_DISPLAY_NAME_F1
+else:
+    raise ValueError(f"Unknown default model name: {DEFAULT_MODEL_NAME}")
 
+print(f"Initial model '{active_model_name}' loaded to CPU.")
+
+# --- Configure models ---
 vae.eval()
 text_encoder.eval()
 text_encoder_2.eval()
@@ -76,28 +98,33 @@ if not high_vram:
 transformer.high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
 
+# Set dtypes
 transformer.to(dtype=torch.bfloat16)
 vae.to(dtype=torch.float16)
 image_encoder.to(dtype=torch.float16)
 text_encoder.to(dtype=torch.float16)
 text_encoder_2.to(dtype=torch.float16)
 
+# Set requires_grad
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
 text_encoder_2.requires_grad_(False)
 image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
 
+# --- Apply memory management ---
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
     DynamicSwapInstaller.install_model(transformer, device=gpu)
-    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+    DynamicSwapInstaller.install_model(text_encoder, device=gpu) # Keep text encoder swappable
+    # VAE and Image Encoder will be loaded/unloaded manually as needed
 else:
-    text_encoder.to(gpu)
-    text_encoder_2.to(gpu)
-    image_encoder.to(gpu)
-    vae.to(gpu)
-    transformer.to(gpu)
+    # Keep non-transformer models on CPU initially in high VRAM mode too,
+    # load them to GPU only when needed or keep them there if switching cost is low.
+    # For simplicity matching low VRAM, we'll load them on demand.
+    # If performance dictates, they can be moved permanently to GPU here.
+    # transformer.to(gpu) # Transformer goes to GPU only when generating
+    pass # Other models stay on CPU until needed
 
 stream = AsyncStream()
 
@@ -126,7 +153,7 @@ last_used_preset_file = os.path.join(presets_folder, '_lastused.txt') # <-- ADDE
 batch_stop_requested = False
 # --- End Add Global Stop Flag ---
 
-# --- Global LoRA State --- (MODIFICATION 1)
+# --- Global LoRA State --- (MODIFICATION 1 - Unchanged conceptually)
 currently_loaded_lora_info = {
     "adapter_name": None,
     "lora_path": None # Store path for potential re-verification if needed
@@ -220,7 +247,7 @@ def print_supported_image_formats():
     return supported_formats
 
 def get_images_from_folder(folder_path):
-    """Get all image files from a folder."""
+    """Get all image files from a folder, sorted naturally."""
     if not folder_path or not os.path.exists(folder_path):
         return []
 
@@ -233,7 +260,12 @@ def get_images_from_folder(folder_path):
         if os.path.isfile(file_path) and os.path.splitext(file)[1].lower() in image_extensions:
             images.append(file_path)
 
-    return sorted(images)
+    # --- Use natsorted for natural sorting ---
+    print(f"Found {len(images)} images. Sorting naturally...")
+    sorted_images = natsorted(images)
+    # print("Sorted file list:", sorted_images) # Optional: for debugging sort order
+    return sorted_images
+    # --- End natural sorting ---
 
 def get_prompt_from_txt_file(image_path):
     """Check for a matching txt file with the same name as the image and return its content as prompt."""
@@ -267,6 +299,9 @@ def save_processing_metadata(output_path, metadata):
         # Ensure directory exists before saving
         os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
         with open(metadata_path, 'w', encoding='utf-8') as f:
+            # --- Add Model Name to Metadata ---
+            f.write(f"Model: {metadata.pop('Model', 'Unknown')}\n") # Extract and write first
+            # --- End Add Model Name ---
             for key, value in metadata.items():
                 f.write(f"{key}: {value}\n")
         return True
@@ -337,6 +372,7 @@ def refresh_loras():
     lora_options = scan_lora_files()
     return gr.update(choices=[name for name, _ in lora_options], value="None")
 
+# --- safe_unload_lora and force_remove_lora_modules remain unchanged ---
 def safe_unload_lora(model, device=None):
     """
     Safely unload LoRA weights from the model, handling different model types.
@@ -500,8 +536,7 @@ def force_remove_lora_modules(model):
 
 print_supported_image_formats()
 
-# --- Preset Functions START --- (Added for Presets)
-
+# --- Preset Functions START --- (Unchanged)
 def get_preset_path(name: str) -> str:
     """Constructs the full path for a preset file."""
     # Sanitize name slightly to prevent path traversal issues, though Gradio input might handle some of this.
@@ -576,10 +611,9 @@ def load_preset_data(name: str) -> Optional[dict]:
     else:
         print(f"Preset file not found: {preset_path}")
         return None
-
 # --- Preset Functions END ---
 
-
+# --- save_last_frame_to_file remains unchanged ---
 def save_last_frame_to_file(frames, output_dir, filename_base):
     """Save only the last frame from a video frames tensor (bcthw format).
 
@@ -635,6 +669,7 @@ def save_last_frame_to_file(frames, output_dir, filename_base):
         traceback.print_exc()
         return None
 
+# --- parse_simple_timestamped_prompt remains unchanged ---
 def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, latent_window_size: int, fps: int) -> Optional[list[tuple[float, str]]]:
     """
     Parses prompts in the format '[seconds] prompt_text' per line.
@@ -718,7 +753,7 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
     print(f"Parsed timestamped prompts (in original order): {final_sections}")
     return final_sections
 
-# --- Updated Function ---
+# --- update_iteration_info remains unchanged ---
 def update_iteration_info(vid_len_s, fps_val, win_size):
     """Calculates and formats information about generation sections."""
     # (Keep the initial validation and calculation parts the same)
@@ -735,7 +770,22 @@ def update_iteration_info(vid_len_s, fps_val, win_size):
         # Calculate total sections needed (ensure division by zero doesn't happen)
         total_latent_sections = 0
         if frames_per_section_calc > 0:
-            total_latent_sections = int(max(round(total_frames_needed / frames_per_section_calc), 1))
+            # --- ADJUSTMENT FOR F1 MODEL ---
+            # F1 model generates sections differently (extends from start frame).
+            # The concept of 'total sections' is less direct than the original overlapping window approach.
+            # However, for user feedback and prompt timing, we can estimate based on the original logic.
+            # The number of loops in the F1 worker determines generation length.
+            # Let's keep the original calculation for the info display, but add a note if F1 is active.
+            # The actual loop count in worker for F1 depends on total_second_length, fps, and latent_window_size.
+            # F1 adds 'latent_window_size * 4 - 3' frames per loop after the first frame.
+            frames_to_generate = total_frames_needed - 1 # Minus the start frame
+            frames_per_f1_loop = (latent_window_size * 4 - 3)
+            if frames_per_f1_loop > 0:
+                total_f1_loops = math.ceil(frames_to_generate / frames_per_f1_loop) if frames_to_generate > 0 else 0
+                total_latent_sections = max(total_f1_loops, 1) # Ensure at least 1 if duration > 0
+            else:
+                return "Invalid parameters leading to zero frames per section."
+            # --- END F1 ADJUSTMENT ---
         else:
              return "Invalid parameters leading to zero frames per section." # Handle division by zero case
 
@@ -753,27 +803,33 @@ def update_iteration_info(vid_len_s, fps_val, win_size):
         else:
             timing_description = f"~**{section_duration_seconds:.2f} seconds**"
 
-        info_text = (
-            f"**Generation Info:** Approx. **{total_latent_sections}** section(s) will be generated.\n"
-            f"Each section represents {timing_description} of the final video time.\n"
-            f"(One section processes {frames_in_one_section} frames internally with overlap at {fps_val} FPS).\n"
-            f"*Use the **{section_duration_seconds:.2f}s per section** estimate for '[seconds] prompt' timings.*"
-        )
+        # --- Update info text based on model ---
+        global active_model_name # Need to know which model is active
+        if active_model_name == MODEL_DISPLAY_NAME_F1:
+             info_text = (
+                 f"**Generation Info (FramePack F1):** Approx. **{total_latent_sections}** loop(s) will run.\n"
+                 f"Each loop adds ~**{(frames_in_one_section / fps_val):.2f} seconds** of video time.\n"
+                 f"(One loop processes {frames_in_one_section} frames internally at {fps_val} FPS).\n"
+                 f"*Timestamp prompts are based on the *final* video duration.*"
+             )
+        else: # Original FramePack
+             info_text = (
+                 f"**Generation Info (Original):** Approx. **{total_latent_sections}** section(s) will be generated.\n"
+                 f"Each section represents {timing_description} of the final video time.\n"
+                 f"(One section processes {frames_in_one_section} frames internally with overlap at {fps_val} FPS).\n"
+                 f"*Use the **{section_duration_seconds:.2f}s per section** estimate for '[seconds] prompt' timings.*"
+             )
 
-        # --- CORRECTED TIP ---
-        # Calculate the ideal LWS for 1s sections at this FPS
-        ideal_lws_float = fps_val / 4.0
-        ideal_lws_int = round(ideal_lws_float)
-        ideal_lws_clamped = max(1, min(ideal_lws_int, 33)) # Clamp to slider range [1, 33]
+        # --- CORRECTED TIP (Applies mainly to Original model's timing) ---
+        if active_model_name == MODEL_DISPLAY_NAME_ORIGINAL:
+            ideal_lws_float = fps_val / 4.0
+            ideal_lws_int = round(ideal_lws_float)
+            ideal_lws_clamped = max(1, min(ideal_lws_int, 33)) # Clamp to slider range [1, 33]
 
-        # Check if the *current* setting is NOT already the ideal one for ~1s sections
-        if win_size != ideal_lws_clamped:
-            # Check if the ideal clamped LWS *would* result in near 1s sections
-            ideal_duration = (ideal_lws_clamped * 4) / fps_val
-            if abs(ideal_duration - 1.0) < 0.01:
-                 info_text += f"\n\n*Tip: Set Latent Window Size to **{ideal_lws_clamped}** for (near) exact 1-second sections at {fps_val} FPS.*"
-            # else: # Optional: Add note if even the ideal int LWS isn't close to 1s
-            #    info_text += f"\n\n*Note: Exact 1-second sections may not be achievable with integer Latent Window Sizes at {fps_val} FPS.*"
+            if win_size != ideal_lws_clamped:
+                ideal_duration = (ideal_lws_clamped * 4) / fps_val
+                if abs(ideal_duration - 1.0) < 0.01:
+                     info_text += f"\n\n*Tip: Set Latent Window Size to **{ideal_lws_clamped}** for (near) exact 1-second sections at {fps_val} FPS.*"
 
         return info_text
     except Exception as e:
@@ -783,26 +839,43 @@ def update_iteration_info(vid_len_s, fps_val, win_size):
 # --- End Updated Function ---
 
 
-# --- MODIFICATION 3a: Modify worker signature ---
+# --- MODIFICATION 3a: Modify worker signature ADD active_model ---
 @torch.no_grad()
 def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, num_generations=1, resolution="640", fps=30,
          # --- LoRA Args Changed ---
          adapter_name_to_use: str = "None", # Receive adapter name
          lora_scale: float = 1.0,           # Keep scale
          # --- End LoRA Args Changed ---
-         save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS"):
-    # --- MODIFICATION 3b: Remove LoRA loading/cleanup block ---
-    # Removed the block that started with:
-    # global transformer, text_encoder, ...
-    # Clean up any previously loaded LoRA... safe_unload_lora(...)
-    # if selected_lora != "none": ... try ... load_lora ... set_adapters ...
+         save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS",
+         # --- ADDED ---
+         active_model: str = MODEL_DISPLAY_NAME_ORIGINAL # Default to original if not passed
+         ):
+    # --- MODIFICATION 3b: Remove LoRA loading/cleanup block --- (Already Done)
 
     # Declare globals needed elsewhere in the function
     global transformer, text_encoder, text_encoder_2, image_encoder, vae
     global individual_frames_folder, intermediate_individual_frames_folder, last_frames_folder, intermediate_last_frames_folder # Ensure these are accessible if modified
 
-    total_latent_sections = (total_second_length * fps) / (latent_window_size * 4)
-    total_latent_sections = int(max(round(total_latent_sections), 1))
+    # --- Calculate total sections based on active model ---
+    total_latent_sections = 0
+    frames_per_section_calc = latent_window_size * 4
+    if frames_per_section_calc <= 0:
+        raise ValueError("Invalid Latent Window Size or FPS leading to zero frames per section")
+
+    total_frames_needed = total_second_length * fps
+
+    if active_model == MODEL_DISPLAY_NAME_F1:
+        # F1 calculation: loops needed to generate enough frames after the start frame
+        frames_to_generate = total_frames_needed - 1
+        frames_per_f1_loop = latent_window_size * 4 - 3
+        if frames_per_f1_loop <= 0: raise ValueError("Invalid LWS for F1 model")
+        total_latent_sections = math.ceil(frames_to_generate / frames_per_f1_loop) if frames_to_generate > 0 else 0
+        total_latent_sections = max(total_latent_sections, 1) # Ensure at least 1 loop if duration > 0
+        print(f"F1 Model: Calculated {total_latent_sections} generation loops needed.")
+    else: # Original Model calculation
+        total_latent_sections = int(max(round(total_frames_needed / frames_per_section_calc), 1))
+        print(f"Original Model: Calculated {total_latent_sections} sections needed.")
+    # --- End section calculation ---
 
     # --- Check for timestamped prompts (No changes here) ---
     parsed_prompts = None
@@ -856,20 +929,21 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
         # Use the new naming scheme for job_id
         job_id = generate_new_timestamp()
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Starting generation {gen_idx+1}/{num_generations} with seed {current_seed}...'))))
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Starting generation {gen_idx+1}/{num_generations} with seed {current_seed} using {active_model}...'))))
 
         try:
             # Clean GPU
             if not high_vram:
                 unload_complete_models(
-                    text_encoder, text_encoder_2, image_encoder, vae, transformer
+                    text_encoder, text_encoder_2, image_encoder, vae, transformer # Unload all potentially loaded models
                 )
 
             # Text encoding
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
             if not high_vram:
-                fake_diffusers_current_device(text_encoder, gpu)
+                # Load text encoders to GPU only when needed
+                fake_diffusers_current_device(text_encoder, gpu) # Use fake device for faster potential swap
                 load_model_as_complete(text_encoder_2, target_device=gpu)
 
             # --- Pre-encode prompts (No changes needed here) ---
@@ -884,32 +958,51 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 print(f"Pre-encoded {len(encoded_prompts)} unique prompts.")
                 if not parsed_prompts:
                     raise ValueError("Timestamped prompts were detected but parsing resulted in an empty list.")
-                llama_vec, llama_attention_mask, clip_l_pooler = encoded_prompts[parsed_prompts[0][1]]
+                # Use the prompt for time 0.0 as the initial prompt
+                initial_prompt_text = "default prompt"
+                for t, p_txt in parsed_prompts:
+                     if t == 0.0:
+                         initial_prompt_text = p_txt
+                         break
+                     # If no 0.0 found explicitly, the first one (sorted by time) will be used implicitly later.
+                     elif not initial_prompt_text or t < parsed_prompts[0][0]: # Find the earliest one if 0.0 isn't there
+                         initial_prompt_text = p_txt
+
+                if initial_prompt_text not in encoded_prompts:
+                     # This case shouldn't happen if parsing worked, but as a fallback:
+                     print(f"Warning: Initial prompt text '{initial_prompt_text}' not found in encoded prompts. Using first available.")
+                     initial_prompt_text = list(encoded_prompts.keys())[0]
+
+                llama_vec, llama_attention_mask, clip_l_pooler = encoded_prompts[initial_prompt_text]
+
             else:
                 stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Encoding single prompt...'))))
                 llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
                 llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
                 encoded_prompts[prompt] = (llama_vec, llama_attention_mask, clip_l_pooler)
 
-            if cfg == 1.0:
+            # Handle negative prompt encoding
+            if cfg > 1.0: # Only encode negative if CFG needs it
+                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+                llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+            else:
+                # Create zero tensors if CFG is 1.0 (or less, though UI minimum is 1.0)
                 first_prompt_key = list(encoded_prompts.keys())[0]
                 ref_llama_vec = encoded_prompts[first_prompt_key][0]
                 ref_clip_l = encoded_prompts[first_prompt_key][2]
                 llama_vec_n, clip_l_pooler_n = torch.zeros_like(ref_llama_vec), torch.zeros_like(ref_clip_l)
                 ref_llama_mask = encoded_prompts[first_prompt_key][1]
                 llama_attention_mask_n = torch.zeros_like(ref_llama_mask)
-            else:
-                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-                llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
+            # Move encoded prompts to correct dtype (do this once)
+            target_dtype = transformer.dtype # Use transformer's dtype (bfloat16)
             for p_text in encoded_prompts:
                  l_vec, l_mask, c_pool = encoded_prompts[p_text]
-                 encoded_prompts[p_text] = (l_vec.to(transformer.dtype), l_mask, c_pool.to(transformer.dtype))
+                 encoded_prompts[p_text] = (l_vec.to(target_dtype), l_mask, c_pool.to(target_dtype))
 
-            llama_vec_n = llama_vec_n.to(transformer.dtype)
-            clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
+            llama_vec_n = llama_vec_n.to(target_dtype)
+            clip_l_pooler_n = clip_l_pooler_n.to(target_dtype)
             # --- End prompt encoding ---
-
 
             # Determine bucket size based on start image
             H, W, C = input_image.shape
@@ -926,9 +1019,10 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
             except Exception as e:
                 print(f"Error saving start image: {str(e)}")
             input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
-            input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+            input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None] # B C T H W (T=1)
 
-            # Processing end image (if provided)
+            # Processing end image (if provided) - Only relevant for Original model?
+            # F1 demo doesn't show end image use. Assume it should work but might be less effective.
             has_end_image = end_image is not None
             end_image_np = None
             end_image_pt = None
@@ -943,171 +1037,285 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 except Exception as e:
                     print(f"Error saving end image: {str(e)}")
                 end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
-                end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
+                end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None] # B C T H W (T=1)
 
             # VAE encoding
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
             if not high_vram:
-                load_model_as_complete(vae, target_device=gpu)
+                load_model_as_complete(vae, target_device=gpu) # Load VAE to GPU
             start_latent = vae_encode(input_image_pt, vae)
             if has_end_image:
                 end_latent = vae_encode(end_image_pt, vae) # Encode end latent
+            # Offload VAE if not high VRAM
+            if not high_vram:
+                 unload_complete_models(vae) # Unload VAE after use
 
-            # CLIP Vision
+            # CLIP Vision encoding
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
             if not high_vram:
-                load_model_as_complete(image_encoder, target_device=gpu)
+                load_model_as_complete(image_encoder, target_device=gpu) # Load Image Encoder to GPU
 
             image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
             image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
             if has_end_image:
                 end_image_encoder_output = hf_clip_vision_encode(end_image_np, feature_extractor, image_encoder)
                 end_image_encoder_last_hidden_state = end_image_encoder_output.last_hidden_state
+                # Combine embeddings (simple average) - F1 might use this differently or not at all
                 image_encoder_last_hidden_state = (image_encoder_last_hidden_state + end_image_encoder_last_hidden_state) / 2.0
                 print("Combined start and end frame CLIP vision embeddings.")
-            image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+            image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(target_dtype)
 
-            # --- LORA LOADING BLOCK DELETED ---
+            # Offload Image Encoder if not high VRAM
+            if not high_vram:
+                unload_complete_models(image_encoder)
+
+            # --- LORA LOADING BLOCK DELETED (Handled externally before worker) ---
 
             # Sampling
-            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Start sampling generation {gen_idx+1}/{num_generations}...'))))
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, f'Start sampling ({active_model}) generation {gen_idx+1}/{num_generations}...'))))
 
             rnd = torch.Generator("cpu").manual_seed(current_seed)
-            num_frames = latent_window_size * 4 - 3
+            num_frames = latent_window_size * 4 - 3 # Frames generated per section/loop
 
-            history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+            # --- Initialize history based on model ---
+            history_latents = None
             history_pixels = None
-            total_generated_latent_frames = 0
+            total_generated_latent_frames = 0 # Counter for total latent frames including start
 
-            base_latent_paddings = reversed(range(total_latent_sections))
-            if total_latent_sections > 4:
-                latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
-            else:
-                latent_paddings = list(base_latent_paddings)
+            if active_model == MODEL_DISPLAY_NAME_F1:
+                # F1 starts with the encoded start latent and builds from there
+                # F1 history needs space for 1 (start) + 16 (4x) + 2 (2x) + 1 (1x) = 20 reference frames? Check F1 demo.
+                # Demo: history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, height // 8, width // 8), dtype=torch.float32).cpu()
+                # Demo then does: history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2)
+                # Let's simplify: Start with start_latent directly.
+                history_latents = start_latent.clone().cpu() # Start with the first frame latent on CPU
+                total_generated_latent_frames = 1
+                print(f"F1 Initial history latent shape: {history_latents.shape}")
+            else: # Original Model
+                # Original model uses padding and overlapping windows. History stores full context.
+                # Needs space for: 1 (clean_pre) + latent_padding_size + latent_window_size + 1 (clean_post) + 2 (2x) + 16 (4x)
+                # Let's stick to the original calculation size, it adapts based on padding.
+                # Max padding is ~ total_latent_sections * latent_window_size. Max LWS=33, max sections high.
+                # Original code used fixed size, let's keep that structure:
+                history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+                # history_latents will be populated within the loop for the original model.
+                total_generated_latent_frames = 0 # Start frame isn't counted until the first section completes
+                print(f"Original Model Initial history latent shape: {history_latents.shape}")
+            # --- End history initialization ---
 
-            duration_per_section = (latent_window_size * 4 - 3) / fps
+
+            # --- Loop setup based on model ---
+            loop_iterator = None
+            if active_model == MODEL_DISPLAY_NAME_F1:
+                loop_iterator = range(total_latent_sections) # F1 loops 'total_latent_sections' times
+            else: # Original Model
+                # Original model uses padding logic
+                base_latent_paddings = reversed(range(total_latent_sections))
+                if total_latent_sections > 4:
+                    latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
+                else:
+                    latent_paddings = list(base_latent_paddings)
+                loop_iterator = enumerate(latent_paddings) # Original iterates through paddings
+            # --- End loop setup ---
+
             current_prompt_text_for_callback = prompt
 
-            for i, latent_padding in enumerate(latent_paddings):
-                is_last_section = latent_padding == 0
-                is_first_section = (i == 0)
-
-                latent_padding_size = latent_padding * latent_window_size
+            # --- Main Generation Loop ---
+            for loop_info in loop_iterator:
+                # --- Unpack loop info based on model ---
+                latent_padding = 0
+                i = 0 # Loop index
+                if active_model == MODEL_DISPLAY_NAME_F1:
+                    i = loop_info # F1 just gives the index
+                    is_last_section = (i == total_latent_sections - 1)
+                    is_first_section = (i == 0)
+                    # F1 doesn't use latent_padding in the same way
+                    print(f'F1 Loop {i+1}/{total_latent_sections}, is_last_section = {is_last_section}')
+                else: # Original Model
+                    i, latent_padding = loop_info
+                    is_last_section = latent_padding == 0
+                    is_first_section = (i == 0)
+                    latent_padding_size = latent_padding * latent_window_size
+                    print(f'Original Loop {i+1}/{total_latent_sections}, latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
+                # --- End unpack loop info ---
 
                 if stream.input_queue.top() == 'end':
                     stream.output_queue.push(('end', None))
-                    print("Worker detected end signal during latent processing")
+                    print(f"Worker detected end signal during {active_model} loop")
                     try:
-                        if not high_vram:
-                            unload_complete_models(
-                                text_encoder, text_encoder_2, image_encoder, vae, transformer
-                            )
-                    except Exception as cleanup_error:
-                        print(f"Error during cleanup: {str(cleanup_error)}")
+                        if not high_vram: unload_complete_models() # Clean up any loaded models
+                    except Exception as cleanup_error: print(f"Error during cleanup: {str(cleanup_error)}")
                     return
 
-                print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
-
-                # --- Determine current prompt tensors (No changes here) ---
-                first_prompt_key = list(encoded_prompts.keys())[0]
-                active_llama_vec = encoded_prompts[first_prompt_key][0]
-                active_llama_mask = encoded_prompts[first_prompt_key][1]
-                active_clip_pooler = encoded_prompts[first_prompt_key][2]
+                # --- Determine current prompt tensors (Timestamp logic) ---
+                first_prompt_key = list(encoded_prompts.keys())[0] # Fallback prompt
+                active_llama_vec, active_llama_mask, active_clip_pooler = encoded_prompts[first_prompt_key]
                 current_prompt_text_for_callback = first_prompt_key
 
                 if using_timestamped_prompts:
-                    if total_latent_sections > 1:
+                    # Calculate current video time based on frames generated so far
+                    current_frames_generated = 0
+                    if active_model == MODEL_DISPLAY_NAME_F1:
+                        # F1: Start frame + frames from previous loops
+                        current_frames_generated = 1 + i * (latent_window_size * 4 - 3)
+                    else: # Original Model
+                        # Original: Need to estimate based on section progress
+                        # This uses the reversed generation logic - time corresponds to *final* video time
                         section_duration_seconds = (latent_window_size * 4) / fps
+                        # Time decreases as we iterate through reversed padding
                         current_video_time = total_second_length - (i * section_duration_seconds)
+                        # Failsafe clamp
                         if current_video_time < 0: current_video_time = 0.0
-                    else:
-                        current_video_time = 0.0
+                        current_frames_generated = int(current_video_time * fps) # Approx frame number
 
-                    print(f"\n===== PROMPT DEBUG INFO =====")
-                    print(f"Iteration: {i} / {total_latent_sections - 1}")
-                    print(f"Latent padding value for this iteration: {latent_padding}")
-                    print(f"Current video time (mapped from iteration): {current_video_time:.2f}s")
+                    current_video_time_sec = current_frames_generated / fps
+
+                    print(f"\n===== PROMPT DEBUG INFO ({active_model}) =====")
+                    print(f"Loop/Iter: {i} / {total_latent_sections -1}")
+                    print(f"Current video time (estimated): {current_video_time_sec:.2f}s (Frame ~{current_frames_generated})")
                     print(f"Available prompts: {parsed_prompts}")
 
-                    selected_prompt_text = parsed_prompts[0][1]
+                    # Find the prompt active at this time
+                    selected_prompt_text = parsed_prompts[0][1] # Default to the earliest
                     last_matching_time = parsed_prompts[0][0]
+                    epsilon = 1e-4 # Small tolerance for float comparison
 
                     print(f"Checking against prompts...")
-                    epsilon = 1e-4
                     for start_time_prompt, p_text in parsed_prompts:
-                        print(f"  - Checking time {start_time_prompt:.2f}s ('{p_text[:20]}...') vs current_video_time {current_video_time:.2f}s")
-                        if current_video_time >= (start_time_prompt - epsilon):
+                        print(f"  - Checking time {start_time_prompt:.2f}s ('{p_text[:20]}...') vs current_video_time {current_video_time_sec:.2f}s")
+                        # Prompt activates if current time is >= its start time
+                        if current_video_time_sec >= (start_time_prompt - epsilon):
                              selected_prompt_text = p_text
                              last_matching_time = start_time_prompt
-                             print(f"    - MATCH: Current time {current_video_time:.2f}s >= {start_time_prompt}s. Tentative selection: '{selected_prompt_text[:20]}...'")
+                             print(f"    - MATCH: Current time {current_video_time_sec:.2f}s >= {start_time_prompt}s. Tentative selection: '{selected_prompt_text[:20]}...'")
                         else:
-                            print(f"    - NO MATCH: Current time {current_video_time:.2f}s < {start_time_prompt}s. Stopping search.")
+                            # Since prompts are sorted by time, we can stop once current time is less
+                            print(f"    - NO MATCH: Current time {current_video_time_sec:.2f}s < {start_time_prompt}s. Stopping search.")
                             break
 
-                    print(f"Final selected prompt active at/before {current_video_time:.2f}s is the one from {last_matching_time}s: '{selected_prompt_text}'")
-                    print(f"===== END DEBUG INFO =====\n")
+                    print(f"Final selected prompt active at/before {current_video_time_sec:.2f}s is the one from {last_matching_time}s: '{selected_prompt_text}'")
+                    print(f"===== END DEBUG INFO ({active_model}) =====\n")
 
+                    # Use the selected prompt's encoded tensors
                     active_llama_vec, active_llama_mask, active_clip_pooler = encoded_prompts[selected_prompt_text]
                     current_prompt_text_for_callback = selected_prompt_text
                     print(f'---> Generating section corresponding to video time >= {last_matching_time:.2f}s, Using prompt: "{selected_prompt_text[:50]}..."')
 
-                else:
+                else: # Not using timestamped prompts, use the single full prompt
                      active_llama_vec, active_llama_mask, active_clip_pooler = encoded_prompts[prompt]
                      current_prompt_text_for_callback = prompt
                 # --- End prompt tensor determination ---
 
 
-                indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                # --- Prepare Latent Indices and Clean Latents based on Model ---
+                latent_indices = None
+                clean_latents = None
+                clean_latent_indices = None
+                clean_latents_2x = None
+                clean_latent_2x_indices = None
+                clean_latents_4x = None
+                clean_latent_4x_indices = None
 
-                clean_latents_pre = start_latent.to(history_latents)
-                clean_latents_post_orig, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-                if has_end_image and is_first_section:
-                    clean_latents_post = end_latent.to(history_latents)
-                    print("Using end_latent for clean_latents_post in the first section.")
-                else:
+                if active_model == MODEL_DISPLAY_NAME_F1:
+                    # F1 Indices (based on demo_gradio_f1.py)
+                    # indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
+                    # clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+                    # clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+
+                    # Recalculate F1 indices to match expected input shapes for sample_hunyuan
+                    # sample_hunyuan expects: latent_indices(LWS), clean_latent_indices(2), clean_latent_2x_indices(2), clean_latent_4x_indices(16)
+                    # F1 Demo Indices: clean_start(1), 4x(16), 2x(2), 1x(1), latent(LWS)
+                    # Let's map F1 demo indices to sample_hunyuan expected indices:
+                    total_f1_indices = 1 + 16 + 2 + 1 + latent_window_size
+                    indices = torch.arange(0, total_f1_indices).unsqueeze(0)
+
+                    # Split according to F1 demo structure first
+                    f1_clean_start_idx, f1_clean_4x_idx, f1_clean_2x_idx, f1_clean_1x_idx, f1_latent_idx = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+
+                    # Map to sample_hunyuan's expectations:
+                    latent_indices = f1_latent_idx
+                    clean_latent_indices = torch.cat([f1_clean_start_idx, f1_clean_1x_idx], dim=1) # Should be shape [1, 2]
+                    clean_latent_2x_indices = f1_clean_2x_idx # Should be shape [1, 2]
+                    clean_latent_4x_indices = f1_clean_4x_idx # Should be shape [1, 16]
+
+                    # F1 Clean Latents (based on demo_gradio_f1.py)
+                    # Needs last 16+2+1 frames from history_latents
+                    required_history_len = 16 + 2 + 1
+                    if history_latents.shape[2] < required_history_len:
+                        # Pad history if it's too short (should only happen on first loop if start frame isn't enough)
+                        padding_needed = required_history_len - history_latents.shape[2]
+                        padding_tensor = torch.zeros(
+                            (history_latents.shape[0], history_latents.shape[1], padding_needed, history_latents.shape[3], history_latents.shape[4]),
+                            dtype=history_latents.dtype, device=history_latents.device
+                        )
+                        current_history_segment = torch.cat([padding_tensor, history_latents], dim=2).to(gpu) # Move padded segment to GPU
+                        print(f"F1 Warning: Padded history by {padding_needed} frames.")
+                    else:
+                        current_history_segment = history_latents[:, :, -required_history_len:, :, :].to(gpu) # Get last N frames and move to GPU
+
+                    # Split the segment according to F1 demo structure
+                    clean_latents_4x, clean_latents_2x, clean_latents_1x = current_history_segment.split([16, 2, 1], dim=2)
+
+                    # Map to sample_hunyuan's expectations:
+                    clean_latents = torch.cat([start_latent.to(gpu), clean_latents_1x], dim=2) # Needs start_latent + 1x latent
+
+                else: # Original Model
+                    # Original Indices (based on original app.py)
+                    latent_padding_size = latent_padding * latent_window_size # Recalculate here
+                    total_original_indices = sum([1, latent_padding_size, latent_window_size, 1, 2, 16])
+                    indices = torch.arange(0, total_original_indices).unsqueeze(0)
+                    clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+                    clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1) # Shape [1, 2]
+
+                    # Original Clean Latents (based on original app.py)
+                    # Needs start_latent, end_latent (maybe), and history
+                    clean_latents_pre = start_latent.to(gpu) # Move start latent to GPU
+                    # Get reference frames from history (these might be zeros initially)
+                    clean_latents_post_orig, clean_latents_2x_orig, clean_latents_4x_orig = history_latents[:, :, :1 + 2 + 16, :, :].to(gpu).split([1, 2, 16], dim=2)
+
                     clean_latents_post = clean_latents_post_orig
-                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+                    # Use end_latent ONLY if available AND it's the first section (highest padding)
+                    if has_end_image and is_first_section and end_latent is not None:
+                        clean_latents_post = end_latent.to(gpu) # Use end latent, move to GPU
+                        print("Using end_latent for clean_latents_post in the first section.")
 
+                    # Combine clean latents
+                    clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+                    clean_latents_2x = clean_latents_2x_orig
+                    clean_latents_4x = clean_latents_4x_orig
 
-                # --- Move Model to GPU --- (MODIFICATION 3c - Part 1)
+                # --- Move Model to GPU ---
                 if not high_vram:
-                    unload_complete_models()
+                    unload_complete_models() # Ensure others are unloaded
                     move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                else:
+                    # In high VRAM, assume transformer is already on GPU OR move it now if it wasn't persistent
+                    if transformer.device != gpu:
+                         print("Moving transformer to GPU (High VRAM mode)...")
+                         transformer.to(gpu)
                 # --- End Move Model to GPU ---
 
                 # --- NEW: Explicitly Sync LoRA Parameters to GPU ---
-                # This needs to run *after* the base model is on GPU, before sampling.
-                # It ensures LoRA weights added while the model was on CPU are moved.
-                if adapter_name_to_use != "None": # Only sync if a LoRA is supposed to be active
+                if adapter_name_to_use != "None":
                     print(f"Worker: Ensuring LoRA adapter '{adapter_name_to_use}' parameters are on {gpu}...")
                     try:
                         lora_params_synced = 0
                         for name, param in transformer.named_parameters():
-                            # Check common LoRA param names OR if the adapter name is part of the param name (safer)
-                            if 'lora_' in name or f"'{adapter_name_to_use}'" in name: # Check standard naming or adapter name inclusion
+                            if 'lora_' in name or f"'{adapter_name_to_use}'" in name:
                                 if param.device != gpu:
                                     param.data = param.data.to(gpu)
                                     lora_params_synced += 1
                         if lora_params_synced > 0:
                              print(f"Worker: Synced {lora_params_synced} LoRA parameters to {gpu}.")
-                        # Optional: Check modules too, though parameters are usually sufficient
-                        # for name, module in transformer.named_modules():
-                        #     if 'lora' in name.lower() or isinstance(module, (peft.tuners.lora.LoraLayer)): # Example check
-                        #         if next(module.parameters(), torch.empty(0)).device != gpu:
-                        #              module.to(gpu)
                     except Exception as sync_err:
                         print(f"Worker ERROR: Failed to sync LoRA parameters to {gpu}: {sync_err}")
                         traceback.print_exc()
-                        # Depending on severity, maybe raise error or try to disable LoRA
-                        # For now, we'll proceed, but it might fail later
                 # --- END NEW LoRA Sync Block ---
 
 
-                # --- Apply LoRA Scale (Existing position is fine now) ---
+                # --- Apply LoRA Scale ---
                 if adapter_name_to_use != "None":
-                    try:                        
+                    try:
                         set_adapters(transformer, [adapter_name_to_use], [lora_scale])
                         print(f"Worker: Applied scale {lora_scale} to adapter '{adapter_name_to_use}'")
                     except Exception as e:
@@ -1115,14 +1323,15 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                          traceback.print_exc()
                 elif hasattr(transformer, 'disable_adapters'): # Ensure disabled if target is None
                      try:
-                         # print("Worker: Ensuring adapters are disabled (target is None)")
                          transformer.disable_adapters()
                      except Exception as e:
                          print(f"Trying to disable adapters (this is not an error if you did not select any LoRA): {e}")
                 # --- End Apply LoRA Scale ---
 
                 # --- Initialize TeaCache based on threshold value ---
-                if teacache_threshold > 0.0:
+                # F1 demo uses teacache=True by default. Let's use the UI toggle.
+                use_teacache_effective = teacache_threshold > 0.0
+                if use_teacache_effective:
                     print(f"TeaCache: Enabled (Threshold: {teacache_threshold})")
                     transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_threshold)
                 else:
@@ -1132,10 +1341,10 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
 
                 sampling_start_time = time.time()
 
-                # --- Callback definition (No changes here) ---
+                # --- Callback definition (No changes here, uses global total_generated_latent_frames) ---
                 def callback(d):
                     preview = d['denoised']
-                    preview = vae_decode_fake(preview)
+                    preview = vae_decode_fake(preview) # Uses global vae
                     preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
                     preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
 
@@ -1152,18 +1361,42 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     time_per_step = elapsed_time / current_step if current_step > 0 else 0
                     remaining_steps = steps - current_step
                     eta_seconds = time_per_step * remaining_steps
-                    expected_frames = latent_window_size * 4 - 3
+
+                    # Calculate expected frames differently for ETA
+                    # This preview shows intermediate *latent* frames being denoised
+                    # Use the number of frames in the current sampling call
+                    expected_latent_frames_in_section = latent_indices.shape[1] # LWS usually
+                    expected_output_frames_from_section = num_frames # latent_window_size * 4 - 3
+
                     if current_step == steps:
-                        post_processing_eta = expected_frames * estimated_vae_time_per_frame + estimated_save_time
+                        # Estimate time for VAE decode + save for the frames *from this section*
+                        post_processing_eta = expected_output_frames_from_section * estimated_vae_time_per_frame + estimated_save_time
                         eta_seconds = post_processing_eta
                     else:
-                        post_processing_eta = expected_frames * estimated_vae_time_per_frame + estimated_save_time
+                        # Add VAE/save estimate for this section to sampling ETA
+                        post_processing_eta = expected_output_frames_from_section * estimated_vae_time_per_frame + estimated_save_time
                         eta_seconds += post_processing_eta
+
                     eta_str = format_time_human_readable(eta_seconds)
-                    total_elapsed = time.time() - gen_start_time
+                    total_elapsed = time.time() - gen_start_time # Time for this specific generation index
                     elapsed_str = format_time_human_readable(total_elapsed)
-                    hint = f'Sampling {current_step}/{steps} (Gen {gen_idx+1}/{num_generations}, Seed {current_seed})'
-                    desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / fps) :.2f} seconds (FPS-{fps}).'
+                    hint = f'Sampling {current_step}/{steps} (Gen {gen_idx+1}/{num_generations}, Seed {current_seed}, Loop {i+1}/{total_latent_sections})'
+
+                    # Calculate total *output* frames generated so far for description
+                    total_output_frames_so_far = 0
+                    if active_model == MODEL_DISPLAY_NAME_F1:
+                        # F1: Start frame + (loops completed * frames per loop)
+                         total_output_frames_so_far = 1 + i * num_frames
+                         # Add estimate for current incomplete loop based on step progress
+                         total_output_frames_so_far += int((current_step / steps) * num_frames)
+                    else: # Original Model
+                        # Original: Estimate based on history_pixels if available, otherwise guess from loop index
+                        if history_pixels is not None:
+                             total_output_frames_so_far = history_pixels.shape[2]
+                        else: # Rough estimate before first decode
+                             total_output_frames_so_far = i * num_frames # Approximation
+
+                    desc = f'Total generated frames: ~{int(max(0, total_output_frames_so_far))}, Video length: {max(0, total_output_frames_so_far / fps) :.2f} seconds (FPS-{fps}).'
                     if using_timestamped_prompts:
                         desc += f' Current Prompt: "{current_prompt_text_for_callback[:50]}..."'
                     time_info = f'Elapsed: {elapsed_str} | ETA: {eta_str}'
@@ -1173,9 +1406,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 # --- End callback ---
 
                 try:
-                    # --- sample_hunyuan call (No changes needed here) ---
+                    # --- sample_hunyuan call (Arguments prepared above based on model) ---
                     generated_latents = sample_hunyuan(
-                        transformer=transformer,
+                        transformer=transformer, # Global transformer, should be on GPU now
                         sampler='unipc',
                         width=width,
                         height=height,
@@ -1185,22 +1418,22 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         guidance_rescale=rs,
                         num_inference_steps=steps,
                         generator=rnd,
-                        prompt_embeds=active_llama_vec,
-                        prompt_embeds_mask=active_llama_mask,
-                        prompt_poolers=active_clip_pooler,
-                        negative_prompt_embeds=llama_vec_n,
-                        negative_prompt_embeds_mask=llama_attention_mask_n,
-                        negative_prompt_poolers=clip_l_pooler_n,
+                        prompt_embeds=active_llama_vec.to(gpu), # Ensure prompt tensors are on GPU
+                        prompt_embeds_mask=active_llama_mask.to(gpu),
+                        prompt_poolers=active_clip_pooler.to(gpu),
+                        negative_prompt_embeds=llama_vec_n.to(gpu),
+                        negative_prompt_embeds_mask=llama_attention_mask_n.to(gpu),
+                        negative_prompt_poolers=clip_l_pooler_n.to(gpu),
                         device=gpu,
-                        dtype=torch.bfloat16,
-                        image_embeddings=image_encoder_last_hidden_state,
-                        latent_indices=latent_indices,
-                        clean_latents=clean_latents,
-                        clean_latent_indices=clean_latent_indices,
-                        clean_latents_2x=clean_latents_2x,
-                        clean_latent_2x_indices=clean_latent_2x_indices,
-                        clean_latents_4x=clean_latents_4x,
-                        clean_latent_4x_indices=clean_latent_4x_indices,
+                        dtype=target_dtype, # Use transformer's dtype
+                        image_embeddings=image_encoder_last_hidden_state.to(gpu), # Ensure image embed on GPU
+                        latent_indices=latent_indices.to(gpu),
+                        clean_latents=clean_latents.to(gpu), # Already moved to GPU during prep
+                        clean_latent_indices=clean_latent_indices.to(gpu),
+                        clean_latents_2x=clean_latents_2x.to(gpu), # Already moved to GPU
+                        clean_latent_2x_indices=clean_latent_2x_indices.to(gpu),
+                        clean_latents_4x=clean_latents_4x.to(gpu), # Already moved to GPU
+                        clean_latent_4x_indices=clean_latent_4x_indices.to(gpu),
                         callback=callback,
                     )
                 except ConnectionResetError as e:
@@ -1209,54 +1442,106 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     if stream.input_queue.top() == 'end':
                         stream.output_queue.push(('end', None))
                         return
+                    # Create empty latents to avoid breaking downstream code
                     empty_shape = (1, 16, latent_window_size, height // 8, width // 8)
                     generated_latents = torch.zeros(empty_shape, dtype=torch.float32).cpu()
                     print("Skipping to next generation due to connection error")
-                    break # Skip current generation
+                    break # Skip current generation's remaining loops
 
                 section_time = time.time() - sampling_start_time
-                print(f"\nSection completed in {section_time:.2f} seconds")
-                print(f"VAE decoding started (takes longer on higher resolution)... {'Using standard decoding' if high_vram else 'Using memory optimization: VAE offloading enabled'}")
+                print(f"\nSection/Loop {i+1} completed sampling in {section_time:.2f} seconds")
 
-                if is_last_section:
-                    generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
+                # --- Update History Latents (on CPU) ---
+                if active_model == MODEL_DISPLAY_NAME_F1:
+                    history_latents = torch.cat([history_latents, generated_latents.cpu()], dim=2)
+                    total_generated_latent_frames = history_latents.shape[2] # Update total count
+                else: # Original Model
+                    # Original logic: add start latent only on last section, update history
+                    current_section_latents = generated_latents.cpu()
+                    if is_last_section:
+                        # Prepend start latent if it's the final (first generated) section
+                        current_section_latents = torch.cat([start_latent.cpu(), current_section_latents], dim=2)
+                    # Update history by prepending the new section's latents
+                    history_latents = torch.cat([current_section_latents, history_latents], dim=2)
+                    # Keep track of total frames added (crude estimate, refined by decode)
+                    total_generated_latent_frames += int(current_section_latents.shape[2])
 
-                total_generated_latent_frames += int(generated_latents.shape[2])
-                history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+                print(f"Updated history_latents shape (CPU): {history_latents.shape}, Total latent frames: {total_generated_latent_frames}")
 
+                # --- VAE Decoding ---
+                print(f"VAE decoding started... {'Using standard decoding' if high_vram else 'Using memory optimization: VAE offloading'}")
                 if not high_vram:
-                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
-                    load_model_as_complete(vae, target_device=gpu)
+                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation) # Offload transformer
+                    load_model_as_complete(vae, target_device=gpu) # Load VAE
 
                 vae_start_time = time.time()
-                real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-                if history_pixels is None:
-                    history_pixels = vae_decode(real_history_latents, vae).cpu()
-                else:
-                    section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
-                    overlapped_frames = latent_window_size * 4 - 3
-                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                    history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                # --- Decode logic based on model ---
+                # We need the full sequence generated *so far* for decoding
+                # The 'history_latents' on CPU should contain this
+                # However, the original model's 'history_latents' includes padding/context not meant for final output.
+                # Let's refine the VAE input based on the model.
+
+                latents_to_decode = None
+                if active_model == MODEL_DISPLAY_NAME_F1:
+                    # F1 history is straightforward: just the sequence generated
+                    latents_to_decode = history_latents.to(gpu) # Move the whole history to GPU
+                else: # Original Model
+                    # Original model needs slicing to get only the 'real' frames
+                    # Use total_generated_latent_frames as the count from the 'end' (which is start of tensor)
+                    latents_to_decode = history_latents[:, :, :total_generated_latent_frames, :, :].to(gpu)
+
+                print(f"Latents to decode shape: {latents_to_decode.shape}")
+
+                # --- Soft Append Logic (Only needed for Original Model?) ---
+                # F1 demo decodes the relevant part each time. Original used soft_append.
+                # Let's try decoding the full relevant history each time for both models for simplicity,
+                # unless performance becomes an issue. Soft append adds complexity.
+
+                # Decode the full sequence generated so far
+                current_pixels = vae_decode(latents_to_decode, vae).cpu() # Decode on GPU, move result to CPU
+                history_pixels = current_pixels # Overwrite history_pixels with the latest full sequence
+
+                # --- Original Soft Append Logic (commented out for unified approach) ---
+                # if active_model != MODEL_DISPLAY_NAME_F1:
+                #     if history_pixels is None:
+                #         history_pixels = vae_decode(latents_to_decode, vae).cpu()
+                #     else:
+                #         # Calculate frames decoded in this section
+                #         section_latent_frames = latents_to_decode.shape[2] # Frames in current decode batch
+                #         # How many frames overlap? Depends on LWS
+                #         overlapped_frames = latent_window_size * 4 - 3 # Check if this is right for soft append
+                #         current_pixels_section = vae_decode(latents_to_decode, vae).cpu() # Decode only the latest part? Needs adjustment
+                #         # Soft append needs careful implementation if used. Sticking to full decode for now.
+                #         history_pixels = soft_append_bcthw(current_pixels_section, history_pixels, overlapped_frames) # Needs adjustment
+                # else: # F1 - just decode the history
+                #      history_pixels = vae_decode(latents_to_decode, vae).cpu()
+                # --- End Original Soft Append Logic ---
+
 
                 vae_time = time.time() - vae_start_time
-                num_frames_decoded = real_history_latents.shape[2]
+                num_frames_decoded = history_pixels.shape[2] # Use actual decoded frames count
                 vae_time_per_frame = vae_time / num_frames_decoded if num_frames_decoded > 0 else estimated_vae_time_per_frame
                 vae_time_history.append(vae_time_per_frame)
                 if len(vae_time_history) > 0:
                     estimated_vae_time_per_frame = sum(vae_time_history) / len(vae_time_history)
                 print(f"VAE decoding completed in {vae_time:.2f} seconds ({vae_time_per_frame:.3f} sec/frame)")
+                print(f'Decoded pixel shape {history_pixels.shape}')
 
+                # --- Offload VAE if needed ---
                 if not high_vram:
-                    unload_complete_models()
+                    unload_complete_models(vae) # Unload VAE after use
 
+                # --- Saving logic (mostly unchanged) ---
                 is_intermediate = not is_last_section
+                # Use job_id and frame count for intermediate naming consistency
+                intermediate_suffix = f"_{history_pixels.shape[2]}frames" # Use actual pixel frame count
+                output_filename_base = f"{job_id}"
                 if is_intermediate:
-                    output_filename = os.path.join(intermediate_videos_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
-                    webm_output_filename = os.path.join(intermediate_webm_videos_folder, f'{job_id}_{total_generated_latent_frames}.webm')
-                else:
-                    output_filename = os.path.join(outputs_folder, f'{job_id}.mp4')  # Use only the timestamp as filename for final output
-                    webm_output_filename = os.path.join(webm_videos_folder, f'{job_id}.webm')
+                     output_filename_base += intermediate_suffix
+
+                output_filename = os.path.join(intermediate_videos_folder if is_intermediate else outputs_folder, f'{output_filename_base}.mp4')
+                webm_output_filename = os.path.join(intermediate_webm_videos_folder if is_intermediate else webm_videos_folder, f'{output_filename_base}.webm')
 
                 save_start_time = time.time()
                 try:
@@ -1269,13 +1554,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     if save_last_frame_flag is True and output_filename and os.path.exists(output_filename):
                         try:
                             print(f"Attempting to save last frame for {output_filename}")
-                            last_frame_base_name = os.path.splitext(os.path.basename(output_filename))[0]
+                            last_frame_base_name_for_save = os.path.splitext(os.path.basename(output_filename))[0]
                             frames_output_dir = os.path.join(
                                 intermediate_last_frames_folder if is_intermediate else last_frames_folder,
-                                last_frame_base_name
+                                last_frame_base_name_for_save # Subfolder named after the video file base
                             )
                             os.makedirs(frames_output_dir, exist_ok=True)
-                            save_last_frame_to_file(history_pixels, frames_output_dir, f"{last_frame_base_name}_lastframe")
+                            save_last_frame_to_file(history_pixels, frames_output_dir, f"{last_frame_base_name_for_save}_lastframe")
                         except Exception as lf_err:
                             print(f"Error saving last frame for {output_filename}: {str(lf_err)}")
                             traceback.print_exc()
@@ -1290,7 +1575,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                             cap.release()
                             print(f"Source MP4 FPS: {source_fps:.2f}")
 
-                            if source_fps <= 60:
+                            if source_fps <= 60: # Limit RIFE application
                                 multiplier_val = "4" if rife_multiplier == "4x FPS" else "2"
                                 print(f"Using RIFE multiplier: {multiplier_val}x")
                                 rife_output_filename = os.path.splitext(output_filename)[0] + '_extra_FPS.mp4'
@@ -1313,7 +1598,7 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                                     if result.returncode == 0:
                                         if os.path.exists(rife_output_filename):
                                             print(f"Successfully applied RIFE. Saved as: {rife_output_filename}")
-                                            stream.output_queue.push(('rife_file', rife_output_filename))
+                                            stream.output_queue.push(('rife_file', rife_output_filename)) # Yield RIFE file path
                                         else:
                                              print(f"RIFE command succeeded but output file missing: {rife_output_filename}")
                                              print(f"RIFE stdout:\n{result.stdout}")
@@ -1340,10 +1625,10 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         (not is_intermediate and save_individual_frames_flag)):
                         frames_output_dir = os.path.join(
                             intermediate_individual_frames_folder if is_intermediate else individual_frames_folder,
-                            os.path.splitext(os.path.basename(output_filename))[0]
+                            os.path.splitext(os.path.basename(output_filename))[0] # Subfolder named after video
                         )
-                        from diffusers_helper.utils import save_individual_frames
-                        save_individual_frames(history_pixels, frames_output_dir, job_id)
+                        from diffusers_helper.utils import save_individual_frames # Import here just in case
+                        save_individual_frames(history_pixels, frames_output_dir, job_id) # Use job_id as base for frame names
                         print(f"Saved individual frames to {frames_output_dir}")
 
                 except ConnectionResetError as e:
@@ -1357,21 +1642,23 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                     output_filename = None
                     webm_output_filename = None
 
-                # --- MODIFICATION 3d: Update Metadata Saving ---
-                save_metadata_enabled = True # Assume true for now
-                if save_metadata_enabled and is_last_section:
+                # --- Metadata Saving ---
+                save_metadata_enabled = True # Assume true (controlled by UI checkbox later)
+                if save_metadata_enabled and is_last_section: # Only save final metadata
                     gen_time_current = time.time() - gen_start_time
                     generation_time_seconds = int(gen_time_current)
                     generation_time_formatted = format_time_human_readable(gen_time_current)
-                    metadata_prompt = prompt
+                    metadata_prompt = prompt # Save the original full prompt
                     if using_timestamped_prompts:
-                        metadata_prompt = prompt
+                        # Include the full multiline prompt if timestamps were used
+                         metadata_prompt = prompt
 
                     metadata = {
+                        "Model": active_model, # <-- ADDED MODEL NAME
                         "Prompt": metadata_prompt,
                         "Negative Prompt": n_prompt,
                         "Seed": current_seed,
-                        "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
+                        "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0.0 else "Disabled",
                         "Video Length (seconds)": total_second_length,
                         "FPS": fps,
                         "Latent Window Size": latent_window_size,
@@ -1386,44 +1673,51 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         "End Frame Provided": has_end_image,
                         "Timestamped Prompts Used": using_timestamped_prompts,
                     }
-                    # --- Use worker args for metadata ---
                     if adapter_name_to_use != "None":
                         metadata["LoRA"] = adapter_name_to_use
                         metadata["LoRA Scale"] = lora_scale
-                    # --- End metadata update ---
 
-                    if output_filename: save_processing_metadata(output_filename, metadata)
-                    if export_gif and os.path.exists(os.path.splitext(output_filename)[0] + '.gif'):
-                        save_processing_metadata(os.path.splitext(output_filename)[0] + '.gif', metadata)
-                    if export_apng and os.path.exists(os.path.splitext(output_filename)[0] + '.png'):
-                        save_processing_metadata(os.path.splitext(output_filename)[0] + '.png', metadata)
-                    if export_webp and os.path.exists(os.path.splitext(output_filename)[0] + '.webp'):
-                        save_processing_metadata(os.path.splitext(output_filename)[0] + '.webp', metadata)
-                    if video_quality == 'web_compatible' and webm_output_filename and os.path.exists(webm_output_filename):
-                        save_processing_metadata(webm_output_filename, metadata)
-                # --- END Metadata Saving ---
+                    # Save metadata for all generated final formats
+                    if output_filename: save_processing_metadata(output_filename, metadata.copy())
+                    final_gif_path = os.path.join(gif_videos_folder, f'{job_id}.gif')
+                    if export_gif and os.path.exists(final_gif_path):
+                        save_processing_metadata(final_gif_path, metadata.copy())
+                    final_apng_path = os.path.join(apng_videos_folder, f'{job_id}.png')
+                    if export_apng and os.path.exists(final_apng_path):
+                         save_processing_metadata(final_apng_path, metadata.copy())
+                    final_webp_path = os.path.join(webp_videos_folder, f'{job_id}.webp')
+                    if export_webp and os.path.exists(final_webp_path):
+                         save_processing_metadata(final_webp_path, metadata.copy())
+                    final_webm_path = os.path.join(webm_videos_folder, f'{job_id}.webm')
+                    if video_quality == 'web_compatible' and final_webm_path and os.path.exists(final_webm_path):
+                        save_processing_metadata(final_webm_path, metadata.copy())
+                    rife_final_path = os.path.splitext(output_filename)[0] + '_extra_FPS.mp4' if output_filename else None
+                    if rife_enabled and rife_final_path and os.path.exists(rife_final_path):
+                         save_processing_metadata(rife_final_path, metadata.copy())
+
+                # --- End Metadata Saving ---
 
 
-                # Save additional formats
+                # Save additional formats (GIF, APNG, WebP)
                 try:
+                    gif_filename = os.path.join(intermediate_gif_videos_folder if is_intermediate else gif_videos_folder, f'{output_filename_base}.gif')
                     if export_gif:
-                        gif_filename = os.path.join(intermediate_gif_videos_folder if is_intermediate else gif_videos_folder, f'{job_id}_{total_generated_latent_frames}.gif' if is_intermediate else f'{job_id}.gif')
                         try:
                             os.makedirs(os.path.dirname(gif_filename), exist_ok=True)
                             save_bcthw_as_gif(history_pixels, gif_filename, fps=fps)
                             print(f"Saved GIF animation to {gif_filename}")
                         except Exception as e: print(f"Error saving GIF: {str(e)}")
 
+                    apng_filename = os.path.join(intermediate_apng_videos_folder if is_intermediate else apng_videos_folder, f'{output_filename_base}.png')
                     if export_apng:
-                        apng_filename = os.path.join(intermediate_apng_videos_folder if is_intermediate else apng_videos_folder, f'{job_id}_{total_generated_latent_frames}.png' if is_intermediate else f'{job_id}.png')
                         try:
                             os.makedirs(os.path.dirname(apng_filename), exist_ok=True)
                             save_bcthw_as_apng(history_pixels, apng_filename, fps=fps)
                             print(f"Saved APNG animation to {apng_filename}")
                         except Exception as e: print(f"Error saving APNG: {str(e)}")
 
+                    webp_filename = os.path.join(intermediate_webp_videos_folder if is_intermediate else webp_videos_folder, f'{output_filename_base}.webp')
                     if export_webp:
-                        webp_filename = os.path.join(intermediate_webp_videos_folder if is_intermediate else webp_videos_folder, f'{job_id}_{total_generated_latent_frames}.webp' if is_intermediate else f'{job_id}.webp')
                         try:
                             os.makedirs(os.path.dirname(webp_filename), exist_ok=True)
                             save_bcthw_as_webp(history_pixels, webp_filename, fps=fps)
@@ -1438,13 +1732,15 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                 if len(save_time_history) > 0:
                     estimated_save_time = sum(save_time_history) / len(save_time_history)
                 print(f"Saving operations completed in {save_time:.2f} seconds")
-                print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
-                # Yield the original filename to the UI
-                stream.output_queue.push(('file', output_filename))
+                # Yield the primary output file (MP4 or WebM) to the UI
+                primary_output_file = output_filename
+                if video_quality == 'web_compatible' and webm_output_filename and os.path.exists(webm_output_filename):
+                     primary_output_file = webm_output_filename
+                stream.output_queue.push(('file', primary_output_file))
 
                 if is_last_section:
-                    break # End of generation loop
+                    break # End of generation loop for this generation index
 
             # --- Generation Loop Timing ---
             gen_time_completed = time.time() - gen_start_time
@@ -1456,10 +1752,6 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
             print(f"\nGeneration {gen_idx+1}/{num_generations} completed in {gen_time_completed:.2f} seconds")
             if remaining_gens > 0:
                 print(f"Estimated time for remaining generations: {estimated_remaining_time/60:.1f} minutes")
-                # --- REMOVED LoRA cleanup here, handled outside ---
-                # if using_lora and hasattr(transformer, "peft_config") ...:
-                #     print("Cleaning up LoRA weights before next generation")
-                #     safe_unload_lora(transformer, gpu)
 
             stream.output_queue.push(('timing', {'gen_time': gen_time_completed, 'avg_time': avg_gen_time, 'remaining_time': estimated_remaining_time}))
             # --- End Generation Loop Timing ---
@@ -1467,57 +1759,54 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
         except KeyboardInterrupt as e:
             if str(e) == 'User ends the task.':
                 print("\n" + "="*50 + "\nGENERATION ENDED BY USER\n" + "="*50)
-                # --- REMOVED LoRA cleanup here ---
                 if not high_vram:
                     print("Unloading models from memory...")
                     unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
                 stream.output_queue.push(('end', None))
-                return
-            else: raise
+                return # Exit worker function
+            else: raise # Re-raise other KeyboardInterrupts
         except ConnectionResetError as e:
             print(f"Connection Reset Error outside main processing loop: {str(e)}")
-            print("Trying to continue with next generation...")
-            # --- REMOVED LoRA cleanup here ---
+            print("Trying to continue with next generation if possible...")
             if not high_vram:
                 try: unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
                 except Exception as cleanup_error: print(f"Error during memory cleanup: {str(cleanup_error)}")
-            if gen_idx == num_generations - 1:
+            if gen_idx == num_generations - 1: # If it was the last planned generation
                 stream.output_queue.push(('end', None))
-                return
-            continue # Continue to next generation
+                return # Exit worker
+            continue # Continue to next generation index
         except Exception as e:
             print("\n" + "="*50 + f"\nERROR DURING GENERATION: {str(e)}\n" + "="*50)
             traceback.print_exc()
             print("="*50)
-            # --- REMOVED LoRA cleanup here ---
             if not high_vram:
                 try: unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
                 except Exception as cleanup_error: print(f"Error during memory cleanup after exception: {str(cleanup_error)}")
-            if gen_idx == num_generations - 1:
+            if gen_idx == num_generations - 1: # If it was the last planned generation
                 stream.output_queue.push(('end', None))
-                return
-            continue # Continue to next generation
+                return # Exit worker
+            continue # Continue to next generation index
 
+    # --- End of all generations loop ---
     total_time_worker = time.time() - start_time # Use overall worker start time for total duration
-    print(f"\nTotal worker time: {total_time_worker:.2f} seconds ({total_time_worker/60:.2f} minutes)")
+    print(f"\nTotal worker time for {num_generations} generation(s): {total_time_worker:.2f} seconds ({total_time_worker/60:.2f} minutes)")
 
-    # --- REMOVED FINAL LoRA cleanup here ---
-    # if hasattr(transformer, "peft_config") ...:
-    #     print("Final cleanup of LoRA weights at worker completion")
-    #     safe_unload_lora(transformer, gpu)
+    # --- Final cleanup (ensure models used in loop are unloaded if low VRAM) ---
+    if not high_vram:
+        unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer) # Final attempt to clear
 
     stream.output_queue.push(('final_timing', {'total_time': total_time_worker, 'generation_times': generation_times}))
     stream.output_queue.push(('final_seed', last_used_seed))
     stream.output_queue.push(('end', None))
     return
 
-# --- Helper Function (MODIFICATION 2a) ---
+# --- Helper Function manage_lora_structure (Unchanged conceptually, acts on global transformer) ---
 def manage_lora_structure(selected_lora_dropdown_value: str):
     """
     Ensures the correct LoRA structure is loaded/unloaded onto the global transformer.
     MUST be called when the transformer is expected to be on the CPU.
     """
-    global transformer, currently_loaded_lora_info, text_encoder, text_encoder_2, image_encoder, vae # Need other models for unload
+    global transformer, currently_loaded_lora_info, text_encoder, text_encoder_2, image_encoder, vae # Need other models for unload check
 
     lora_path = get_lora_path_from_name(selected_lora_dropdown_value) # Get full path
 
@@ -1530,17 +1819,28 @@ def manage_lora_structure(selected_lora_dropdown_value: str):
         print(f"LoRA Change Detected: Target='{target_adapter_name}', Current='{currently_loaded_lora_info['adapter_name']}'")
 
         # --- Ensure model is on CPU before modification ---
-        if not high_vram:
-            print("Ensuring models are on CPU before LoRA structure change...")
-            unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
-        else:
+        transformer_on_cpu = False
+        if transformer.device == cpu or (hasattr(transformer, 'model') and transformer.model.device == cpu): # Check wrapper and internal model device
+             transformer_on_cpu = True
+        elif not high_vram:
+             # If low VRAM, assume DynamicSwap handled it or unload manually
+             print("Ensuring transformer is on CPU before LoRA structure change (Low VRAM mode)...")
+             unload_complete_models(transformer) # Attempt to unload it fully
+             transformer_on_cpu = True # Assume success for now
+        else: # High VRAM mode, explicitly move to CPU
              try:
                  print("Moving transformer to CPU for LoRA structure change (High VRAM mode)...")
                  transformer.to(cpu)
                  torch.cuda.empty_cache()
+                 transformer_on_cpu = True
              except Exception as e:
                  print(f"Warning: Failed to move transformer to CPU in high VRAM mode: {e}")
+                 # Proceed cautiously, LoRA ops might fail if still on GPU
         # --- End CPU Check ---
+
+        if not transformer_on_cpu:
+             print("ERROR: Transformer could not be confirmed on CPU. Aborting LoRA structure change.")
+             raise RuntimeError("Failed to ensure transformer is on CPU for LoRA modification.")
 
 
         # 1. Unload existing LoRA structure if one is loaded
@@ -1553,13 +1853,15 @@ def manage_lora_structure(selected_lora_dropdown_value: str):
                 currently_loaded_lora_info["lora_path"] = None
             else:
                 print(f"ERROR: Failed to unload LoRA {currently_loaded_lora_info['adapter_name']}! State may be corrupt.")
-                raise RuntimeError(f"Failed to unload previous LoRA '{currently_loaded_lora_info['adapter_name']}'. Cannot safely proceed.")
+                # Don't raise error here, allow attempting to load the new one over it as a fallback
+                # raise RuntimeError(f"Failed to unload previous LoRA '{currently_loaded_lora_info['adapter_name']}'. Cannot safely proceed.")
 
         # 2. Load new LoRA structure if target is not "None"
         if target_adapter_name is not None and lora_path != "none":
             print(f"Loading new LoRA structure: {target_adapter_name} from {lora_path}")
             try:
                 lora_dir, lora_filename = os.path.split(lora_path)
+                # Ensure load_lora works correctly with DynamicSwap models if applicable
                 load_lora(transformer, lora_dir, lora_filename) # Assume modification in-place on CPU model
                 print(f"Successfully loaded structure for {target_adapter_name}.")
                 currently_loaded_lora_info["adapter_name"] = target_adapter_name
@@ -1567,33 +1869,172 @@ def manage_lora_structure(selected_lora_dropdown_value: str):
             except Exception as e:
                 print(f"ERROR loading LoRA structure for {target_adapter_name}: {e}")
                 traceback.print_exc()
-                currently_loaded_lora_info["adapter_name"] = None
+                currently_loaded_lora_info["adapter_name"] = None # Reset state on failure
                 currently_loaded_lora_info["lora_path"] = None
                 raise RuntimeError(f"Failed to load LoRA structure '{target_adapter_name}'.")
         else:
              print("Target LoRA is 'None'. No new structure loaded.")
+             currently_loaded_lora_info["adapter_name"] = None # Ensure state is None if target is None
+             currently_loaded_lora_info["lora_path"] = None
 
         # --- Optional: Move model back to GPU if in high_vram mode ---
-        if high_vram:
-            try:
-                print("Moving transformer back to GPU after LoRA change (High VRAM mode)...")
-                transformer.to(gpu)
-            except Exception as e:
-                print(f"Warning: Failed to move transformer back to GPU in high VRAM mode: {e}")
+        # Let's NOT move it back here. Let the worker handle moving it when needed.
+        # if high_vram and transformer_on_cpu: # Only if we explicitly moved it
+        #     try:
+        #         print("Moving transformer back to GPU after LoRA change (High VRAM mode)...")
+        #         transformer.to(gpu)
+        #     except Exception as e:
+        #         print(f"Warning: Failed to move transformer back to GPU in high VRAM mode: {e}")
         # --- End Optional Move Back ---
     else:
         print(f"No LoRA structure change needed. Current: '{currently_loaded_lora_info['adapter_name']}'")
 
 
-# --- MODIFICATION 2b: Modify process function signature & add LoRA management ---
-def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, lora_scale=1.0, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False, rife_enabled=False, rife_multiplier="2x FPS",
-             selected_lora_dropdown_value="None"): # <-- Added this arg, removed selected_lora path arg
+# --- Function to Switch Active Model ---
+def switch_active_model(target_model_display_name: str, progress=gr.Progress()):
+    """Unloads current transformer, loads the target one, handles LoRA state."""
+    global transformer, active_model_name, currently_loaded_lora_info
 
-    global stream, currently_loaded_lora_info # Need global state access
+    if target_model_display_name == active_model_name:
+        print(f"Model '{active_model_name}' is already active.")
+        return active_model_name, f"Model '{active_model_name}' is already active."
+
+    progress(0, desc=f"Switching model to '{target_model_display_name}'...")
+    print(f"Switching model from '{active_model_name}' to '{target_model_display_name}'...")
+
+    # 1. Unload any existing LoRA from the current transformer FIRST
+    if currently_loaded_lora_info["adapter_name"] is not None:
+        print(f"Unloading LoRA '{currently_loaded_lora_info['adapter_name']}' before switching model...")
+        progress(0.1, desc=f"Unloading LoRA '{currently_loaded_lora_info['adapter_name']}'...")
+        try:
+            # Ensure current transformer is on CPU for safe unload
+            if transformer.device != cpu:
+                if not high_vram:
+                    unload_complete_models(transformer) # Try dynamic swap unload first
+                if transformer.device != cpu: # If still not on CPU (e.g., high VRAM)
+                    transformer.to(cpu)
+                    torch.cuda.empty_cache()
+
+            unload_success = safe_unload_lora(transformer, cpu)
+            if unload_success:
+                print(f"Successfully unloaded LoRA '{currently_loaded_lora_info['adapter_name']}'.")
+                currently_loaded_lora_info = {"adapter_name": None, "lora_path": None} # Reset LoRA state
+            else:
+                print(f"Warning: Failed to cleanly unload LoRA '{currently_loaded_lora_info['adapter_name']}'. Proceeding with model switch, but LoRA state might be inconsistent.")
+                currently_loaded_lora_info = {"adapter_name": None, "lora_path": None} # Reset state anyway
+        except Exception as e:
+            print(f"Error unloading LoRA during model switch: {e}")
+            traceback.print_exc()
+            currently_loaded_lora_info = {"adapter_name": None, "lora_path": None} # Reset state on error
+
+    # 2. Unload the current transformer model
+    progress(0.3, desc=f"Unloading current model '{active_model_name}'...")
+    print(f"Unloading current model '{active_model_name}'...")
+    try:
+        is_dynamic_swap = hasattr(transformer, '_hf_hook') and isinstance(transformer._hf_hook, DynamicSwapInstaller.SwapHook)
+        if is_dynamic_swap:
+            print("Uninstalling DynamicSwap from current transformer...")
+            DynamicSwapInstaller.uninstall_model(transformer) # Remove hooks before deleting
+
+        del transformer # Remove reference
+        torch.cuda.empty_cache() # Clear VRAM
+        print(f"Model '{active_model_name}' unloaded.")
+    except Exception as e:
+        print(f"Error during model unload: {e}")
+        traceback.print_exc()
+        # Continue, try to load the new one anyway
+
+    # 3. Load the new transformer model
+    new_model_hf_name = None
+    if target_model_display_name == MODEL_DISPLAY_NAME_ORIGINAL:
+        new_model_hf_name = MODEL_NAME_ORIGINAL
+    elif target_model_display_name == MODEL_DISPLAY_NAME_F1:
+        new_model_hf_name = MODEL_NAME_F1
+    else:
+        error_msg = f"Unknown target model name: {target_model_display_name}"
+        print(f"ERROR: {error_msg}")
+        # Try to reload the default as a fallback? Or just fail? Let's fail for clarity.
+        # Re-assigning global `transformer` requires it to be defined.
+        # This state is problematic. Best to raise error or return status indicating failure.
+        # For Gradio yield, we return the original active_model_name and an error message.
+        return active_model_name, f"Error: {error_msg}. Model not switched."
+
+    progress(0.5, desc=f"Loading new model '{target_model_display_name}' from {new_model_hf_name}...")
+    print(f"Loading new model '{target_model_display_name}' from {new_model_hf_name}...")
+    try:
+        transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(new_model_hf_name, torch_dtype=torch.bfloat16).cpu()
+        transformer.eval()
+        transformer.high_quality_fp32_output_for_inference = True
+        transformer.to(dtype=torch.bfloat16) # Ensure dtype
+        transformer.requires_grad_(False)
+        print(f"New model '{target_model_display_name}' loaded to CPU.")
+
+        # 4. Apply DynamicSwap if needed
+        if not high_vram:
+            progress(0.8, desc=f"Applying memory optimization...")
+            print("Applying DynamicSwap to new transformer...")
+            DynamicSwapInstaller.install_model(transformer, device=gpu)
+
+        # 5. Update global state
+        active_model_name = target_model_display_name
+        progress(1.0, desc=f"Model switched successfully to '{active_model_name}'.")
+        print(f"Model switched successfully to '{active_model_name}'.")
+        # Refresh iteration info display after model switch
+        # This requires access to the UI components - better to return the value and update UI separately
+        # info_text = update_iteration_info(current_vid_len, current_fps, current_win_size) # Need current UI values
+        return active_model_name, f"Model switched to '{active_model_name}'."
+
+    except Exception as e:
+        error_msg = f"Failed to load model '{target_model_display_name}': {e}"
+        print(f"ERROR: {error_msg}")
+        traceback.print_exc()
+        # Attempt to reload the previous model as a fallback? Risky.
+        # Return the previous model name and error status.
+        # Need to ensure `transformer` variable exists globally even if loading failed.
+        # Let's try reloading the original default as a last resort.
+        try:
+             print("Attempting to reload default model as fallback...")
+             default_hf_name = MODEL_NAME_ORIGINAL if DEFAULT_MODEL_NAME == MODEL_DISPLAY_NAME_ORIGINAL else MODEL_NAME_F1
+             transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(default_hf_name, torch_dtype=torch.bfloat16).cpu()
+             transformer.eval()
+             transformer.high_quality_fp32_output_for_inference = True
+             transformer.to(dtype=torch.bfloat16)
+             transformer.requires_grad_(False)
+             if not high_vram: DynamicSwapInstaller.install_model(transformer, device=gpu)
+             active_model_name = DEFAULT_MODEL_NAME # Reset active name to default
+             return active_model_name, f"Error: {error_msg}. Reverted to default model '{active_model_name}'."
+        except Exception as fallback_e:
+             fatal_error_msg = f"CRITICAL ERROR: Failed to load target model AND fallback model. Error: {fallback_e}"
+             print(fatal_error_msg)
+             # Application might be unusable now.
+             # Returning original name but state is broken.
+             return active_model_name, fatal_error_msg # Return original name, but signal critical failure
+
+
+# --- Modify process function signature & add model switch check ---
+def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, lora_scale=1.0, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False, rife_enabled=False, rife_multiplier="2x FPS",
+             selected_lora_dropdown_value="None",
+             # --- ADDED ---
+             selected_model_display_name=DEFAULT_MODEL_NAME):
+
+    global stream, currently_loaded_lora_info, active_model_name # Need global state access
     assert input_image is not None, 'No start input image!'
 
-    # --- MANAGE LORA STRUCTURE --- (MODIFICATION 2b)
+    # --- CHECK AND SWITCH MODEL (if necessary) ---
+    # This should ideally happen via a dedicated UI interaction, but can be checked here too.
+    # However, doing the potentially long switch here makes the 'Start' button slow.
+    # Assume `switch_active_model` was called via UI change event before this.
+    # We just need to use the current `active_model_name`.
+    if selected_model_display_name != active_model_name:
+         print(f"Warning: Selected model '{selected_model_display_name}' differs from active model '{active_model_name}'. Using the active model.")
+         # Or trigger switch here? Let's rely on the UI event for switching.
+    current_active_model = active_model_name # Use the globally set active model
+    # --- END MODEL CHECK ---
+
+
+    # --- MANAGE LORA STRUCTURE ---
     try:
+        # Ensure transformer is on CPU before managing LoRA (manage_lora_structure handles this)
         manage_lora_structure(selected_lora_dropdown_value)
     except RuntimeError as e:
          print(f"LoRA Management Error: {e}")
@@ -1618,13 +2059,13 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
 
     for prompt_idx, current_prompt_line in enumerate(prompt_lines):
         stream = AsyncStream()
-        print(f"Starting processing loop {prompt_idx+1}/{total_prompts_or_loops}")
-        status_msg = f"Processing prompt {prompt_idx+1}/{total_prompts_or_loops}" if use_multiline_prompts else "Starting generation"
+        print(f"Starting processing loop {prompt_idx+1}/{total_prompts_or_loops} using model '{current_active_model}'")
+        status_msg = f"Processing prompt {prompt_idx+1}/{total_prompts_or_loops} ({current_active_model})" if use_multiline_prompts else f"Starting generation ({current_active_model})"
         yield None, None, status_msg, '', gr.update(interactive=False), gr.update(interactive=True), seed, ''
 
         prompt_to_worker = prompt if not use_multiline_prompts else current_prompt_line
 
-        # --- MODIFIED WORKER CALL --- (MODIFICATION 2b)
+        # --- MODIFIED WORKER CALL (Add active_model) ---
         current_adapter_name = currently_loaded_lora_info["adapter_name"] if currently_loaded_lora_info["adapter_name"] else "None"
         async_run(worker, input_image, end_image, prompt_to_worker, n_prompt, seed, use_random_seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, num_generations, resolution, fps,
                   # --- LoRA Args Changed ---
@@ -1635,7 +2076,10 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
                   save_intermediate_frames_flag=save_intermediate_frames,
                   save_last_frame_flag=save_last_frame,
                   use_multiline_prompts_flag=use_multiline_prompts,
-                  rife_enabled=rife_enabled, rife_multiplier=rife_multiplier)
+                  rife_enabled=rife_enabled, rife_multiplier=rife_multiplier,
+                  # --- ADDED ---
+                  active_model=current_active_model
+                 )
         # --- END MODIFIED WORKER CALL ---
 
         output_filename = None
@@ -1643,7 +2087,8 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
         gif_filename = None
         apng_filename = None
         webp_filename = None
-        current_seed = seed # Re-initialize seed for each loop pass? Or keep incrementing? Let's keep it consistent with original logic.
+        rife_final_video_path = None # Track potential RIFE output
+        current_seed_display = seed # Keep seed consistent for UI during multi-prompt
         timing_info = ""
         last_output = None
 
@@ -1651,11 +2096,11 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
             flag, data = stream.output_queue.next()
 
             if flag == 'seed_update':
-                current_seed = data
-                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
+                current_seed_display = data # Update UI seed display
+                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed_display, timing_info
 
             if flag == 'final_seed':
-                current_seed = data
+                 pass # Worker finished, final seed is known internally
 
             if flag == 'timing':
                 gen_time = data['gen_time']
@@ -1663,94 +2108,94 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
                 remaining_time = data['remaining_time']
                 eta_str = f"{remaining_time/60:.1f} minutes" if remaining_time > 60 else f"{remaining_time:.1f} seconds"
                 timing_info = f"Last generation: {gen_time:.2f}s | Average: {avg_time:.2f}s | ETA: {eta_str}"
-                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
+                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed_display, timing_info
 
             if flag == 'final_timing':
                 total_time = data['total_time']
                 timing_info = f"Total generation time: {total_time:.2f}s ({total_time/60:.2f} min)"
-                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, timing_info
+                yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed_display, timing_info
 
             if flag == 'file':
-                output_filename = data
+                output_filename = data # This is the primary output (MP4 or WebM)
                 if output_filename is None:
-                    print("Warning: No output file was generated due to an error")
-                    yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
-                    continue
+                    print("Warning: No primary output file was generated by worker")
+                    yield None, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed_display, timing_info
+                    continue # Wait for more messages or 'end'
 
                 last_output = output_filename
-                final_video = output_filename
-                base_name = os.path.basename(output_filename)
-                base_name_no_ext = os.path.splitext(base_name)[0]
-                is_intermediate = 'intermediate' in output_filename
+                final_video = output_filename # Assume this is the final unless RIFE replaces it
 
-                if is_intermediate:
-                    webm_filename = os.path.join(intermediate_webm_videos_folder, f"{base_name_no_ext}.webm")
-                    gif_filename = os.path.join(intermediate_gif_videos_folder, f"{base_name_no_ext}.gif")
-                    apng_filename = os.path.join(intermediate_apng_videos_folder, f"{base_name_no_ext}.png")
-                    webp_filename = os.path.join(intermediate_webp_videos_folder, f"{base_name_no_ext}.webp")
-                else:
-                    webm_filename = os.path.join(webm_videos_folder, f"{base_name_no_ext}.webm")
-                    gif_filename = os.path.join(gif_videos_folder, f"{base_name_no_ext}.gif")
-                    apng_filename = os.path.join(apng_videos_folder, f"{base_name_no_ext}.png")
-                    webp_filename = os.path.join(webp_videos_folder, f"{base_name_no_ext}.webp")
+                # Check for associated RIFE file (worker might have generated it)
+                potential_rife_path = os.path.splitext(output_filename)[0] + '_extra_FPS.mp4'
+                if rife_enabled and os.path.exists(potential_rife_path):
+                    rife_final_video_path = potential_rife_path
+                    final_video = rife_final_video_path # RIFE output becomes the final video
+                    print(f"RIFE output detected: {rife_final_video_path}")
 
-                if not os.path.exists(webm_filename): webm_filename = None
-                if not os.path.exists(gif_filename): gif_filename = None
-                if not os.path.exists(apng_filename): apng_filename = None
-                if not os.path.exists(webp_filename): webp_filename = None
+                # Determine which file to display
+                display_video = final_video
 
-                video_file = output_filename if output_filename is not None else None
-                if output_filename is not None and video_quality == 'web_compatible' and webm_filename and os.path.exists(webm_filename):
-                    video_file = webm_filename
-
-                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if use_multiline_prompts else ""
-                yield video_file, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info + prompt_info
+                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops}, {current_active_model})" if use_multiline_prompts else f" ({current_active_model})"
+                yield display_video, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed_display, timing_info + prompt_info
 
             if flag == 'rife_file':
-                rife_video_file = data
-                print(f"Displaying RIFE-enhanced video: {rife_video_file}")
-                prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if use_multiline_prompts else ""
-                final_video = rife_video_file
-                yield rife_video_file, gr.update(), gr.update(value=f"RIFE-enhanced video ready ({rife_multiplier})"), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info + prompt_info
+                 # Worker explicitly signals RIFE file completion
+                 rife_video_file = data
+                 print(f"Displaying RIFE-enhanced video: {rife_video_file}")
+                 rife_final_video_path = rife_video_file
+                 final_video = rife_video_file # Update final video
+                 prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops}, {current_active_model})" if use_multiline_prompts else f" ({current_active_model})"
+                 yield rife_video_file, gr.update(), gr.update(value=f"RIFE-enhanced video ready ({rife_multiplier})"), gr.update(), gr.update(interactive=False), gr.update(interactive=True), current_seed_display, timing_info + prompt_info
 
             if flag == 'progress':
                 preview, desc, html = data
+                # Add model and prompt info to progress
+                model_prompt_info = f" ({current_active_model}"
                 if use_multiline_prompts:
-                    if html:
-                        import re
-                        hint_match = re.search(r'>(.*?)<br', html)
-                        if hint_match:
-                            hint = hint_match.group(1)
-                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts_or_loops}: {current_prompt_line[:30]}{'...' if len(current_prompt_line) > 30 else ''})"
-                            html = html.replace(hint, new_hint)
-                    if desc:
-                        desc += f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})"
-                yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
+                     model_prompt_info += f", Prompt {prompt_idx+1}/{total_prompts_or_loops}"
+                model_prompt_info += ")"
+
+                if html:
+                    import re
+                    hint_match = re.search(r'>(.*?)<br', html) # Find text before <br/>
+                    if hint_match:
+                        hint = hint_match.group(1)
+                        new_hint = f"{hint}{model_prompt_info}"
+                        # Escape potential special characters in hint for regex replacement
+                        escaped_hint = re.escape(hint)
+                        html = re.sub(f">{escaped_hint}<br", f">{new_hint}<br", html, count=1)
+                    else: # Fallback if structure changes
+                         html += f"<span>{model_prompt_info}</span>"
+
+                if desc:
+                    desc += model_prompt_info
+
+                yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True), current_seed_display, timing_info
 
             if flag == 'end':
-                if prompt_idx == len(prompt_lines) - 1:
-                    if rife_enabled and final_video and os.path.exists(os.path.splitext(final_video)[0] + '_extra_FPS.mp4'):
-                        rife_final_video = os.path.splitext(final_video)[0] + '_extra_FPS.mp4'
-                        print(f"Using RIFE-enhanced final video: {rife_final_video}")
-                        yield rife_final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
-                    else:
-                        yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
-                else:
-                    yield final_video, gr.update(visible=False), f"Completed prompt {prompt_idx+1}/{total_prompts_or_loops}", '', gr.update(interactive=False), gr.update(interactive=True), current_seed, timing_info
-                break # Exit the inner while loop
+                # Determine final video to display after loop ends
+                display_video = final_video if final_video else None
+
+                if prompt_idx == len(prompt_lines) - 1: # Last prompt processed
+                    yield display_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed_display, timing_info
+                else: # More prompts to go
+                    yield display_video, gr.update(visible=False), f"Completed prompt {prompt_idx+1}/{total_prompts_or_loops} ({current_active_model})", '', gr.update(interactive=False), gr.update(interactive=True), current_seed_display, timing_info
+                break # Exit the inner while loop, proceed to next prompt_line or finish
+
+        # Update seed for the next prompt line if not using random seeds
+        if not use_random_seed and prompt_idx < len(prompt_lines) - 1:
+             seed += 1 # Increment seed for next line's generation(s)
+
 
         if not use_multiline_prompts:
-            break
+            break # Only run once if multi-line is off
 
-    if rife_enabled and final_video and os.path.exists(os.path.splitext(final_video)[0] + '_extra_FPS.mp4'):
-        rife_final_video = os.path.splitext(final_video)[0] + '_extra_FPS.mp4'
-        print(f"Using RIFE-enhanced final video at process end: {rife_final_video}")
-        yield rife_final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
-    else:
-        yield final_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed, timing_info
+    # Final yield after all prompts are done
+    display_video = final_video if final_video else None
+    yield display_video, gr.update(visible=False), '', '', gr.update(interactive=True), gr.update(interactive=False), current_seed_display, timing_info
 
 
-# --- MODIFICATION 2c: Modify batch_process function signature & add LoRA management ---
+# --- Modify batch_process function signature & add model switch check ---
 def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n_prompt, seed, use_random_seed, total_second_length,
                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold,
                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
@@ -1758,15 +2203,25 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                   lora_scale=1.0, batch_use_multiline_prompts=False,
                   batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False,
                   rife_enabled=False, rife_multiplier="2x FPS",
-                  selected_lora_dropdown_value="None"): # <-- Added this arg, removed selected_lora path arg
+                  selected_lora_dropdown_value="None",
+                  # --- ADDED ---
+                  selected_model_display_name=DEFAULT_MODEL_NAME):
 
-    global stream, batch_stop_requested, currently_loaded_lora_info # Need global state access
+    global stream, batch_stop_requested, currently_loaded_lora_info, active_model_name # Need global state access
 
     print("Resetting batch stop flag.")
     batch_stop_requested = False
 
-    # --- MANAGE LORA STRUCTURE (ONCE FOR BATCH) --- (MODIFICATION 2c)
+    # --- CHECK AND SWITCH MODEL (if necessary) ---
+    # Assume model switch happened via UI before starting batch
+    if selected_model_display_name != active_model_name:
+         print(f"Warning: Selected batch model '{selected_model_display_name}' differs from active model '{active_model_name}'. Using the active model for the entire batch.")
+    current_active_model = active_model_name # Use the globally set active model for the whole batch
+    # --- END MODEL CHECK ---
+
+    # --- MANAGE LORA STRUCTURE (ONCE FOR BATCH) ---
     try:
+        # Ensure transformer is on CPU before managing LoRA
         manage_lora_structure(selected_lora_dropdown_value)
     except RuntimeError as e:
          print(f"LoRA Management Error during batch setup: {e}")
@@ -1787,14 +2242,14 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
     if batch_end_frame_folder and not use_end_frames:
          print(f"Warning: End frame folder provided but not found or not a directory: {batch_end_frame_folder}. Proceeding without end frames.")
 
-    image_files = get_images_from_folder(input_folder)
+    image_files = get_images_from_folder(input_folder) # Uses natsorted now
     if not image_files:
         return None, f"No image files found in {input_folder}", "", "", gr.update(interactive=True), gr.update(interactive=False), seed, ""
 
-    yield None, None, f"Found {len(image_files)} images to process. End frames {'enabled' if use_end_frames else 'disabled'}.", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+    yield None, None, f"Found {len(image_files)} images to process using model '{current_active_model}'. End frames {'enabled' if use_end_frames else 'disabled'}.", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
 
     final_output = None
-    current_seed = seed
+    current_batch_seed = seed # Use a separate seed tracker for the batch
     current_adapter_name = currently_loaded_lora_info["adapter_name"] if currently_loaded_lora_info["adapter_name"] else "None"
 
 
@@ -1802,17 +2257,20 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
     for idx, image_path in enumerate(image_files):
         if batch_stop_requested:
             print("Batch stop requested. Exiting batch process.")
-            yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+            yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed, ""
             return
 
         start_image_basename = os.path.basename(image_path)
         output_filename_base = os.path.splitext(start_image_basename)[0]
 
-        current_prompt_text = prompt
+        current_prompt_text = prompt # Default prompt
         custom_prompt = get_prompt_from_txt_file(image_path)
         if custom_prompt:
             current_prompt_text = custom_prompt
             print(f"Using custom prompt from txt file for {image_path}")
+        else:
+            print(f"Using default batch prompt for {image_path}")
+
 
         if batch_use_multiline_prompts:
             potential_lines = current_prompt_text.split('\n')
@@ -1826,19 +2284,44 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
 
         total_prompts_or_loops = len(prompt_lines_or_fulltext)
 
+        # --- Skip Check Logic ---
         skip_this_image = False
         if skip_existing:
-            output_check_base = os.path.join(output_folder, f"{output_filename_base}")
+            # Check for the first potential output file's existence
+            # Needs to account for multi-prompt and multi-generation naming
+            first_prompt_idx = 0
+            first_gen_idx = 1 # Generations are 1-based in naming
+            output_check_suffix = ""
             if batch_use_multiline_prompts:
-                output_check_path = f"{output_check_base}_p1{'_g1' if num_generations > 1 else ''}.mp4"
+                 output_check_suffix += f"_p{first_prompt_idx+1}"
+            if num_generations > 1:
+                 output_check_suffix += f"_g{first_gen_idx}"
+            elif not batch_use_multiline_prompts and num_generations > 1 : # Original naming for single prompt multi-gen
+                 output_check_suffix += f"_{first_gen_idx}"
+
+            # Check for MP4, WebM (if web_compatible), and maybe RIFE output
+            output_check_mp4 = os.path.join(output_folder, f"{output_filename_base}{output_check_suffix}.mp4")
+            output_check_webm = os.path.join(output_folder, f"{output_filename_base}{output_check_suffix}.webm")
+            output_check_rife = os.path.join(output_folder, f"{output_filename_base}{output_check_suffix}_extra_FPS.mp4")
+
+            exists_mp4 = os.path.exists(output_check_mp4)
+            exists_webm = video_quality == 'web_compatible' and os.path.exists(output_check_webm)
+            exists_rife = rife_enabled and os.path.exists(output_check_rife)
+
+            # Skip if the expected primary output exists (or RIFE if enabled)
+            if rife_enabled:
+                 skip_this_image = exists_rife or exists_mp4 # Skip if RIFE exists, or base MP4 if RIFE failed/not run yet
+            elif video_quality == 'web_compatible':
+                 skip_this_image = exists_webm or exists_mp4 # Skip if WebM exists, or base MP4 otherwise
             else:
-                 output_check_path = f"{output_check_base}{'_1' if num_generations > 1 else ''}.mp4"
-            skip_this_image = os.path.exists(output_check_path)
+                 skip_this_image = exists_mp4 # Skip if MP4 exists
 
         if skip_this_image:
             print(f"Skipping {image_path} - output already exists")
-            yield None, None, f"Skipping {idx+1}/{len(image_files)}: {start_image_basename} - already processed", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+            yield None, None, f"Skipping {idx+1}/{len(image_files)}: {start_image_basename} - already processed", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed, ""
             continue
+        # --- End Skip Check ---
+
 
         try:
             img = Image.open(image_path)
@@ -1848,12 +2331,13 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
             print(f"Loaded start image {image_path} with shape {input_image.shape} and dtype {input_image.dtype}")
         except Exception as e:
             print(f"Error loading start image {image_path}: {str(e)}")
-            yield None, None, f"Error processing {idx+1}/{len(image_files)}: {start_image_basename} - {str(e)}", "", gr.update(interactive=False), gr.update(interactive=True), seed, ""
+            yield None, None, f"Error processing {idx+1}/{len(image_files)}: {start_image_basename} - {str(e)}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed, ""
             continue
 
         current_end_image = None
         end_image_path_str = "None"
         if use_end_frames:
+            # Try matching filename exactly in the end frame folder
             potential_end_path = os.path.join(batch_end_frame_folder, start_image_basename)
             if os.path.exists(potential_end_path):
                 try:
@@ -1865,81 +2349,113 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                     end_image_path_str = potential_end_path
                 except Exception as e:
                     print(f"Error loading end image {potential_end_path}: {str(e)}. Processing without end frame.")
+                    current_end_image = None # Ensure it's None on error
             else:
                  print(f"No matching end frame found for {start_image_basename} in {batch_end_frame_folder}")
 
 
-        # --- INNER PROMPT LOOP (if multi-line enabled) ---
+        # --- INNER PROMPT LOOP (if multi-line enabled for batch) ---
         for prompt_idx, current_prompt_segment in enumerate(prompt_lines_or_fulltext):
             if batch_stop_requested:
                 print("Batch stop requested during prompt loop. Exiting batch process.")
-                yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+                yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed, ""
                 return
 
-            generation_count_for_image = 0
+            # Handle seed for this image/prompt combination
+            seed_for_this_prompt = current_batch_seed
             if use_random_seed:
-                current_seed = random.randint(1, 2147483647)
-                yield None, None, f"Using new random seed {current_seed} for prompt {prompt_idx+1}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, ""
-            elif prompt_idx > 0:
-                 current_seed += 1
+                # Use a new random seed for each image/prompt combo if random is checked
+                seed_for_this_prompt = random.randint(1, 2147483647)
+            elif idx > 0 or prompt_idx > 0:
+                # Increment seed from the previous image/prompt unless it's the very first one
+                 seed_for_this_prompt = current_batch_seed + (idx * total_prompts_or_loops) + prompt_idx
+
+            current_batch_seed_display = seed_for_this_prompt # Use this for UI display and worker
 
             prompt_info = ""
             if batch_use_multiline_prompts:
                 prompt_info = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops}: {current_prompt_segment[:30]}{'...' if len(current_prompt_segment) > 30 else ''})"
-            elif not batch_use_multiline_prompts:
-                 prompt_info = " (Processing full text - potential timestamps)"
+            elif not batch_use_multiline_prompts and custom_prompt:
+                 prompt_info = " (Using .txt prompt - potential timestamps)"
+            elif not batch_use_multiline_prompts and not custom_prompt:
+                 prompt_info = " (Using default prompt - potential timestamps)"
 
-            yield None, None, f"Processing {idx+1}/{len(image_files)}: {start_image_basename} (End: {os.path.basename(end_image_path_str) if current_end_image is not None else 'No'}) with {num_generations} generation(s){prompt_info}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, ""
+
+            yield None, None, f"Processing {idx+1}/{len(image_files)}: {start_image_basename} ({current_active_model}, End: {os.path.basename(end_image_path_str) if current_end_image is not None else 'No'}) with {num_generations} generation(s){prompt_info}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, ""
 
 
-            gen_start_time_batch = time.time() # Track start time for metadata
+            gen_start_time_batch = time.time() # Track start time for metadata for this image/prompt
 
             stream = AsyncStream()
 
-            batch_individual_frames_folder = None
-            batch_intermediate_individual_frames_folder = None
-            batch_last_frames_folder = None
-            batch_intermediate_last_frames_folder = None
-            if batch_save_individual_frames or batch_save_intermediate_frames or batch_save_last_frame:
-                batch_individual_frames_folder = os.path.join(output_folder, 'individual_frames')
-                batch_intermediate_individual_frames_folder = os.path.join(batch_individual_frames_folder, 'intermediate_videos')
-                batch_last_frames_folder = os.path.join(output_folder, 'last_frames')
-                batch_intermediate_last_frames_folder = os.path.join(batch_last_frames_folder, 'intermediate_videos')
-                os.makedirs(batch_individual_frames_folder, exist_ok=True)
-                os.makedirs(batch_intermediate_individual_frames_folder, exist_ok=True)
-                os.makedirs(batch_last_frames_folder, exist_ok=True)
-                os.makedirs(batch_intermediate_last_frames_folder, exist_ok=True)
-                print(f"Created frames folders for batch output in: {output_folder}")
+            # --- Setup batch-specific output folders for frames ---
+            # This part seems complex to override globally. The worker uses global paths.
+            # For batch, let's save frames relative to the batch output folder instead of the main outputs.
+            # We need to temporarily modify the global paths within the worker call.
 
-            def batch_worker_override(*args, **kwargs):
+            batch_individual_frames_folder_abs = None
+            batch_intermediate_individual_frames_folder_abs = None
+            batch_last_frames_folder_abs = None
+            batch_intermediate_last_frames_folder_abs = None
+
+            override_paths_needed = batch_save_individual_frames or batch_save_intermediate_frames or batch_save_last_frame
+            if override_paths_needed:
+                batch_base_frame_folder = os.path.join(output_folder, "frames_output") # Central folder for frames in batch output
+                batch_individual_frames_folder_abs = os.path.join(batch_base_frame_folder, 'individual_frames')
+                batch_intermediate_individual_frames_folder_abs = os.path.join(batch_individual_frames_folder_abs, 'intermediate_videos')
+                batch_last_frames_folder_abs = os.path.join(batch_base_frame_folder, 'last_frames')
+                batch_intermediate_last_frames_folder_abs = os.path.join(batch_last_frames_folder_abs, 'intermediate_videos')
+                try: # Create these folders within the batch output directory
+                    os.makedirs(batch_individual_frames_folder_abs, exist_ok=True)
+                    os.makedirs(batch_intermediate_individual_frames_folder_abs, exist_ok=True)
+                    os.makedirs(batch_last_frames_folder_abs, exist_ok=True)
+                    os.makedirs(batch_intermediate_last_frames_folder_abs, exist_ok=True)
+                    print(f"Created/Ensured batch frame output folders in: {batch_base_frame_folder}")
+                except Exception as e:
+                     print(f"Error creating batch frame folders: {e}")
+                     override_paths_needed = False # Disable override if folders can't be made
+
+            # Wrapper function to temporarily change global paths for the worker
+            def batch_worker_path_override(*args, **kwargs):
                 global individual_frames_folder, intermediate_individual_frames_folder, last_frames_folder, intermediate_last_frames_folder
+                # Store original global paths
                 orig_individual_frames = individual_frames_folder
                 orig_intermediate_individual_frames = intermediate_individual_frames_folder
                 orig_last_frames = last_frames_folder
                 orig_intermediate_last_frames = intermediate_last_frames_folder
-                if batch_individual_frames_folder:
-                    individual_frames_folder = batch_individual_frames_folder
-                    intermediate_individual_frames_folder = batch_intermediate_individual_frames_folder
-                    last_frames_folder = batch_last_frames_folder
-                    intermediate_last_frames_folder = batch_intermediate_last_frames_folder
+
+                # Override with batch-specific absolute paths
+                individual_frames_folder = batch_individual_frames_folder_abs
+                intermediate_individual_frames_folder = batch_intermediate_individual_frames_folder_abs
+                last_frames_folder = batch_last_frames_folder_abs
+                intermediate_last_frames_folder = batch_intermediate_last_frames_folder_abs
+                print(f"Worker override: Using batch frame paths rooted at {output_folder}")
                 try:
+                    # Call the original worker function with all arguments
                     result = worker(*args, **kwargs)
                     return result
                 finally:
-                    if batch_individual_frames_folder:
-                        individual_frames_folder = orig_individual_frames
-                        intermediate_individual_frames_folder = orig_intermediate_individual_frames
-                        last_frames_folder = orig_last_frames
-                        intermediate_last_frames_folder = orig_intermediate_last_frames
+                    # Restore original global paths crucial!
+                    individual_frames_folder = orig_individual_frames
+                    intermediate_individual_frames_folder = orig_intermediate_individual_frames
+                    last_frames_folder = orig_last_frames
+                    intermediate_last_frames_folder = orig_intermediate_last_frames
+                    print("Worker override: Restored global frame paths.")
 
-            override_needed = batch_save_individual_frames or batch_save_intermediate_frames or batch_save_last_frame
+            worker_function_to_call = batch_worker_path_override if override_paths_needed else worker
+            # --- End path override setup ---
 
-            # --- MODIFIED WORKER CALL (BATCH) --- (MODIFICATION 2c)
-            async_run(batch_worker_override if override_needed else worker,
-                    input_image, current_end_image, current_prompt_segment, n_prompt, current_seed, use_random_seed,
+
+            # --- MODIFIED WORKER CALL (BATCH - Add active_model) ---
+            async_run(worker_function_to_call,
+                    input_image, current_end_image, current_prompt_segment, n_prompt,
+                    current_batch_seed_display, # Use the seed calculated for this specific task
+                    False, # Use fixed seed for each generation within the same image/prompt
                     total_second_length, latent_window_size, steps, cfg, gs, rs,
                     gpu_memory_preservation, teacache_threshold, video_quality, export_gif,
-                    export_apng, export_webp, num_generations=num_generations, resolution=resolution, fps=fps,
+                    export_apng, export_webp,
+                    num_generations=num_generations, # Pass the per-image generation count
+                    resolution=resolution, fps=fps,
                     # --- LoRA Args Changed ---
                     adapter_name_to_use=current_adapter_name, # Pass name
                     lora_scale=lora_scale,                   # Keep scale
@@ -1947,62 +2463,90 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                     save_individual_frames_flag=batch_save_individual_frames,
                     save_intermediate_frames_flag=batch_save_intermediate_frames,
                     save_last_frame_flag=batch_save_last_frame,
+                    # Pass batch multi-line flag to worker to potentially adjust timestamp parsing logic if needed (though it currently doesn't)
                     use_multiline_prompts_flag=batch_use_multiline_prompts,
-                    rife_enabled=rife_enabled, rife_multiplier=rife_multiplier)
+                    rife_enabled=rife_enabled, rife_multiplier=rife_multiplier,
+                    # --- ADDED ---
+                    active_model=current_active_model
+                   )
             # --- END MODIFIED WORKER CALL (BATCH) ---
 
 
-            output_filename = None
-            last_output = None
-            all_outputs = {}
+            output_filename_from_worker = None
+            last_output_for_ui = None
+            all_outputs_for_image = {} # Track outputs for this specific image/prompt
+            generation_count_this_prompt = 0
 
             # --- WORKER LISTENING LOOP ---
             while True:
                 if batch_stop_requested:
                      print("Batch stop requested while waiting for worker. Ending loop.")
+                     if stream: stream.input_queue.push('end') # Signal worker to stop if running
                      break
                 flag, data = stream.output_queue.next()
 
-                if flag is None: continue
+                if flag is None: continue # Should not happen with Queue.get()
 
                 if flag == 'seed_update':
-                    current_seed = data
-                    yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_seed, gr.update()
+                    # Worker updates seed internally for its generations. Update UI display.
+                    current_batch_seed_display = data
+                    yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), current_batch_seed_display, gr.update()
 
                 if flag == 'final_seed':
-                     pass
+                     # Worker finished its generations for this image/prompt.
+                     # The seed might have incremented if num_generations > 1.
+                     # We need this final seed if we continue to the next image/prompt non-randomly.
+                     # current_batch_seed = data # Update the main batch seed tracker ONLY if not random
+                     pass # Let the outer loop handle seed incrementing based on idx/prompt_idx
 
                 if flag == 'file':
-                    output_filename = data
-                    if output_filename:
-                        is_intermediate = 'intermediate' in output_filename
+                    output_filename_from_worker = data # MP4 or WebM from worker's *final* step for a generation
+                    if output_filename_from_worker:
+                        is_intermediate = 'intermediate' in output_filename_from_worker # Check if it's an intermediate save from worker loop
                         if not is_intermediate:
-                            generation_count_for_image += 1
+                            generation_count_this_prompt += 1
+
+                            # --- Construct final output filename for batch ---
+                            output_file_suffix = ""
                             if batch_use_multiline_prompts:
-                                suffix = f"_p{prompt_idx+1}" + (f"_g{generation_count_for_image}" if num_generations > 1 else "")
-                            else:
-                                suffix = f"_{generation_count_for_image}" if num_generations > 1 else ""
-                            modified_image_filename_base = f"{output_filename_base}{suffix}"
+                                output_file_suffix += f"_p{prompt_idx+1}"
+                            if num_generations > 1:
+                                # Use the per-prompt generation count
+                                output_file_suffix += f"_g{generation_count_this_prompt}"
+                            elif not batch_use_multiline_prompts and num_generations > 1: # Original naming convention
+                                output_file_suffix += f"_{generation_count_this_prompt}"
 
-                            moved_file = move_and_rename_output_file(output_filename, output_folder, f"{modified_image_filename_base}.mp4")
-                            if moved_file:
-                                output_key = f'mp4_{generation_count_for_image}' if num_generations > 1 else 'mp4'
-                                all_outputs[output_key] = moved_file
-                                last_output = moved_file
-                                final_output = moved_file
+                            final_output_filename_base = f"{output_filename_base}{output_file_suffix}"
+                            # --- End filename construction ---
+
+                            # Move/Copy the primary file (MP4 or WebM)
+                            moved_primary_file = move_and_rename_output_file(
+                                output_filename_from_worker,
+                                output_folder,
+                                f"{final_output_filename_base}{os.path.splitext(output_filename_from_worker)[1]}" # Keep original extension
+                            )
+
+                            if moved_primary_file:
+                                output_key = f'primary_{generation_count_this_prompt}' if num_generations > 1 else 'primary'
+                                all_outputs_for_image[output_key] = moved_primary_file
+                                last_output_for_ui = moved_primary_file # Update UI with the latest primary file
+                                final_output = moved_primary_file # Track the very last primary file generated
+
                                 prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if batch_use_multiline_prompts else ""
-                                yield last_output, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generated video {generation_count_for_image}/{num_generations}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                                yield last_output_for_ui, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} ({current_active_model}) - Generated video {generation_count_this_prompt}/{num_generations}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, gr.update()
 
-                                # --- MODIFICATION 2c: Update Metadata Saving ---
+                                # --- Metadata Saving for Batch ---
                                 if save_metadata:
                                     gen_time_batch_current = time.time() - gen_start_time_batch
                                     generation_time_seconds = int(gen_time_batch_current)
                                     generation_time_formatted = format_time_human_readable(gen_time_batch_current)
                                     metadata = {
-                                        "Prompt": current_prompt_segment,
+                                        "Model": current_active_model, # <-- ADDED MODEL NAME
+                                        "Prompt": current_prompt_segment, # Use the specific prompt segment
                                         "Negative Prompt": n_prompt,
-                                        "Seed": current_seed,
-                                        "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0 else "Disabled",
+                                        # Use the seed worker actually used for this generation
+                                        "Seed": current_batch_seed_display + (generation_count_this_prompt - 1) if not use_random_seed else "Random", # Estimate seed if fixed
+                                        "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0.0 else "Disabled",
                                         "Video Length (seconds)": total_second_length,
                                         "FPS": fps,
                                         "Latent Window Size": latent_window_size,
@@ -2016,108 +2560,135 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         "Start Frame": image_path,
                                         "End Frame": end_image_path_str if current_end_image is not None else "None",
                                         "Multi-line Prompts Mode": batch_use_multiline_prompts,
+                                        "Generation Index": f"{generation_count_this_prompt}/{num_generations}",
                                     }
                                     if not batch_use_multiline_prompts:
-                                         metadata["Timestamped Prompts Parsed"] = "[Check Worker Logs]"
+                                         metadata["Timestamped Prompts Parsed"] = "[Check Worker Logs]" # Indicate worker handled it
                                     if batch_use_multiline_prompts:
                                         metadata["Prompt Number"] = f"{prompt_idx+1}/{total_prompts_or_loops}"
 
-                                    # --- Use current_adapter_name for Metadata ---
                                     if current_adapter_name != "None":
                                         metadata["LoRA"] = current_adapter_name
                                         metadata["LoRA Scale"] = lora_scale
-                                    # --- End Metadata Update ---
-                                    save_processing_metadata(moved_file, metadata)
-                                # --- End Metadata Saving Update ---
 
-                                # Handle other formats
-                                if export_gif:
-                                    gif_filename = os.path.splitext(output_filename)[0] + '.gif'
-                                    moved_gif = move_and_rename_output_file(gif_filename, output_folder, f"{modified_image_filename_base}.gif")
-                                    if moved_gif and save_metadata: save_processing_metadata(moved_gif, metadata)
-                                if export_apng:
-                                    apng_filename = os.path.splitext(output_filename)[0] + '.png'
-                                    moved_apng = move_and_rename_output_file(apng_filename, output_folder, f"{modified_image_filename_base}.png")
-                                    if moved_apng and save_metadata: save_processing_metadata(moved_apng, metadata)
-                                if export_webp:
-                                    webp_filename = os.path.splitext(output_filename)[0] + '.webp'
-                                    moved_webp = move_and_rename_output_file(webp_filename, output_folder, f"{modified_image_filename_base}.webp")
-                                    if moved_webp and save_metadata: save_processing_metadata(moved_webp, metadata)
-                                if video_quality == 'web_compatible':
-                                    webm_filename = os.path.splitext(output_filename)[0] + '.webm'
-                                    moved_webm = move_and_rename_output_file(webm_filename, output_folder, f"{modified_image_filename_base}.webm")
-                                    if moved_webm:
-                                        if save_metadata: save_processing_metadata(moved_webm, metadata)
-                                        last_output = moved_webm
-                                        final_output = moved_webm
+                                    save_processing_metadata(moved_primary_file, metadata.copy()) # Save for primary file
 
-                                # Move RIFE file
-                                rife_original_path = os.path.splitext(output_filename)[0] + '_extra_FPS.mp4'
-                                if os.path.exists(rife_original_path):
-                                    rife_target_filename = f"{modified_image_filename_base}_extra_FPS.mp4"
-                                    rife_target_path = os.path.join(output_folder, rife_target_filename)
-                                    try:
-                                        shutil.copy2(rife_original_path, rife_target_path)
-                                        print(f"Copied RIFE enhanced file to batch outputs: {rife_target_path}")
-                                        if rife_enabled:
-                                            last_output = rife_target_path
+                                    # --- Save Metadata for Other Formats ---
+                                    worker_output_base = os.path.splitext(output_filename_from_worker)[0]
+                                    target_output_base = os.path.join(output_folder, final_output_filename_base)
+
+                                    # GIF
+                                    gif_original_path = f"{worker_output_base}.gif"
+                                    if export_gif and os.path.exists(gif_original_path):
+                                        moved_gif = move_and_rename_output_file(gif_original_path, output_folder, f"{final_output_filename_base}.gif")
+                                        if moved_gif: save_processing_metadata(moved_gif, metadata.copy())
+                                    # APNG
+                                    apng_original_path = f"{worker_output_base}.png"
+                                    if export_apng and os.path.exists(apng_original_path):
+                                         moved_apng = move_and_rename_output_file(apng_original_path, output_folder, f"{final_output_filename_base}.png")
+                                         if moved_apng: save_processing_metadata(moved_apng, metadata.copy())
+                                    # WebP
+                                    webp_original_path = f"{worker_output_base}.webp"
+                                    if export_webp and os.path.exists(webp_original_path):
+                                         moved_webp = move_and_rename_output_file(webp_original_path, output_folder, f"{final_output_filename_base}.webp")
+                                         if moved_webp: save_processing_metadata(moved_webp, metadata.copy())
+                                    # WebM (if not primary)
+                                    webm_original_path = f"{worker_output_base}.webm"
+                                    if video_quality == 'web_compatible' and moved_primary_file != webm_original_path and os.path.exists(webm_original_path):
+                                         moved_webm = move_and_rename_output_file(webm_original_path, output_folder, f"{final_output_filename_base}.webm")
+                                         if moved_webm: save_processing_metadata(moved_webm, metadata.copy())
+                                    # RIFE
+                                    rife_original_path = f"{worker_output_base}_extra_FPS.mp4"
+                                    if rife_enabled and os.path.exists(rife_original_path):
+                                        rife_target_path = f"{target_output_base}_extra_FPS.mp4"
+                                        try:
+                                            shutil.copy2(rife_original_path, rife_target_path)
+                                            print(f"Copied RIFE enhanced file to batch outputs: {rife_target_path}")
+                                            save_processing_metadata(rife_target_path, metadata.copy())
+                                            # Update UI only if RIFE is the intended final output
+                                            last_output_for_ui = rife_target_path
                                             final_output = rife_target_path
-                                            print(f"Using RIFE-enhanced video as the display output: {rife_target_path}")
-                                    except Exception as e:
-                                        print(f"Error copying RIFE enhanced file to {rife_target_path}: {str(e)}")
-                        else: # Intermediate file
+                                        except Exception as e:
+                                            print(f"Error copying RIFE enhanced file to {rife_target_path}: {str(e)}")
+                                # --- End Metadata Saving for Other Formats ---
+                            else:
+                                 print(f"ERROR: Failed to move/rename output file {output_filename_from_worker}")
+                                 # Keep UI showing previous success if any
+                                 yield last_output_for_ui, gr.update(visible=False), f"Error saving output for {idx+1}/{len(image_files)}: {start_image_basename}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, gr.update()
+
+                        else: # Intermediate file from worker - display it but don't move/save metadata yet
                             prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})" if batch_use_multiline_prompts else ""
-                            yield output_filename, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} - Generating intermediate result{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                            yield output_filename_from_worker, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename} ({current_active_model}) - Generating intermediate result{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, gr.update()
 
                 if flag == 'progress':
                     preview, desc, html = data
-                    current_progress = f"Processing {idx+1}/{len(image_files)}: {start_image_basename}"
+                    # Add batch progress info
+                    batch_prog_info = f"Processing {idx+1}/{len(image_files)}: {start_image_basename} ({current_active_model}"
                     if batch_use_multiline_prompts:
-                        prompt_status = f" (Prompt {prompt_idx+1}/{total_prompts_or_loops})"
-                        current_progress += prompt_status
-                    if desc: current_progress += f" - {desc}"
-                    progress_html = html if html else make_progress_bar_html(0, f"Processing file {idx+1} of {len(image_files)}")
-                    if batch_use_multiline_prompts and html:
-                        import re
-                        hint_match = re.search(r'>(.*?)<br', html)
-                        if hint_match:
-                            hint = hint_match.group(1)
-                            new_hint = f"{hint} (Prompt {prompt_idx+1}/{total_prompts_or_loops})"
-                            progress_html = html.replace(hint, new_hint)
-                    video_update = last_output if last_output else gr.update()
-                    yield video_update, gr.update(visible=True, value=preview), current_progress, progress_html, gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
+                        batch_prog_info += f", Prompt {prompt_idx+1}/{total_prompts_or_loops}"
+                    batch_prog_info += ")"
+
+                    current_progress_desc = f"{batch_prog_info} - {desc}" if desc else batch_prog_info
+                    progress_html = html if html else make_progress_bar_html(0, batch_prog_info)
+
+                    # Add batch info to HTML hint
+                    if html:
+                         import re
+                         hint_match = re.search(r'>(.*?)<br', html)
+                         if hint_match:
+                              hint = hint_match.group(1)
+                              new_hint = f"{hint} [{idx+1}/{len(image_files)}]"
+                              if batch_use_multiline_prompts: new_hint += f"[P{prompt_idx+1}]"
+                              escaped_hint = re.escape(hint)
+                              progress_html = re.sub(f">{escaped_hint}<br", f">{new_hint}<br", html, count=1)
+                         else:
+                             progress_html += f"<span>{batch_prog_info}</span>"
+
+
+                    video_update = last_output_for_ui if last_output_for_ui else gr.update()
+                    yield video_update, gr.update(visible=True, value=preview), current_progress_desc, progress_html, gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, gr.update()
 
                 if flag == 'end':
-                    video_update = last_output if last_output else gr.update()
-                    if prompt_idx == len(prompt_lines_or_fulltext) - 1:
-                        yield video_update, gr.update(visible=False), f"Completed {idx+1}/{len(image_files)}: {start_image_basename}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
-                    else:
+                    # Worker finished for this image/prompt/(all generations)
+                    video_update = last_output_for_ui if last_output_for_ui else gr.update()
+                    if prompt_idx == len(prompt_lines_or_fulltext) - 1: # Last prompt for this image
+                        yield video_update, gr.update(visible=False), f"Completed {idx+1}/{len(image_files)}: {start_image_basename} ({current_active_model})", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, gr.update()
+                    else: # More prompts for this image
                         prompt_status = f" (Completed prompt {prompt_idx+1}/{total_prompts_or_loops}, continuing to next prompt)"
-                        yield video_update, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_seed, gr.update()
-                    break # End loop for this prompt/text
+                        yield video_update, gr.update(visible=False), f"Processing {idx+1}/{len(image_files)}: {start_image_basename}{prompt_status}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, gr.update()
+                    break # End listening loop for this worker instance
             # --- END WORKER LISTENING LOOP ---
 
             if batch_stop_requested:
                 print("Batch stop requested after worker finished. Exiting batch process.")
-                yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+                yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed_display, ""
                 return
 
+            # Increment seed for next prompt if not random (handled inside loop now)
+
             if not batch_use_multiline_prompts:
-                 break
+                 break # Only one loop if not using multi-line
         # --- END INNER PROMPT LOOP ---
+
+        # Increment seed for the next image if not random
+        # Base seed for next image = initial seed + num images processed so far
+        # This ensures restarting batch uses predictable seeds if initial seed is the same.
+        if not use_random_seed:
+             current_batch_seed = seed + (idx + 1) # Increment base seed for next image
 
         if batch_stop_requested:
             print("Batch stop requested after inner loop. Exiting batch process.")
-            yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+            yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed_display, ""
             return
     # --- END OUTER BATCH LOOP ---
 
     if not batch_stop_requested:
-        yield final_output, gr.update(visible=False), f"Batch processing complete. Processed {len(image_files)} images.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+        yield final_output, gr.update(visible=False), f"Batch processing complete. Processed {len(image_files)} images using {current_active_model}.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed_display, ""
     else:
-         yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_seed, ""
+         yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed_display, ""
 
 
+# --- end_process remains unchanged ---
 def end_process():
     global batch_stop_requested # Declare intent to modify global flag
     print("\nSending end generation signal...")
@@ -2142,7 +2713,7 @@ quick_prompts = [
 ]
 quick_prompts = [[x] for x in quick_prompts]
 
-# --- Function to auto-set Latent Window Size ---
+# --- Function to auto-set Latent Window Size --- (Unchanged)
 def auto_set_window_size(fps_val: int, current_lws: int):
     """Calculates Latent Window Size for ~1 second sections."""
     if not isinstance(fps_val, int) or fps_val <= 0:
@@ -2178,25 +2749,37 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V45 - https://www.patreon.com/posts/126855226')
+    gr.Markdown('# FramePack Improved SECourses App V45+F1 - https://www.patreon.com/posts/126855226') # Updated Title
+    with gr.Row():
+        # --- Model Selector ---
+        model_selector = gr.Radio(
+            label="Select Model",
+            choices=[MODEL_DISPLAY_NAME_ORIGINAL, MODEL_DISPLAY_NAME_F1],
+            value=active_model_name, # Use the globally loaded default
+            info="Choose the generation model. Switching will unload the current model and load the new one."
+        )
+        model_status = gr.Markdown(f"Active model: **{active_model_name}**")
+        # --- End Model Selector ---
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
-                with gr.Tab("Single Image"):
+                with gr.Tab("Single Image / Multi-Prompt"): # Renamed slightly
                     with gr.Row():
                         with gr.Column():
                             input_image = gr.Image(sources='upload', type="numpy", label="Start Frame", height=320)
                         with gr.Column():
-                            end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional)", height=320)
+                            # End frame might be less effective with F1 but keep for Original
+                            end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional, Original Model primarily)", height=320)
 
                     with gr.Row():
                         iteration_info_display = gr.Markdown("Calculating generation info...", elem_id="iteration-info-display")
-                        auto_set_lws_button = gr.Button(value="Set Window for ~1s Sections", scale=1)
+                        auto_set_lws_button = gr.Button(value="Set Window for ~1s Sections (Original Model)", scale=1) # Clarified button purpose
 
-                    prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on")
+                    prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on. Applies to both models.")
                     with gr.Row():
-                        use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen. OFF: Try parsing '[secs] prompt' format.")
-                        latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunks. Affects section count and duration (see info above prompt).")
+                        use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen (new seed per line if random). OFF: Try parsing '[secs] prompt' format.")
+                        # Latent Window Size - Keep, might affect F1 loop length/speed balance too
+                        latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunk size. Affects section/loop count and duration (see info above prompt). Default 9 recommended.")
                     example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
                     example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
@@ -2211,20 +2794,20 @@ with block:
                         end_button = gr.Button(value="End Generation", interactive=False)
 
                 with gr.Tab("Batch Processing"):
-                    batch_input_folder = gr.Textbox(label="Input Folder Path (Start Frames)", info="Folder containing starting images to process")
-                    batch_end_frame_folder = gr.Textbox(label="End Frame Folder Path (Optional)", info="Folder containing matching end frames (same filename as start frame)")
+                    batch_input_folder = gr.Textbox(label="Input Folder Path (Start Frames)", info="Folder containing starting images to process (sorted naturally)")
+                    batch_end_frame_folder = gr.Textbox(label="End Frame Folder Path (Optional, Original Model primarily)", info="Folder containing matching end frames (same filename as start frame)")
                     batch_output_folder = gr.Textbox(label="Output Folder Path (optional)", info="Leave empty to use the default batch_outputs folder")
                     batch_prompt = gr.Textbox(label="Default Prompt", value='', lines=4, info="Used if no matching .txt file exists. Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF.")
 
                     with gr.Row():
-                        batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip files that already exist in the output folder")
+                        batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip images where the first expected output video already exists")
                         batch_save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
                         batch_use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line in prompt/.txt is a separate gen. OFF: Try parsing '[secs] prompt' format from full prompt/.txt.")
 
                     with gr.Row():
-                        batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
-                        batch_save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        batch_save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations (MP4 Only)", value=False, info="Save only the last frame of each MP4 generation to the last_frames folder")
+                        batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image (in batch_output/frames_output)")
+                        batch_save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images (in batch_output/frames_output)")
+                        batch_save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations (MP4 Only)", value=False, info="Save only the last frame of each MP4 generation (in batch_output/frames_output)")
 
                     with gr.Row():
                         batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
@@ -2236,33 +2819,36 @@ with block:
                         open_batch_output_folder = gr.Button(value="Open Output Folder")
 
 
-            with gr.Group():
+            with gr.Group("Common Settings"): # Group shared settings
                 with gr.Row():
-                    num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence (per prompt if multi-line is ON)")
+                    num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence (per image/prompt)")
                     resolution = gr.Dropdown(label="Resolution", choices=["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
 
                 with gr.Row():
-                    teacache_threshold = gr.Slider(label='TeaCache Threshold', minimum=0.0, maximum=0.5, value=0.15, step=0.01, info='0 = Disabled, 0.15 = Default. Higher values = more caching but potentially less detail.')
+                    # TeaCache - F1 Demo default is 0.15 (True). Let's use slider like original.
+                    teacache_threshold = gr.Slider(label='TeaCache Threshold', minimum=0.0, maximum=0.5, value=0.15, step=0.01, info='0 = Disabled, >0 = Enabled. Higher values = more caching but potentially less detail. Affects both models.')
                     seed = gr.Number(label="Seed", value=31337, precision=0)
-                    use_random_seed = gr.Checkbox(label="Random Seed", value=True, info="Use random seeds instead of incrementing")
+                    use_random_seed = gr.Checkbox(label="Random Seed", value=True, info="Use random seeds instead of fixed/incrementing")
 
-                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True) # Made visible for preset saving/loading
+                # Negative Prompt - Keep for Original Model, might have minor effect on F1 if CFG > 1?
+                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True, info="Used when CFG Scale > 1.0 (Primarily for Original Model)")
 
                 with gr.Row():
-                    fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Directly changes how many frames are generated, 60 will make double frames")
+                    fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Directly changes how many frames are generated")
                     total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
 
-
+                with gr.Row():
+                    steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Default 25 recommended for both models.')
+                    # GS - F1 Demo uses 10.0. Original uses 10.0. Keep common.
+                    gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Default 10.0 recommended for both models.')
 
                 with gr.Row():
-                    steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
-                    gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
+                    # CFG - F1 Demo uses 1.0. Original uses 1.0 but allows > 1 for neg prompt. Keep visible.
+                    cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=True, info='Needs > 1.0 for Negative Prompt. F1 model typically uses 1.0.')
+                    # RS - F1 Demo uses 0.0. Original uses 0.0. Keep common.
+                    rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=True, info='Default 0.0 recommended for both models.')
 
-                with gr.Row():
-                    cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=True, info='You need more than CFG 1 for negative prompts')
-                    rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=True)
-
-                gr.Markdown("### LoRA Settings")
+                gr.Markdown("### LoRA Settings (Applies to selected model)")
                 with gr.Row():
                     with gr.Column():
                         lora_options = scan_lora_files()
@@ -2271,21 +2857,24 @@ with block:
                         with gr.Row():
                              lora_refresh_btn = gr.Button(value="🔄 Refresh", scale=1)
                              lora_folder_btn = gr.Button(value="📁 Open Folder", scale=1)
-                        lora_scale = gr.Slider(label="LoRA Scale", minimum=0.0, maximum=9.0, value=1.0, step=0.01, info="Adjust the strength of the LoRA effect (0-2)")
+                        lora_scale = gr.Slider(label="LoRA Scale", minimum=0.0, maximum=9.0, value=1.0, step=0.01, info="Adjust the strength of the LoRA effect")
 
                 with gr.Row():
-                    gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower on big VRAM but you need to have it large enough to not use shared VRAM (on low VRAM machines) or it will be extremely slower)", minimum=0, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. Do not set this very low that will cause shared VRAM usage")
+                    # GPU Memory Preservation - Keep common setting
+                    gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB)", minimum=0, maximum=128, value=8, step=0.1, info="Memory to keep free on GPU (Low VRAM mode). Larger value causes slower speed but helps prevent OOM. Adjust based on Resolution and VRAM.")
 
                     def update_memory_for_resolution(res):
-                        if res == "1440": return 23
-                        if res == "1320": return 21
-                        if res == "1200": return 19
-                        if res == "1080": return 16
-                        elif res == "960": return 14
-                        elif res == "840": return 12
-                        elif res == "720": return 10
-                        elif res == "640": return 8
-                        else: return 6
+                        # Adjust defaults based on observation or keep simple mapping
+                        res_int = int(res)
+                        if res_int >= 1440: return 23
+                        elif res_int >= 1320: return 21
+                        elif res_int >= 1200: return 19
+                        elif res_int >= 1080: return 16
+                        elif res_int >= 960: return 14
+                        elif res_int >= 840: return 12
+                        elif res_int >= 720: return 10
+                        elif res_int >= 640: return 8
+                        else: return 6 # Default for lower resolutions
                     resolution.change(fn=update_memory_for_resolution, inputs=resolution, outputs=gpu_memory_preservation)
 
         with gr.Column(): # Right column for preview/results
@@ -2293,16 +2882,15 @@ with block:
             result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=True, height=512, loop=True)
             video_info = gr.HTML("<div id='video-info'>Generate a video to see information</div>")
             gr.Markdown('''
-            Note on Sampling: Due to inverted sampling, the end part of the video is generated first, and the start part last.
-            - **Start Frame Only:** If the start action isn't in the video initially, wait for the full generation.
-            - **Start and End Frames:** The model attempts a smooth transition. The end frame's influence appears early in the generation process.
-            - **Timestamp Prompts (Multi-line OFF):** Prompts like `[2] wave hello` trigger *after* 2 seconds have passed in the *final* video (meaning they are generated earlier in the process). Use the **Generation Info** (duration per section) above for timing estimates.
+            **Notes:**
+            - **Original Model:** Generates video back-to-front. Start frame appears late, end frame early. Uses overlapping windows. Timestamp prompts `[secs]` relate to *final* video time, estimated by section duration (see info above prompt).
+            - **FramePack F1 Model:** Extends video from the start frame. Start frame is always present. End frame is ignored or has minimal effect. Timestamp prompts `[secs]` relate to *final* video time.
             ''')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
             timing_display = gr.Markdown("", label="Time Information", elem_classes='no-generating-animation')
 
-            gr.Markdown("### Presets")
+            gr.Markdown("### Presets (Includes selected model)")
             with gr.Row():
                 preset_dropdown = gr.Dropdown(label="Select Preset", choices=scan_presets(), value=load_last_used_preset_name() or "Default")
                 preset_load_button = gr.Button(value="Load Preset")
@@ -2317,11 +2905,12 @@ with block:
                 open_outputs_btn = gr.Button(value="Open Generations Folder")
                 open_batch_outputs_btn = gr.Button(value="Open Batch Outputs Folder")
 
+            # Video Quality - Common setting
             video_quality = gr.Radio(
                 label="Video Quality",
                 choices=["high", "medium", "low", "web_compatible"],
                 value="high",
-                info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility"
+                info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility (MP4+WebM)"
             )
 
             gr.Markdown("### RIFE Frame Interpolation (MP4 Only)")
@@ -2330,33 +2919,38 @@ with block:
                 rife_multiplier = gr.Radio(choices=["2x FPS", "4x FPS"], label="RIFE FPS Multiplier", value="2x FPS", info="Choose the frame rate multiplication factor.")
 
             gr.Markdown("### Additional Export Formats")
-            gr.Markdown("Select additional formats to export alongside MP4:")
+            gr.Markdown("Select additional formats to export alongside MP4/WebM:")
             with gr.Row():
-                export_gif = gr.Checkbox(label="Export as GIF", value=False, info="Save animation as GIF (larger file size but widely compatible)")
-                export_apng = gr.Checkbox(label="Export as APNG", value=False, info="Save animation as Animated PNG (better quality than GIF but less compatible)")
-                export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP (good balance of quality and file size)")
+                export_gif = gr.Checkbox(label="Export as GIF", value=False, info="Save animation as GIF")
+                export_apng = gr.Checkbox(label="Export as APNG", value=False, info="Save animation as Animated PNG")
+                export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP")
 
 
+    # --- Update Preset Component Lists ---
     preset_components_list = [
+        model_selector, # ADDED
         use_multiline_prompts, save_metadata, save_individual_frames, save_intermediate_frames, save_last_frame,
         batch_skip_existing, batch_save_metadata, batch_use_multiline_prompts, batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame,
         num_generations, resolution, teacache_threshold, seed, use_random_seed, n_prompt, fps, total_second_length,
         latent_window_size, steps, gs, cfg, rs,
-        selected_lora, # Keep the dropdown component here for saving/loading its *value* (name)
+        selected_lora,
         lora_scale,
         gpu_memory_preservation, video_quality, rife_enabled, rife_multiplier, export_gif, export_apng, export_webp
     ]
     component_names_for_preset = [
+        "model_selector", # ADDED
         "use_multiline_prompts", "save_metadata", "save_individual_frames", "save_intermediate_frames", "save_last_frame",
         "batch_skip_existing", "batch_save_metadata", "batch_use_multiline_prompts", "batch_save_individual_frames", "batch_save_intermediate_frames", "batch_save_last_frame",
         "num_generations", "resolution", "teacache_threshold", "seed", "use_random_seed", "n_prompt", "fps", "total_second_length",
         "latent_window_size", "steps", "gs", "cfg", "rs",
-        "selected_lora", # The name matches the component
+        "selected_lora",
         "lora_scale",
         "gpu_memory_preservation", "video_quality", "rife_enabled", "rife_multiplier", "export_gif", "export_apng", "export_webp"
     ]
+    # --- End Preset Component List Update ---
 
-    # --- Preset Action Functions START ---
+
+    # --- Preset Action Functions START (Modified Load Action) ---
 
     def save_preset_action(name: str, *values):
         """Saves the current settings (*values) to a preset file."""
@@ -2380,59 +2974,123 @@ with block:
             presets = scan_presets()
             status_msg = f"Preset '{name}' saved successfully."
             print(status_msg)
+            # Return updates for dropdown and status message
             return gr.update(choices=presets, value=name), gr.update(value=status_msg)
         except Exception as e:
             error_msg = f"Error saving preset '{name}': {e}"
             print(error_msg)
+            # Return updates only for status message
             return gr.update(), gr.update(value=error_msg)
 
-    def load_preset_action(name: str):
-        """Loads settings from a preset file and updates the UI components."""
+
+    def load_preset_action(name: str, progress=gr.Progress()):
+        """Loads settings from a preset file, switches model if needed, and updates UI."""
+        global active_model_name # Need to potentially update this
+
+        progress(0, desc=f"Loading preset '{name}'...")
         preset_data = load_preset_data(name)
         if preset_data is None:
-             return [gr.update() for _ in preset_components_list] + [gr.update(value=f"Failed to load preset '{name}'.")]
+             error_msg = f"Failed to load preset '{name}'."
+             print(error_msg)
+             # Return updates for status message and model status (no change)
+             return [gr.update() for _ in preset_components_list] + [gr.update(value=error_msg), gr.update(value=f"Active model: **{active_model_name}**")] + [gr.update()]
 
+        # --- Model Switching from Preset ---
+        model_status_update = f"Active model: **{active_model_name}**" # Default status
+        preset_model = preset_data.get("model_selector", DEFAULT_MODEL_NAME)
+        if preset_model != active_model_name:
+             progress(0.1, desc=f"Preset requires model '{preset_model}'. Switching...")
+             print(f"Preset '{name}' requires model switch to '{preset_model}'.")
+             try:
+                 # Call the switch function
+                 new_active_model, switch_status_msg = switch_active_model(preset_model, progress=progress)
+                 # Update the global active_model_name if switch was successful (or reverted)
+                 active_model_name = new_active_model
+                 model_status_update = f"Status: {switch_status_msg}" # Show switch status
+                 # Update the preset data in case switch failed and reverted
+                 preset_data["model_selector"] = active_model_name
+                 print(f"Switch status: {switch_status_msg}")
+                 if "Error" in switch_status_msg or "CRITICAL" in switch_status_msg:
+                      # If switch failed, maybe don't apply the rest of the preset?
+                      # For now, proceed but the model might be wrong.
+                      pass
+             except Exception as switch_err:
+                  error_msg = f"Error switching model for preset: {switch_err}"
+                  print(error_msg)
+                  traceback.print_exc()
+                  model_status_update = f"Error switching model: {error_msg}. Model remains '{active_model_name}'."
+                  preset_data["model_selector"] = active_model_name # Ensure preset reflects reality
+        else:
+             progress(0.5, desc="Model already correct. Loading settings...")
+             print(f"Preset '{name}' uses the currently active model '{active_model_name}'.")
+             model_status_update = f"Active model: **{active_model_name}**" # Confirm active model
+        # --- End Model Switching ---
+
+
+        # --- Apply Preset Values to UI Components ---
         updates = []
-        found_lora = False
-        available_loras = [lora_name for lora_name, _ in scan_lora_files()]
-        loaded_values = {}
+        loaded_values: Dict[str, Any] = {} # Store loaded values for iteration info update
+        available_loras = [lora_name for lora_name, _ in scan_lora_files()] # Get current LoRAs
 
         for i, comp_name in enumerate(component_names_for_preset):
-            comp_initial_value = getattr(preset_components_list[i], 'value', None)
+            target_component = preset_components_list[i]
+            # Get the default value from the component instance if possible
+            comp_initial_value = getattr(target_component, 'value', None)
+
             if comp_name in preset_data:
                 value = preset_data[comp_name]
+                # Special handling for dropdowns to ensure value exists
                 if comp_name == "selected_lora":
-                    if value in available_loras:
-                        updates.append(gr.update(value=value))
-                        found_lora = True
-                    else:
-                        print(f"Warning: Saved LoRA '{value}' not found in current LoRA list. Setting to 'None'.")
+                    if value not in available_loras:
+                        print(f"Preset Warning: Saved LoRA '{value}' not found. Setting LoRA to 'None'.")
                         value = "None"
-                        updates.append(gr.update(value="None"))
-                else:
                     updates.append(gr.update(value=value))
-                loaded_values[comp_name] = value
+                elif comp_name == "model_selector":
+                     # Ensure the value matches the *actual* active model after potential switch attempt
+                     updates.append(gr.update(value=active_model_name))
+                     value = active_model_name # Use the confirmed active model name
+                elif comp_name == "resolution":
+                     # Ensure resolution value is valid
+                     valid_resolutions = [choice for choice in getattr(target_component,'choices', [])]
+                     if value not in valid_resolutions:
+                          print(f"Preset Warning: Saved resolution '{value}' not valid. Using default.")
+                          value = getattr(target_component, 'value', "640") # Use component default
+                     updates.append(gr.update(value=value))
+                else:
+                    # For other components, assume the value is valid
+                    updates.append(gr.update(value=value))
+                loaded_values[comp_name] = value # Store the value applied/used
             else:
-                 if comp_name not in preset_data:
-                     print(f"Warning: Key '{comp_name}' not found in preset '{name}'. Using component's current/default value.")
-                     updates.append(gr.update())
-                     loaded_values[comp_name] = getattr(preset_components_list[i], 'value', None)
+                 # Key missing in preset, keep component's current value
+                 print(f"Preset Warning: Key '{comp_name}' not found in preset '{name}'. Keeping current value.")
+                 updates.append(gr.update()) # No change update
+                 loaded_values[comp_name] = comp_initial_value # Store the default/current value
 
+        # Verify update list length
         if len(updates) != len(preset_components_list):
-             print(f"Error: Number of updates ({len(updates)}) does not match number of components ({len(preset_components_list)}).")
-             return [gr.update() for _ in preset_components_list] + [gr.update(value=f"Error applying preset '{name}'. Mismatch in component count.")] + [gr.update()]
+             error_msg = f"Error applying preset '{name}': Mismatch in component update count."
+             print(error_msg)
+             # Return error status and don't change components
+             return [gr.update() for _ in preset_components_list] + [gr.update(value=error_msg), gr.update(value=f"Active model: **{active_model_name}**")] + [gr.update()]
 
 
-        save_last_used_preset_name(name)
-        status_msg = f"Preset '{name}' loaded."
-        print(status_msg)
-
+        # --- Update Iteration Info Display based on loaded values ---
         vid_len = loaded_values.get('total_second_length', 5)
         fps_val = loaded_values.get('fps', 30)
         win_size = loaded_values.get('latent_window_size', 9)
+        # update_iteration_info uses the global active_model_name, which should be correct now
         info_text = update_iteration_info(vid_len, fps_val, win_size)
+        info_update = gr.update(value=info_text)
+        # --- End Iteration Info Update ---
 
-        return updates + [gr.update(value=status_msg)] + [gr.update(value=info_text)]
+        save_last_used_preset_name(name) # Save preset name as last used
+        status_msg = f"Preset '{name}' loaded."
+        print(status_msg)
+        preset_status_update = gr.update(value=status_msg)
+        model_status_update_gr = gr.update(value=model_status_update) # Use the status from model switching
+
+        # Return component updates, preset status, model status, iteration info
+        return updates + [preset_status_update, model_status_update_gr, info_update]
 
 
     def refresh_presets_action():
@@ -2447,53 +3105,55 @@ with block:
 
     # --- Gradio Event Wiring START ---
     lora_refresh_btn.click(fn=refresh_loras, outputs=[selected_lora])
-    lora_folder_btn.click(fn=lambda: open_folder(loras_folder), outputs=[gr.Text(visible=False)])
+    lora_folder_btn.click(fn=lambda: open_folder(loras_folder), inputs=None, outputs=None) # Simple lambda
 
-    # --- MODIFICATION 4a: Update ips list for process function ---
+    # --- Update ips list for process function (ADD model_selector) ---
     ips = [input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality, export_gif, export_apng, export_webp, save_metadata, resolution, fps,
-           # selected_lora (path) REMOVED here
-           lora_scale, # Keep scale
+           lora_scale,
            use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_last_frame, rife_enabled, rife_multiplier,
-           selected_lora # ADD the dropdown component itself here for its value
+           selected_lora, # LoRA dropdown component
+           model_selector # ADDED Model selector component
            ]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
 
-    end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
+    end_button.click(fn=end_process, inputs=None, outputs=[start_button, end_button, batch_start_button, batch_end_button], cancels=[]) # Add cancels=[]
 
-    open_outputs_btn.click(fn=lambda: open_folder(outputs_folder), outputs=gr.Text(visible=False))
-    open_batch_outputs_btn.click(fn=lambda: open_folder(outputs_batch_folder), outputs=gr.Text(visible=False))
+    open_outputs_btn.click(fn=lambda: open_folder(outputs_folder), inputs=None, outputs=None)
+    open_batch_outputs_btn.click(fn=lambda: open_folder(outputs_batch_folder), inputs=None, outputs=None)
 
-    batch_folder_status_text = gr.Text(visible=False)
-    open_batch_input_folder.click(fn=lambda x: open_folder(x) if x else "No input folder specified", inputs=[batch_input_folder], outputs=[batch_folder_status_text])
-    open_batch_end_folder.click(fn=lambda x: open_folder(x) if x else "No end frame folder specified", inputs=[batch_end_frame_folder], outputs=[batch_folder_status_text])
-    open_batch_output_folder.click(fn=lambda x: open_folder(x if x else outputs_batch_folder), inputs=[batch_output_folder], outputs=[batch_folder_status_text])
+    batch_folder_status_text = gr.Textbox(visible=False) # Use Textbox for status messages
+    open_batch_input_folder.click(fn=lambda x: open_folder(x) if x and os.path.isdir(x) else f"Folder not found or invalid: {x}", inputs=[batch_input_folder], outputs=[batch_folder_status_text])
+    open_batch_end_folder.click(fn=lambda x: open_folder(x) if x and os.path.isdir(x) else f"Folder not found or invalid: {x}", inputs=[batch_end_frame_folder], outputs=[batch_folder_status_text])
+    open_batch_output_folder.click(fn=lambda x: open_folder(x if x and os.path.isdir(x) else outputs_batch_folder), inputs=[batch_output_folder], outputs=[batch_folder_status_text])
 
-    # --- MODIFICATION 4b: Update batch_ips list for batch_process function ---
+
+    # --- Update batch_ips list for batch_process function (ADD model_selector) ---
     batch_ips = [batch_input_folder, batch_output_folder, batch_end_frame_folder, batch_prompt, n_prompt, seed, use_random_seed,
                  total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                  teacache_threshold, video_quality, export_gif, export_apng, export_webp, batch_skip_existing,
                  batch_save_metadata, num_generations, resolution, fps,
-                 # selected_lora (path) REMOVED here
-                 lora_scale, # Keep scale
+                 lora_scale,
                  batch_use_multiline_prompts,
                  batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame,
                  rife_enabled, rife_multiplier,
-                 selected_lora # ADD the dropdown component itself here for its value
+                 selected_lora, # LoRA dropdown component
+                 model_selector # ADDED Model selector component
                  ]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
 
-    batch_end_button.click(fn=end_process, outputs=[start_button, end_button, batch_start_button, batch_end_button])
+    batch_end_button.click(fn=end_process, inputs=None, outputs=[start_button, end_button, batch_start_button, batch_end_button], cancels=[]) # Add cancels=[]
 
-    # --- Preset Event Wiring START --- (No changes needed here)
+    # --- Preset Event Wiring START ---
     preset_save_button.click(
         fn=save_preset_action,
         inputs=[preset_save_name] + preset_components_list,
         outputs=[preset_dropdown, preset_status_display]
     )
+    # Update preset load to include model_status and iteration_info_display outputs
     preset_load_button.click(
         fn=load_preset_action,
         inputs=[preset_dropdown],
-        outputs=preset_components_list + [preset_status_display] + [iteration_info_display]
+        outputs=preset_components_list + [preset_status_display, model_status, iteration_info_display]
     )
     preset_refresh_button.click(
         fn=refresh_presets_action,
@@ -2502,7 +3162,7 @@ with block:
     )
     # --- Preset Event Wiring END ---
 
-    # --- Auto Set Latent Window Size Button Wiring --- (No changes needed here)
+    # --- Auto Set Latent Window Size Button Wiring --- (Unchanged)
     auto_set_lws_button.click(
         fn=auto_set_window_size,
         inputs=[fps, latent_window_size],
@@ -2510,78 +3170,145 @@ with block:
     )
     # --- End Auto Set Wiring ---
 
-    # --- Change Listeners for Iteration Info --- (No changes needed here)
+    # --- Change Listeners for Iteration Info START ---
+    # Update iteration info when model changes, or relevant params change
     iteration_info_inputs = [total_second_length, fps, latent_window_size]
+    # Function to trigger update
+    def update_iter_info_ui(vid_len, fps_val, win_size, current_model): # Pass model just to trigger change
+        # The update_iteration_info function uses the global active_model_name
+        return update_iteration_info(vid_len, fps_val, win_size)
+
+    # Trigger on model change
+    model_selector.change(
+        fn=update_iter_info_ui,
+        inputs=iteration_info_inputs + [model_selector], # Include model selector as input
+        outputs=iteration_info_display,
+        queue=False
+    )
+    # Trigger on parameter change
     for comp in iteration_info_inputs:
         comp.change(
-            fn=update_iteration_info,
-            inputs=iteration_info_inputs,
+            fn=update_iter_info_ui,
+            inputs=iteration_info_inputs + [model_selector], # Include model selector here too
             outputs=iteration_info_display,
             queue=False
         )
-    # --- END Iteration Info Listeners ---
+    # --- Change Listeners for Iteration Info END ---
+
+    # --- Model Switch Wiring ---
+    model_selector.change(
+        fn=switch_active_model,
+        inputs=[model_selector],
+        outputs=[model_selector, model_status], # Update selector value (in case switch failed) and status
+        show_progress="full" # Show progress during model switch
+    )
+    # --- End Model Switch Wiring ---
 
     # --- Gradio Event Wiring END ---
 
 
+    # --- video_info_js remains unchanged ---
     video_info_js = """
     function updateVideoInfo() {
         const videoResultDiv = document.querySelector('#result_video');
         if (!videoResultDiv) return;
         const videoElement = videoResultDiv.querySelector('video');
 
-        if (videoElement) {
+        if (videoElement && videoElement.currentSrc && videoElement.currentSrc.startsWith('http')) { // Check if src is loaded
             const infoDiv = document.getElementById('video-info');
             if (!infoDiv) return;
             const displayInfo = () => {
-                if (videoElement.videoWidth && videoElement.videoHeight && videoElement.duration) {
-                     const format = videoElement.currentSrc ? videoElement.currentSrc.split('.').pop().toUpperCase() : 'N/A';
+                if (videoElement.videoWidth && videoElement.videoHeight && videoElement.duration && isFinite(videoElement.duration)) {
+                     const format = videoElement.currentSrc ? videoElement.currentSrc.split('.').pop().toUpperCase().split('?')[0] : 'N/A'; // Handle potential query strings
                      infoDiv.innerHTML = `<p>Resolution: ${videoElement.videoWidth}x${videoElement.videoHeight} | Duration: ${videoElement.duration.toFixed(2)}s | Format: ${format}</p>`;
-                } else {
+                } else if (videoElement.readyState < 1) {
                      infoDiv.innerHTML = '<p>Loading video info...</p>';
+                } else {
+                     // Sometimes duration might be Infinity initially
+                     infoDiv.innerHTML = `<p>Resolution: ${videoElement.videoWidth}x${videoElement.videoHeight} | Duration: Loading... | Format: ${videoElement.currentSrc ? videoElement.currentSrc.split('.').pop().toUpperCase().split('?')[0] : 'N/A'}</p>`;
                 }
             };
-            if (videoElement.readyState >= 1) {
+            // Use 'loadeddata' or 'durationchange' as they often fire when duration is known
+            videoElement.removeEventListener('loadeddata', displayInfo);
+            videoElement.addEventListener('loadeddata', displayInfo);
+            videoElement.removeEventListener('durationchange', displayInfo);
+            videoElement.addEventListener('durationchange', displayInfo);
+
+            // Initial check if data is already available
+            if (videoElement.readyState >= 2) { // HAVE_CURRENT_DATA or more
                 displayInfo();
             } else {
-                videoElement.removeEventListener('loadedmetadata', displayInfo);
-                videoElement.addEventListener('loadedmetadata', displayInfo);
+                 infoDiv.innerHTML = '<p>Loading video info...</p>';
             }
         } else {
              const infoDiv = document.getElementById('video-info');
              if (infoDiv) infoDiv.innerHTML = "<div>Generate a video to see information</div>";
         }
     }
+    // Debounce function
+    function debounce(func, wait) {
+        let timeout;
+        return function executedFunction(...args) {
+            const later = () => {
+                clearTimeout(timeout);
+                func(...args);
+            };
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+        };
+    };
+
+    const debouncedUpdateVideoInfo = debounce(updateVideoInfo, 250); // Update max 4 times per second
+
+    // Use MutationObserver to detect when the video src changes
     const observerCallback = function(mutationsList, observer) {
         for(const mutation of mutationsList) {
-            if (mutation.type === 'childList') {
+            // Check if the result_video div or its children changed, or if attributes changed (like src)
+             if (mutation.type === 'childList' || mutation.type === 'attributes') {
                  const videoResultDiv = document.querySelector('#result_video');
-                 if (videoResultDiv && (mutation.target === videoResultDiv || videoResultDiv.contains(mutation.target))) {
-                    updateVideoInfo();
-                    break;
+                 // Check if the mutation target is the video element itself or its container
+                 if (videoResultDiv && (mutation.target === videoResultDiv || videoResultDiv.contains(mutation.target) || mutation.target.tagName === 'VIDEO')) {
+                    debouncedUpdateVideoInfo(); // Use debounced update
+                    break; // No need to check other mutations for this change
                  }
             }
         }
     };
     const observer = new MutationObserver(observerCallback);
-    observer.observe(document.body, { childList: true, subtree: true });
+    // Observe changes in the body, looking for subtree modifications and attribute changes
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+
+    // Initial call on load
     if (document.readyState === 'complete') {
-      updateVideoInfo();
+      // Already loaded
+      // debouncedUpdateVideoInfo(); // Call directly if loaded
     } else {
-      document.addEventListener('DOMContentLoaded', updateVideoInfo);
+      // Wait for DOM content
+      document.addEventListener('DOMContentLoaded', debouncedUpdateVideoInfo);
+    }
+    // Add listener for Gradio updates as well
+    if (typeof window.gradio_config !== 'undefined') {
+        window.addEventListener('gradio:update', debouncedUpdateVideoInfo);
     }
     """
     result_video.elem_id = "result_video"
 
-    # --- Startup Loading START (Combined Preset & Iteration Info) --- (No changes needed here)
+    # --- Startup Loading START (Combined Preset & Iteration Info) ---
     def apply_preset_and_init_info_on_startup():
+        global active_model_name, transformer # Allow modification of globals on startup
+
         print("Applying preset and initializing info on startup...")
         initial_values = {}
         for i, comp in enumerate(preset_components_list):
+             # Try to get default value from component definition
              default_value = getattr(comp, 'value', None)
              initial_values[component_names_for_preset[i]] = default_value
 
+        # Ensure Default preset exists with current defaults (including default model)
+        initial_values["model_selector"] = active_model_name # Set initial model
         create_default_preset_if_needed(initial_values)
+
+        # Load last used preset name, fallback to Default
         preset_to_load = load_last_used_preset_name()
         available_presets = scan_presets()
         if preset_to_load not in available_presets:
@@ -2590,51 +3317,100 @@ with block:
         else:
             print(f"Loading last used preset: '{preset_to_load}'")
 
+        # Load preset data
         preset_data = load_preset_data(preset_to_load)
         if preset_data is None and preset_to_load != "Default":
              print(f"Failed to load '{preset_to_load}', attempting to load 'Default'.")
              preset_to_load = "Default"
              preset_data = load_preset_data(preset_to_load)
+        elif preset_data is None and preset_to_load == "Default":
+             print(f"Critical Error: Failed to load 'Default' preset data. Using hardcoded component defaults.")
+             # Use the initial_values gathered from components
+             preset_data = initial_values
 
-        preset_updates = []
-        loaded_values = {}
-        if preset_data:
-            available_loras = [lora_name for lora_name, _ in scan_lora_files()]
-            for i, comp_name in enumerate(component_names_for_preset):
-                comp_initial_value = initial_values.get(comp_name)
-                if comp_name in preset_data:
-                    value = preset_data[comp_name]
-                    if comp_name == "selected_lora" and value not in available_loras:
-                        print(f"Startup Warning: Saved LoRA '{value}' not found. Setting to 'None'.")
-                        value = "None"
-                    preset_updates.append(gr.update(value=value))
-                    loaded_values[comp_name] = value
-                else:
-                    print(f"Startup Warning: Key '{comp_name}' missing in '{preset_to_load}'. Using component's default.")
-                    preset_updates.append(gr.update(value=comp_initial_value))
-                    loaded_values[comp_name] = comp_initial_value
+        # --- Switch Model Based on Preset ---
+        startup_model_status = f"Active model: **{active_model_name}**"
+        preset_model = preset_data.get("model_selector", DEFAULT_MODEL_NAME)
+        if preset_model != active_model_name:
+             print(f"Startup: Preset '{preset_to_load}' requires model '{preset_model}'. Switching...")
+             # Use a simple progress indicator for startup
+             startup_progress = gr.Progress()
+             startup_progress(0, desc=f"Loading model '{preset_model}' for startup preset...")
+             try:
+                 # Call switch_active_model directly - modifies globals
+                 new_active_model, switch_status_msg = switch_active_model(preset_model, progress=startup_progress)
+                 active_model_name = new_active_model # Update global name
+                 startup_model_status = f"Status: {switch_status_msg}"
+                 preset_data["model_selector"] = active_model_name # Update data with actual model
+                 print(f"Startup model switch status: {switch_status_msg}")
+             except Exception as startup_switch_err:
+                  error_msg = f"Startup Error switching model: {startup_switch_err}"
+                  print(error_msg)
+                  traceback.print_exc()
+                  startup_model_status = f"Error: {error_msg}. Model remains '{active_model_name}'."
+                  preset_data["model_selector"] = active_model_name # Reflect reality
         else:
-             print("Critical Error: Failed to load 'Default' preset data. Using hardcoded defaults.")
-             preset_updates = [gr.update(value=initial_values.get(name)) for name in component_names_for_preset]
-             loaded_values = initial_values
+             print(f"Startup: Preset '{preset_to_load}' uses initially loaded model '{active_model_name}'.")
+             startup_model_status = f"Active model: **{active_model_name}**" # Confirm active model
+        # --- End Model Switch ---
 
-        initial_vid_len = loaded_values.get('total_second_length', 5)
-        initial_fps = loaded_values.get('fps', 30)
-        initial_win_size = loaded_values.get('latent_window_size', 9)
+        # --- Generate UI Updates from Preset Data ---
+        preset_updates = []
+        loaded_values_startup: Dict[str, Any] = {}
+        available_loras_startup = [lora_name for lora_name, _ in scan_lora_files()]
+
+        for i, comp_name in enumerate(component_names_for_preset):
+            comp_initial_value = initial_values.get(comp_name) # Default from component
+            value_to_set = comp_initial_value # Start with default
+            if comp_name in preset_data:
+                 value_from_preset = preset_data[comp_name]
+                 # Validate specific components
+                 if comp_name == "model_selector":
+                      value_to_set = active_model_name # Always use the confirmed active model
+                 elif comp_name == "selected_lora":
+                      if value_from_preset not in available_loras_startup:
+                           print(f"Startup Warning: Preset LoRA '{value_from_preset}' not found. Setting LoRA to 'None'.")
+                           value_to_set = "None"
+                      else:
+                           value_to_set = value_from_preset
+                 elif comp_name == "resolution":
+                      target_component = preset_components_list[i]
+                      valid_resolutions = [choice for choice in getattr(target_component,'choices', [])]
+                      if value_from_preset not in valid_resolutions:
+                           print(f"Startup Warning: Preset resolution '{value_from_preset}' not valid. Using default.")
+                           value_to_set = getattr(target_component, 'value', "640")
+                      else:
+                           value_to_set = value_from_preset
+                 else:
+                      value_to_set = value_from_preset # Use preset value directly
+            else:
+                 print(f"Startup Warning: Key '{comp_name}' missing in '{preset_to_load}'. Using component's default.")
+                 value_to_set = comp_initial_value # Keep default
+
+            preset_updates.append(gr.update(value=value_to_set))
+            loaded_values_startup[comp_name] = value_to_set # Store applied value
+
+        # --- Calculate Initial Iteration Info ---
+        initial_vid_len = loaded_values_startup.get('total_second_length', 5)
+        initial_fps = loaded_values_startup.get('fps', 30)
+        initial_win_size = loaded_values_startup.get('latent_window_size', 9)
+        # update_iteration_info uses the global active_model_name set during model switch
         initial_info_text = update_iteration_info(initial_vid_len, initial_fps, initial_win_size)
 
-        return [gr.update(choices=available_presets, value=preset_to_load)] + preset_updates + [initial_info_text]
+        # Return updates for: preset dropdown, all components, model status, iteration info
+        return [gr.update(choices=available_presets, value=preset_to_load)] + preset_updates + [startup_model_status, initial_info_text]
 
     block.load(
         fn=apply_preset_and_init_info_on_startup,
         inputs=[],
-        outputs=[preset_dropdown] + preset_components_list + [iteration_info_display]
+        outputs=[preset_dropdown] + preset_components_list + [model_status, iteration_info_display]
     )
     # --- Startup Loading END ---
 
     block.load(None, None, None, js=video_info_js)
 
 
+# --- get_available_drives remains unchanged ---
 def get_available_drives():
     """Detect available drives on the system regardless of OS"""
     available_paths = []
@@ -2648,17 +3424,35 @@ def get_available_drives():
             bitmask >>= 1
         available_paths = drives
     elif platform.system() == "Darwin":
-         available_paths = ["/", "/Volumes"]
-    else:
-        available_paths = ["/", "/mnt", "/media"]
+         available_paths = ["/", "/Volumes"] # Add standard mount point
+    else: # Linux/Other Unix
+        available_paths = ["/", "/mnt", "/media"] # Common mount points
+        # Also add home directory for convenience
+        home_dir = os.path.expanduser("~")
+        if home_dir not in available_paths:
+            available_paths.append(home_dir)
 
-    existing_paths = [p for p in available_paths if os.path.exists(p)]
-    print(f"Allowed Gradio paths: {existing_paths}")
-    return existing_paths
+    # Filter out paths that don't actually exist
+    existing_paths = [p for p in available_paths if os.path.exists(p) and os.path.isdir(p)]
+
+    # Add the current working directory and script directory for relative paths
+    cwd = os.getcwd()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if cwd not in existing_paths: existing_paths.append(cwd)
+    if script_dir not in existing_paths: existing_paths.append(script_dir)
+
+    # Add specific output/input folders relative to script dir
+    for folder in [outputs_folder, loras_folder, presets_folder, outputs_batch_folder]:
+         abs_folder = os.path.abspath(folder)
+         if abs_folder not in existing_paths and os.path.exists(abs_folder):
+             existing_paths.append(abs_folder)
+
+    print(f"Allowed Gradio paths: {list(set(existing_paths))}") # Use set to remove duplicates
+    return list(set(existing_paths))
 
 
 block.launch(
     share=args.share,
     inbrowser=True,
-    allowed_paths=get_available_drives()
+    allowed_paths=get_available_drives() # Use dynamically generated paths
 )
