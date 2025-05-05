@@ -15,3 +15,4 @@ opencv-contrib-python
 safetensors
 apng==0.3.4
 peft
+natsort

@@ -756,11 +756,25 @@ def parse_simple_timestamped_prompt(prompt_text: str, total_duration: float, lat
 # --- update_iteration_info remains unchanged ---
 def update_iteration_info(vid_len_s, fps_val, win_size):
     """Calculates and formats information about generation sections."""
+
+    # --- ADD TYPE CHECKING AND CASTING ---
+    try:
+        # Ensure inputs are numeric before calculations
+        # Handle potential None values during initial setup if necessary
+        vid_len_s = float(vid_len_s) if vid_len_s is not None else 0.0
+        fps_val = int(fps_val) if fps_val is not None else 0
+        win_size = int(win_size) if win_size is not None else 0
+        print(f"DEBUG update_iteration_info - Converted inputs: vid_len_s={vid_len_s}, fps_val={fps_val}, win_size={win_size}")
+    except (ValueError, TypeError, AttributeError) as e:
+        print(f"Error converting types in update_iteration_info: {e}")
+        print(f"Received types: vid_len_s={type(vid_len_s)}, fps_val={type(fps_val)}, win_size={type(win_size)}")
+        # Return an error message or default if types are wrong
+        return "Error: Invalid input types for calculation."
+    # --- END TYPE CHECKING ---
+
     # (Keep the initial validation and calculation parts the same)
-    if not all([isinstance(vid_len_s, (int, float)), isinstance(fps_val, int), isinstance(win_size, int)]):
-         return "Calculating..."
     if fps_val <= 0 or win_size <= 0:
-         return "Invalid FPS or Latent Window Size."
+        return "Invalid FPS or Latent Window Size."
 
     try:
         # Calculate total sections using the same logic as the worker
@@ -779,7 +793,7 @@ def update_iteration_info(vid_len_s, fps_val, win_size):
             # The actual loop count in worker for F1 depends on total_second_length, fps, and latent_window_size.
             # F1 adds 'latent_window_size * 4 - 3' frames per loop after the first frame.
             frames_to_generate = total_frames_needed - 1 # Minus the start frame
-            frames_per_f1_loop = (latent_window_size * 4 - 3)
+            frames_per_f1_loop = (win_size * 4 - 3)
             if frames_per_f1_loop > 0:
                 total_f1_loops = math.ceil(frames_to_generate / frames_per_f1_loop) if frames_to_generate > 0 else 0
                 total_latent_sections = max(total_f1_loops, 1) # Ensure at least 1 if duration > 0
@@ -2197,15 +2211,15 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
 
 # --- Modify batch_process function signature & add model switch check ---
 def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n_prompt, seed, use_random_seed, total_second_length,
-                  latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold,
-                  video_quality='high', export_gif=False, export_apng=False, export_webp=False,
-                  skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
-                  lora_scale=1.0, batch_use_multiline_prompts=False,
-                  batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False,
-                  rife_enabled=False, rife_multiplier="2x FPS",
-                  selected_lora_dropdown_value="None",
-                  # --- ADDED ---
-                  selected_model_display_name=DEFAULT_MODEL_NAME):
+                   latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold,
+                   video_quality='high', export_gif=False, export_apng=False, export_webp=False,
+                   skip_existing=True, save_metadata=True, num_generations=1, resolution="640", fps=30,
+                   lora_scale=1.0, batch_use_multiline_prompts=False,
+                   batch_save_individual_frames=False, batch_save_intermediate_frames=False, batch_save_last_frame=False,
+                   rife_enabled=False, rife_multiplier="2x FPS",
+                   selected_lora_dropdown_value="None",
+                   # --- ADDED ---
+                   selected_model_display_name=DEFAULT_MODEL_NAME):
 
     global stream, batch_stop_requested, currently_loaded_lora_info, active_model_name # Need global state access
 
@@ -2749,7 +2763,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V45+F1 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack Improved SECourses App V46 - https://www.patreon.com/posts/126855226') # Updated Title
     with gr.Row():
         # --- Model Selector ---
         model_selector = gr.Radio(
@@ -3051,10 +3065,11 @@ with block:
                      value = active_model_name # Use the confirmed active model name
                 elif comp_name == "resolution":
                      # Ensure resolution value is valid
-                     valid_resolutions = [choice for choice in getattr(target_component,'choices', [])]
-                     if value not in valid_resolutions:
-                          print(f"Preset Warning: Saved resolution '{value}' not valid. Using default.")
-                          value = getattr(target_component, 'value', "640") # Use component default
+                     # Explicitly define valid choices to avoid potential issues with getattr during load
+                     _VALID_RESOLUTIONS = ["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"]
+                     if value not in _VALID_RESOLUTIONS:
+                          print(f"Preset Warning: Saved resolution '{value}' not valid. Using default ('640').")
+                          value = "640" # Use hardcoded default
                      updates.append(gr.update(value=value))
                 else:
                     # For other components, assume the value is valid
@@ -3374,11 +3389,11 @@ with block:
                       else:
                            value_to_set = value_from_preset
                  elif comp_name == "resolution":
-                      target_component = preset_components_list[i]
-                      valid_resolutions = [choice for choice in getattr(target_component,'choices', [])]
-                      if value_from_preset not in valid_resolutions:
-                           print(f"Startup Warning: Preset resolution '{value_from_preset}' not valid. Using default.")
-                           value_to_set = getattr(target_component, 'value', "640")
+                      # Explicitly define valid choices to avoid potential issues with getattr during load
+                      _VALID_RESOLUTIONS = ["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"]
+                      if value_from_preset not in _VALID_RESOLUTIONS:
+                           print(f"Startup Warning: Preset resolution '{value_from_preset}' not valid. Using default ('640').")
+                           value_to_set = "640" # Use hardcoded default
                       else:
                            value_to_set = value_from_preset
                  else:
