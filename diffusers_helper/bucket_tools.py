@@ -58,6 +58,7 @@ bucket_options = {
 
 
 def find_nearest_bucket(h, w, resolution=640):
+    resolution = str(resolution)  # Ensure it's a string key
     min_metric = float('inf')
     best_bucket = None
     for (bucket_h, bucket_w) in bucket_options[resolution]:
@@ -65,6 +66,5 @@ def find_nearest_bucket(h, w, resolution=640):
         if metric <= min_metric:
             min_metric = metric
             best_bucket = (bucket_h, bucket_w)
-    #print(f"Found best resolution bucket {bucket_w} x {bucket_h}")       
     return best_bucket
 
