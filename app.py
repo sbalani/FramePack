@@ -2763,182 +2763,397 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V46 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack EndangeredAI')
+    gr.Markdown('### [Support Development on Patreon](https://www.patreon.com/posts/126855226)')
+    
     with gr.Row():
-        # --- Model Selector ---
-        model_selector = gr.Radio(
-            label="Select Model",
-            choices=[MODEL_DISPLAY_NAME_ORIGINAL, MODEL_DISPLAY_NAME_F1],
-            value=active_model_name, # Use the globally loaded default
-            info="Choose the generation model. Switching will unload the current model and load the new one."
-        )
+        # --- Model Selection ---
+        with gr.Column():
+            gr.Markdown("### 🎯 Model Selection")
+            model_selector = gr.Radio(
+                label="Choose Generation Model",
+                choices=[MODEL_DISPLAY_NAME_ORIGINAL, MODEL_DISPLAY_NAME_F1],
+                value=active_model_name,
+                info="Each model has different generation characteristics. Switching models requires a brief loading period."
+            )
         model_status = gr.Markdown(f"Active model: **{active_model_name}**")
-        # --- End Model Selector ---
+    
     with gr.Row():
         with gr.Column():
             with gr.Tabs():
-                with gr.Tab("Single Image / Multi-Prompt"): # Renamed slightly
+                with gr.Tab("🎬 Single Image Generation"):
+                    gr.Markdown("### Input Images")
                     with gr.Row():
                         with gr.Column():
-                            input_image = gr.Image(sources='upload', type="numpy", label="Start Frame", height=320)
+                            input_image = gr.Image(sources='upload', type="numpy", label="Start Frame (Required)", height=320)
                         with gr.Column():
-                            # End frame might be less effective with F1 but keep for Original
-                            end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional, Original Model primarily)", height=320)
+                            end_image = gr.Image(sources='upload', type="numpy", label="End Frame (Optional, most effective with Original model)", height=320)
 
+                    gr.Markdown("### Generation Settings")
                     with gr.Row():
                         iteration_info_display = gr.Markdown("Calculating generation info...", elem_id="iteration-info-display")
-                        auto_set_lws_button = gr.Button(value="Set Window for ~1s Sections (Original Model)", scale=1) # Clarified button purpose
+                        auto_set_lws_button = gr.Button(value="⚡ Optimize Window Size for ~1s Sections", scale=1)
 
-                    prompt = gr.Textbox(label="Prompt", value='', lines=4, info="Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF. Example [0] starts second 0, [2] starts after 2 seconds passed and so on. Applies to both models.")
+                    gr.Markdown("### Prompt Configuration")
+                    prompt = gr.Textbox(
+                        label="Main Prompt", 
+                        value='', 
+                        lines=4, 
+                        info="""Prompt Formatting Options:
+                        1. Standard: Enter a single prompt for the entire video
+                        2. Timestamped (when 'Use Multi-line Prompts' is OFF): 
+                           - Use format: [seconds] prompt
+                           - Example: [0] start scene
+                                     [2] transition
+                                     [4] end scene
+                        3. Multi-line (when enabled):
+                           - Each line generates separately
+                           - No timestamp parsing"""
+                    )
                     with gr.Row():
-                        use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line is a separate gen (new seed per line if random). OFF: Try parsing '[secs] prompt' format.")
-                        # Latent Window Size - Keep, might affect F1 loop length/speed balance too
-                        latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=True, info="Controls generation chunk size. Affects section/loop count and duration (see info above prompt). Default 9 recommended.")
-                    example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
-                    example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
+                        use_multiline_prompts = gr.Checkbox(
+                            label="Use Multi-line Prompts", 
+                            value=False, 
+                            info="ON: Each line generates separately | OFF: Parse timestamps [secs] from full prompt"
+                        )
+                        latent_window_size = gr.Slider(
+                            label="Latent Window Size", 
+                            minimum=1, 
+                            maximum=33, 
+                            value=9, 
+                            step=1, 
+                            info="Controls generation chunk size. Default 9 recommended. See info above for impact on timing."
+                        )
+                    
+                    gr.Markdown("### Quick Prompt Templates")
+                    example_quick_prompts = gr.Dataset(
+                        samples=quick_prompts, 
+                        label='Example Prompts', 
+                        samples_per_page=1000, 
+                        components=[prompt]
+                    )
+
+                    gr.Markdown("### Output Options")
+                    with gr.Row():
+                        save_metadata = gr.Checkbox(
+                            label="Save Processing Metadata", 
+                            value=True, 
+                            info="Save generation settings alongside each video"
+                        )
+                        save_individual_frames = gr.Checkbox(
+                            label="Save Individual Frames", 
+                            value=False, 
+                            info="Export each frame as a separate image"
+                        )
+                        save_intermediate_frames = gr.Checkbox(
+                            label="Save Intermediate Frames", 
+                            value=False, 
+                            info="Save frames from intermediate generation steps"
+                        )
+                        save_last_frame = gr.Checkbox(
+                            label="Save Last Frame (MP4)", 
+                            value=False, 
+                            info="Save the final frame of each MP4 generation"
+                        )
 
                     with gr.Row():
-                        save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
-                        save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image")
-                        save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images")
-                        save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations (MP4 Only)", value=False, info="Save only the last frame of each MP4 generation to the last_frames folder")
+                        start_button = gr.Button(value="🚀 Start Generation", variant='primary', scale=2)
+                        end_button = gr.Button(value="⏹️ Stop Generation", interactive=False, scale=1)
+
+                with gr.Tab("📁 Batch Processing"):
+                    gr.Markdown("### Batch Input/Output Paths")
+                    batch_input_folder = gr.Textbox(
+                        label="Start Frames Folder", 
+                        info="Folder containing input images (processed in natural sort order)"
+                    )
+                    batch_end_frame_folder = gr.Textbox(
+                        label="End Frames Folder (Optional)", 
+                        info="Folder with matching end frames (must have same filenames as start frames)"
+                    )
+                    batch_output_folder = gr.Textbox(
+                        label="Output Folder", 
+                        info="Leave empty to use default batch_outputs folder"
+                    )
+                    
+                    gr.Markdown("### Batch Prompt Settings")
+                    batch_prompt = gr.Textbox(
+                        label="Default Batch Prompt", 
+                        value='', 
+                        lines=4, 
+                        info="""Used when no matching .txt file exists for an image.
+                        - Supports same formatting as single generation
+                        - For custom prompts, create .txt files with same names as images"""
+                    )
+
+                    gr.Markdown("### Batch Processing Options")
+                    with gr.Row():
+                        batch_skip_existing = gr.Checkbox(
+                            label="Skip Existing Files", 
+                            value=True, 
+                            info="Skip processing if output already exists"
+                        )
+                        batch_save_metadata = gr.Checkbox(
+                            label="Save Processing Metadata", 
+                            value=True, 
+                            info="Save generation settings with each video"
+                        )
+                        batch_use_multiline_prompts = gr.Checkbox(
+                            label="Use Multi-line Prompts", 
+                            value=False, 
+                            info="Process each line in prompt/txt files separately"
+                        )
 
                     with gr.Row():
-                        start_button = gr.Button(value="Start Generation", variant='primary')
-                        end_button = gr.Button(value="End Generation", interactive=False)
+                        batch_save_individual_frames = gr.Checkbox(
+                            label="Save Individual Frames", 
+                            value=False, 
+                            info="Save frames in batch_output/frames_output"
+                        )
+                        batch_save_intermediate_frames = gr.Checkbox(
+                            label="Save Intermediate Frames", 
+                            value=False, 
+                            info="Save intermediate frames in batch_output/frames_output"
+                        )
+                        batch_save_last_frame = gr.Checkbox(
+                            label="Save Last Frame (MP4)", 
+                            value=False, 
+                            info="Save final frame in batch_output/frames_output"
+                        )
 
-                with gr.Tab("Batch Processing"):
-                    batch_input_folder = gr.Textbox(label="Input Folder Path (Start Frames)", info="Folder containing starting images to process (sorted naturally)")
-                    batch_end_frame_folder = gr.Textbox(label="End Frame Folder Path (Optional, Original Model primarily)", info="Folder containing matching end frames (same filename as start frame)")
-                    batch_output_folder = gr.Textbox(label="Output Folder Path (optional)", info="Leave empty to use the default batch_outputs folder")
-                    batch_prompt = gr.Textbox(label="Default Prompt", value='', lines=4, info="Used if no matching .txt file exists. Use '[seconds] prompt' format on new lines ONLY when 'Use Multi-line Prompts' is OFF.")
-
+                    gr.Markdown("### Batch Controls")
                     with gr.Row():
-                        batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip images where the first expected output video already exists")
-                        batch_save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
-                        batch_use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line in prompt/.txt is a separate gen. OFF: Try parsing '[secs] prompt' format from full prompt/.txt.")
+                        batch_start_button = gr.Button(value="🚀 Start Batch Processing", variant='primary', scale=2)
+                        batch_end_button = gr.Button(value="⏹️ Stop Processing", interactive=False, scale=1)
 
+                    gr.Markdown("### Folder Management")
                     with gr.Row():
-                        batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image (in batch_output/frames_output)")
-                        batch_save_intermediate_frames = gr.Checkbox(label="Save Intermediate Frames", value=False, info="Save each frame of intermediate videos as individual images (in batch_output/frames_output)")
-                        batch_save_last_frame = gr.Checkbox(label="Save Last Frame Of Generations (MP4 Only)", value=False, info="Save only the last frame of each MP4 generation (in batch_output/frames_output)")
+                        open_batch_input_folder = gr.Button(value="📂 Open Start Folder")
+                        open_batch_end_folder = gr.Button(value="📂 Open End Folder")
+                        open_batch_output_folder = gr.Button(value="📂 Open Output Folder")
 
-                    with gr.Row():
-                        batch_start_button = gr.Button(value="Start Batch Processing", variant='primary')
-                        batch_end_button = gr.Button(value="End Processing", interactive=False)
-
-                    with gr.Row():
-                        open_batch_input_folder = gr.Button(value="Open Start Folder")
-                        open_batch_end_folder = gr.Button(value="Open End Folder")
-                        open_batch_output_folder = gr.Button(value="Open Output Folder")
-
-
-            with gr.Group("Common Settings"): # Group shared settings
+            gr.Markdown("### ⚙️ Common Generation Settings")
+            with gr.Group():
                 with gr.Row():
-                    num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence (per image/prompt)")
-                    resolution = gr.Dropdown(label="Resolution", choices=["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
+                    num_generations = gr.Slider(
+                        label="Number of Generations", 
+                        minimum=1, 
+                        maximum=50, 
+                        value=1, 
+                        step=1, 
+                        info="Generate multiple variations per image/prompt"
+                    )
+                    resolution = gr.Dropdown(
+                        label="Output Resolution", 
+                        choices=["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"], 
+                        value="640", 
+                        info="Higher resolutions require more GPU memory"
+                    )
 
                 with gr.Row():
-                    # TeaCache - F1 Demo default is 0.15 (True). Let's use slider like original.
-                    teacache_threshold = gr.Slider(label='TeaCache Threshold', minimum=0.0, maximum=0.5, value=0.15, step=0.01, info='0 = Disabled, >0 = Enabled. Higher values = more caching but potentially less detail. Affects both models.')
-                    seed = gr.Number(label="Seed", value=31337, precision=0)
-                    use_random_seed = gr.Checkbox(label="Random Seed", value=True, info="Use random seeds instead of fixed/incrementing")
+                    teacache_threshold = gr.Slider(
+                        label='TeaCache Optimization', 
+                        minimum=0.0, 
+                        maximum=0.5, 
+                        value=0.15, 
+                        step=0.01, 
+                        info='0 = Off, >0 = On. Higher values trade detail for speed. Default 0.15 recommended.'
+                    )
+                    seed = gr.Number(label="Generation Seed", value=31337, precision=0)
+                    use_random_seed = gr.Checkbox(
+                        label="Random Seed", 
+                        value=True, 
+                        info="Use random seeds instead of fixed/incrementing"
+                    )
 
-                # Negative Prompt - Keep for Original Model, might have minor effect on F1 if CFG > 1?
-                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True, info="Used when CFG Scale > 1.0 (Primarily for Original Model)")
+                n_prompt = gr.Textbox(
+                    label="Negative Prompt", 
+                    value="", 
+                    info="Used when CFG Scale > 1.0 (mainly affects Original model)"
+                )
+
+                gr.Markdown("### ⏱️ Timing Controls")
+                with gr.Row():
+                    fps = gr.Slider(
+                        label="Frames Per Second", 
+                        minimum=10, 
+                        maximum=60, 
+                        value=30, 
+                        step=1, 
+                        info="Output video frame rate"
+                    )
+                    total_second_length = gr.Slider(
+                        label="Video Duration (Seconds)", 
+                        minimum=1, 
+                        maximum=120, 
+                        value=5, 
+                        step=0.1
+                    )
+
+                gr.Markdown("### 🎨 Quality Controls")
+                with gr.Row():
+                    steps = gr.Slider(
+                        label="Generation Steps", 
+                        minimum=1, 
+                        maximum=100, 
+                        value=25, 
+                        step=1, 
+                        info='Default 25 recommended for both models'
+                    )
+                    gs = gr.Slider(
+                        label="Distilled CFG Scale", 
+                        minimum=1.0, 
+                        maximum=32.0, 
+                        value=10.0, 
+                        step=0.01, 
+                        info='Default 10.0 recommended for both models'
+                    )
 
                 with gr.Row():
-                    fps = gr.Slider(label="FPS", minimum=10, maximum=60, value=30, step=1, info="Output Videos FPS - Directly changes how many frames are generated")
-                    total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                    cfg = gr.Slider(
+                        label="CFG Scale", 
+                        minimum=1.0, 
+                        maximum=32.0, 
+                        value=1.0, 
+                        step=0.01, 
+                        info='Needs > 1.0 for negative prompt. F1 model typically uses 1.0'
+                    )
+                    rs = gr.Slider(
+                        label="CFG Re-Scale", 
+                        minimum=0.0, 
+                        maximum=1.0, 
+                        value=0.0, 
+                        step=0.01, 
+                        info='Default 0.0 recommended for both models'
+                    )
 
-                with gr.Row():
-                    steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Default 25 recommended for both models.')
-                    # GS - F1 Demo uses 10.0. Original uses 10.0. Keep common.
-                    gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Default 10.0 recommended for both models.')
-
-                with gr.Row():
-                    # CFG - F1 Demo uses 1.0. Original uses 1.0 but allows > 1 for neg prompt. Keep visible.
-                    cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=True, info='Needs > 1.0 for Negative Prompt. F1 model typically uses 1.0.')
-                    # RS - F1 Demo uses 0.0. Original uses 0.0. Keep common.
-                    rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=True, info='Default 0.0 recommended for both models.')
-
-                gr.Markdown("### LoRA Settings (Applies to selected model)")
+                gr.Markdown("### 🎯 LoRA Controls")
                 with gr.Row():
                     with gr.Column():
                         lora_options = scan_lora_files()
-                        selected_lora = gr.Dropdown(label="Select LoRA", choices=[name for name, _ in lora_options], value="None", info="Select a LoRA to apply")
+                        selected_lora = gr.Dropdown(
+                            label="Select LoRA Model", 
+                            choices=[name for name, _ in lora_options], 
+                            value="None", 
+                            info="Choose a LoRA model to apply"
+                        )
                     with gr.Column():
                         with gr.Row():
-                             lora_refresh_btn = gr.Button(value="🔄 Refresh", scale=1)
-                             lora_folder_btn = gr.Button(value="📁 Open Folder", scale=1)
-                        lora_scale = gr.Slider(label="LoRA Scale", minimum=0.0, maximum=9.0, value=1.0, step=0.01, info="Adjust the strength of the LoRA effect")
+                             lora_refresh_btn = gr.Button(value="🔄 Refresh LoRAs", scale=1)
+                             lora_folder_btn = gr.Button(value="📂 Open LoRA Folder", scale=1)
+                        lora_scale = gr.Slider(
+                            label="LoRA Effect Strength", 
+                            minimum=0.0, 
+                            maximum=9.0, 
+                            value=1.0, 
+                            step=0.01, 
+                            info="Adjust how strongly the LoRA affects generation"
+                        )
 
+                gr.Markdown("### 💾 Memory Management")
                 with gr.Row():
-                    # GPU Memory Preservation - Keep common setting
-                    gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB)", minimum=0, maximum=128, value=8, step=0.1, info="Memory to keep free on GPU (Low VRAM mode). Larger value causes slower speed but helps prevent OOM. Adjust based on Resolution and VRAM.")
+                    gpu_memory_preservation = gr.Slider(
+                        label="Reserved GPU Memory (GB)", 
+                        minimum=0, 
+                        maximum=128, 
+                        value=8, 
+                        step=0.1, 
+                        info="Memory to keep free. Higher values prevent crashes but may slow generation."
+                    )
 
-                    def update_memory_for_resolution(res):
-                        # Adjust defaults based on observation or keep simple mapping
-                        res_int = int(res)
-                        if res_int >= 1440: return 23
-                        elif res_int >= 1320: return 21
-                        elif res_int >= 1200: return 19
-                        elif res_int >= 1080: return 16
-                        elif res_int >= 960: return 14
-                        elif res_int >= 840: return 12
-                        elif res_int >= 720: return 10
-                        elif res_int >= 640: return 8
-                        else: return 6 # Default for lower resolutions
-                    resolution.change(fn=update_memory_for_resolution, inputs=resolution, outputs=gpu_memory_preservation)
-
-        with gr.Column(): # Right column for preview/results
-            preview_image = gr.Image(label="Next Latents", height=200, visible=False)
-            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=True, height=512, loop=True)
+        with gr.Column():
+            gr.Markdown("### 🖥️ Preview & Results")
+            preview_image = gr.Image(label="Generation Preview", height=200, visible=False)
+            result_video = gr.Video(
+                label="Generated Video", 
+                autoplay=True, 
+                show_share_button=True, 
+                height=512, 
+                loop=True
+            )
             video_info = gr.HTML("<div id='video-info'>Generate a video to see information</div>")
-            gr.Markdown('''
-            **Notes:**
-            - **Original Model:** Generates video back-to-front. Start frame appears late, end frame early. Uses overlapping windows. Timestamp prompts `[secs]` relate to *final* video time, estimated by section duration (see info above prompt).
-            - **FramePack F1 Model:** Extends video from the start frame. Start frame is always present. End frame is ignored or has minimal effect. Timestamp prompts `[secs]` relate to *final* video time.
-            ''')
+            
+            gr.Markdown("""
+            ### 📝 Model Behavior Notes
+            
+            **Original Model:**
+            - Generates video in reverse (back-to-front)
+            - Start frame appears near end, end frame near beginning
+            - Uses overlapping generation windows
+            - Timestamp prompts relate to final video timing
+            
+            **FramePack F1 Model:**
+            - Generates video forward from start frame
+            - Start frame always visible at beginning
+            - End frame has minimal/no effect
+            - More consistent timing behavior
+            """)
+            
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
             timing_display = gr.Markdown("", label="Time Information", elem_classes='no-generating-animation')
 
-            gr.Markdown("### Presets (Includes selected model)")
+            gr.Markdown("### 💾 Preset Management")
             with gr.Row():
-                preset_dropdown = gr.Dropdown(label="Select Preset", choices=scan_presets(), value=load_last_used_preset_name() or "Default")
-                preset_load_button = gr.Button(value="Load Preset")
+                preset_dropdown = gr.Dropdown(
+                    label="Available Presets", 
+                    choices=scan_presets(), 
+                    value=load_last_used_preset_name() or "Default"
+                )
+                preset_load_button = gr.Button(value="📥 Load Preset")
                 preset_refresh_button = gr.Button(value="🔄 Refresh")
             with gr.Row():
-                preset_save_name = gr.Textbox(label="Save Preset As", placeholder="Enter preset name...")
-                preset_save_button = gr.Button(value="Save Current Settings")
+                preset_save_name = gr.Textbox(label="New Preset Name", placeholder="Enter name for new preset...")
+                preset_save_button = gr.Button(value="💾 Save Settings As Preset")
             preset_status_display = gr.Markdown("")
 
-            gr.Markdown("### Folder Options")
+            gr.Markdown("### 📁 Quick Access")
             with gr.Row():
-                open_outputs_btn = gr.Button(value="Open Generations Folder")
-                open_batch_outputs_btn = gr.Button(value="Open Batch Outputs Folder")
+                open_outputs_btn = gr.Button(value="📂 Open Main Output Folder")
+                open_batch_outputs_btn = gr.Button(value="📂 Open Batch Output Folder")
 
-            # Video Quality - Common setting
+            gr.Markdown("### 🎥 Video Export Settings")
             video_quality = gr.Radio(
                 label="Video Quality",
                 choices=["high", "medium", "low", "web_compatible"],
                 value="high",
-                info="High: Best quality, Medium: Balanced, Low: Smallest file size, Web Compatible: Best browser compatibility (MP4+WebM)"
+                info="""Quality Options:
+                - High: Best quality, larger files
+                - Medium: Balanced quality/size
+                - Low: Smallest file size
+                - Web Compatible: Best browser playback (MP4+WebM)"""
             )
 
-            gr.Markdown("### RIFE Frame Interpolation (MP4 Only)")
+            gr.Markdown("### 🎞️ Frame Interpolation (RIFE)")
             with gr.Row():
-                rife_enabled = gr.Checkbox(label="Enable RIFE (2x/4x FPS)", value=False, info="Increases FPS of generated MP4s using RIFE. Saves as '[filename]_extra_FPS.mp4'")
-                rife_multiplier = gr.Radio(choices=["2x FPS", "4x FPS"], label="RIFE FPS Multiplier", value="2x FPS", info="Choose the frame rate multiplication factor.")
+                rife_enabled = gr.Checkbox(
+                    label="Enable RIFE Enhancement", 
+                    value=False, 
+                    info="Increase smoothness by generating additional frames"
+                )
+                rife_multiplier = gr.Radio(
+                    choices=["2x FPS", "4x FPS"], 
+                    label="Frame Rate Multiplier", 
+                    value="2x FPS", 
+                    info="How many times to increase the frame rate"
+                )
 
-            gr.Markdown("### Additional Export Formats")
-            gr.Markdown("Select additional formats to export alongside MP4/WebM:")
+            gr.Markdown("### 📦 Additional Export Formats")
             with gr.Row():
-                export_gif = gr.Checkbox(label="Export as GIF", value=False, info="Save animation as GIF")
-                export_apng = gr.Checkbox(label="Export as APNG", value=False, info="Save animation as Animated PNG")
-                export_webp = gr.Checkbox(label="Export as WebP", value=False, info="Save animation as WebP")
-
+                export_gif = gr.Checkbox(
+                    label="Export GIF", 
+                    value=False, 
+                    info="Save as animated GIF (widely compatible)"
+                )
+                export_apng = gr.Checkbox(
+                    label="Export APNG", 
+                    value=False, 
+                    info="Save as Animated PNG (better quality than GIF)"
+                )
+                export_webp = gr.Checkbox(
+                    label="Export WebP", 
+                    value=False, 
+                    info="Save as WebP (good compression, modern format)"
+                )
 
     # --- Update Preset Component Lists ---
     preset_components_list = [
