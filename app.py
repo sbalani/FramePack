@@ -2764,7 +2764,7 @@ css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
     gr.Markdown('# FramePack EndangeredAI')
-    gr.Markdown('### [Support Development on Patreon](https://www.patreon.com/posts/126855226)')
+    gr.Markdown('### [Support Development on Patreon](https://www.patreon.com/posts/127557380/)')
     
     with gr.Row():
         # --- Model Selection ---
