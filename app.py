@@ -613,6 +613,197 @@ def load_preset_data(name: str) -> Optional[dict]:
         return None
 # --- Preset Functions END ---
 
+# --- Metadata Loading Functions START ---
+def parse_metadata_text_content(text_content: str) -> Dict[str, str]:
+    """Parses text content with 'Key: Value' lines into a dictionary."""
+    parsed = {}
+    for line in text_content.splitlines():
+        line = line.strip()
+        if ": " in line:
+            key, value = line.split(": ", 1)
+            parsed[key.strip()] = value.strip()
+        elif ":" in line: # Fallback for missing space after colon
+            key, value = line.split(":", 1)
+            parsed[key.strip()] = value.strip()
+    return parsed
+
+def convert_metadata_to_preset_dict(metadata: Dict[str, str]) -> Dict[str, Any]:
+    """Converts a parsed metadata dictionary to a preset data dictionary with correct types."""
+    preset_dict = {}
+
+    if "Model" in metadata:
+        preset_dict["model_selector"] = metadata["Model"]
+    if "Prompt" in metadata: # This will populate the 'prompt' field in the "Single Image / Multi-Prompt" tab
+        preset_dict["prompt"] = metadata["Prompt"]
+    if "Negative Prompt" in metadata:
+        preset_dict["n_prompt"] = metadata["Negative Prompt"]
+    if "Seed" in metadata:
+        try: preset_dict["seed"] = int(metadata["Seed"])
+        except ValueError: print(f"Warning: Could not parse Seed '{metadata['Seed']}' as int in metadata.")
+    
+    if "TeaCache" in metadata:
+        tc_val = metadata["TeaCache"]
+        if "Disabled" in tc_val:
+            preset_dict["teacache_threshold"] = 0.0
+        elif "Enabled (Threshold: " in tc_val:
+            try:
+                threshold_str = tc_val.split("Enabled (Threshold: ")[1].split(")")[0]
+                preset_dict["teacache_threshold"] = float(threshold_str)
+            except Exception as e: print(f"Warning: Could not parse TeaCache threshold from '{tc_val}': {e}")
+        else:
+            print(f"Warning: Unrecognized TeaCache format: '{tc_val}'")
+
+    if "Video Length (seconds)" in metadata:
+        try: preset_dict["total_second_length"] = float(metadata["Video Length (seconds)"])
+        except ValueError: print(f"Warning: Could not parse Video Length '{metadata['Video Length (seconds)']}' as float in metadata.")
+    if "FPS" in metadata:
+        try: preset_dict["fps"] = int(metadata["FPS"])
+        except ValueError: print(f"Warning: Could not parse FPS '{metadata['FPS']}' as int in metadata.")
+    if "Latent Window Size" in metadata:
+        try: preset_dict["latent_window_size"] = int(metadata["Latent Window Size"])
+        except ValueError: print(f"Warning: Could not parse Latent Window Size '{metadata['Latent Window Size']}' as int in metadata.")
+    if "Steps" in metadata:
+        try: preset_dict["steps"] = int(metadata["Steps"])
+        except ValueError: print(f"Warning: Could not parse Steps '{metadata['Steps']}' as int in metadata.")
+    if "CFG Scale" in metadata:
+        try: preset_dict["cfg"] = float(metadata["CFG Scale"])
+        except ValueError: print(f"Warning: Could not parse CFG Scale '{metadata['CFG Scale']}' as float in metadata.")
+    if "Distilled CFG Scale" in metadata:
+        try: preset_dict["gs"] = float(metadata["Distilled CFG Scale"])
+        except ValueError: print(f"Warning: Could not parse Distilled CFG Scale '{metadata['Distilled CFG Scale']}' as float in metadata.")
+    if "Guidance Rescale" in metadata:
+        try: preset_dict["rs"] = float(metadata["Guidance Rescale"])
+        except ValueError: print(f"Warning: Could not parse Guidance Rescale '{metadata['Guidance Rescale']}' as float in metadata.")
+    if "Resolution" in metadata:
+        preset_dict["resolution"] = metadata["Resolution"] # load_preset_action will validate if it's a valid choice
+
+    lora_name_from_meta = metadata.get("LoRA", "None")
+    if not lora_name_from_meta or lora_name_from_meta.strip().lower() == "none":
+        preset_dict["selected_lora"] = "None"
+    else:
+        preset_dict["selected_lora"] = lora_name_from_meta
+
+    if "LoRA Scale" in metadata:
+        try: preset_dict["lora_scale"] = float(metadata["LoRA Scale"])
+        except ValueError: print(f"Warning: Could not parse LoRA Scale '{metadata['LoRA Scale']}' as float in metadata.")
+
+    if "Timestamped Prompts Used" in metadata:
+        if metadata["Timestamped Prompts Used"].lower() == "true":
+            preset_dict["use_multiline_prompts"] = False
+        elif metadata["Timestamped Prompts Used"].lower() == "false":
+            preset_dict["use_multiline_prompts"] = True
+            
+    # Map other known boolean flags if present in metadata (these are not in the example txt but could be)
+    bool_map = {
+        "Save Processing Metadata": "save_metadata",
+        "Save Individual Frames": "save_individual_frames",
+        "Save Intermediate Frames": "save_intermediate_frames",
+        "Save Last Frame Of Generations (MP4 Only)": "save_last_frame",
+        "Skip Existing Files": "batch_skip_existing", # Batch setting
+        "Random Seed": "use_random_seed",
+        "Enable RIFE (2x/4x FPS)": "rife_enabled",
+        "Export as GIF": "export_gif",
+        "Export as APNG": "export_apng",
+        "Export as WebP": "export_webp",
+    }
+    for meta_key, preset_key in bool_map.items():
+        if meta_key in metadata:
+            preset_dict[preset_key] = metadata[meta_key].lower() == "true"
+
+    if "Number of Generations" in metadata:
+        try: preset_dict["num_generations"] = int(metadata["Number of Generations"])
+        except ValueError: print(f"Warning: Could not parse Number of Generations '{metadata['Number of Generations']}' as int.")
+    
+    if "Video Quality" in metadata:
+        preset_dict["video_quality"] = metadata["Video Quality"]
+
+    if "RIFE FPS Multiplier" in metadata:
+        preset_dict["rife_multiplier"] = metadata["RIFE FPS Multiplier"]
+        
+    if "GPU Inference Preserved Memory (GB)" in metadata:
+        try: preset_dict["gpu_memory_preservation"] = float(metadata["GPU Inference Preserved Memory (GB)"])
+        except ValueError: print(f"Warning: Could not parse GPU Memory '{metadata['GPU Inference Preserved Memory (GB)']}' as float.")
+
+    return preset_dict
+
+def load_settings_from_metadata_file(metadata_file_obj, progress=gr.Progress()):
+    """
+    Handles the metadata file upload, converts it to a temporary preset,
+    and loads it using load_preset_action.
+    Returns updates for UI components.
+    """
+    if metadata_file_obj is None:
+        no_file_updates = [gr.update() for _ in preset_components_list] + \
+                          [gr.update(value="<p style='color:red;'>No metadata file uploaded.</p>"), gr.update(), gr.update()]
+        return no_file_updates
+
+    try:
+        # metadata_file_obj is a file-like object (BytesIO or similar from gr.File)
+        metadata_content = metadata_file_obj.decode('utf-8') # <-- CORRECTED LINE
+    except Exception as e:
+        read_error_updates = [gr.update() for _ in preset_components_list] + \
+                             [gr.update(value=f"<p style='color:red;'>Error reading file: {e}</p>"), gr.update(), gr.update()]
+        return read_error_updates
+
+    parsed_metadata = parse_metadata_text_content(metadata_content)
+    if not parsed_metadata:
+        parse_fail_updates = [gr.update() for _ in preset_components_list] + \
+                             [gr.update(value="<p style='color:red;'>Could not parse metadata from file or file is empty.</p>"), gr.update(), gr.update()]
+        return parse_fail_updates
+
+    preset_data_from_metadata = convert_metadata_to_preset_dict(parsed_metadata)
+    if not preset_data_from_metadata: # Should not happen if parsed_metadata is not empty, but as a safe guard
+        convert_fail_updates = [gr.update() for _ in preset_components_list] + \
+                               [gr.update(value="<p style='color:red;'>Failed to convert parsed metadata to preset format (no settings found).</p>"), gr.update(), gr.update()]
+        return convert_fail_updates
+
+    temp_preset_name = "_temp_metadata_upload"
+    temp_preset_path = get_preset_path(temp_preset_name)
+
+    try:
+        with open(temp_preset_path, 'w', encoding='utf-8') as f:
+            json.dump(preset_data_from_metadata, f, indent=4)
+        print(f"Temporarily saved metadata to preset file: {temp_preset_path}")
+    except Exception as e:
+        save_error_msg = f"Error saving temporary metadata preset: {e}"
+        print(save_error_msg)
+        save_error_updates = [gr.update() for _ in preset_components_list] + \
+                             [gr.update(value=f"<p style='color:red;'>{save_error_msg}</p>"), gr.update(), gr.update()]
+        return save_error_updates
+
+    # Call the existing load_preset_action with the temporary preset name
+    load_results = load_preset_action(temp_preset_name, progress=progress)
+
+    # Clean up the temporary file
+    try:
+        if os.path.exists(temp_preset_path):
+            os.remove(temp_preset_path)
+            print(f"Removed temporary preset file: {temp_preset_path}")
+    except Exception as e:
+        print(f"Warning: Could not remove temporary preset file {temp_preset_path}: {e}")
+
+    # Process results from load_preset_action
+    # load_results = component_updates_list + [preset_status_gr, model_status_gr, iter_info_gr]
+    component_updates = load_results[:-3]
+    original_preset_status_gr_obj = load_results[-3]
+    model_status_gr_obj = load_results[-2]
+    iter_info_gr_obj = load_results[-1]
+
+    original_preset_status_val = getattr(original_preset_status_gr_obj, 'value', '')
+
+    final_status_message = f"<p style='color:green;'>Settings successfully loaded from metadata file.</p>"
+    if "Error" in original_preset_status_val or "Failed" in original_preset_status_val or "Warning" in original_preset_status_val :
+        final_status_message = f"<p style='color:orange;'>Settings loaded from metadata, but with issues from preset system: {original_preset_status_val}</p>"
+    elif not original_preset_status_val: # If status was empty
+         final_status_message = f"<p style='color:green;'>Settings loaded from metadata file. (Preset system had no specific message)</p>"
+
+
+    # Return: list of component updates, custom status for metadata tab, model_status, iteration_info_display
+    return component_updates + [gr.update(value=final_status_message), model_status_gr_obj, iter_info_gr_obj]
+
+# --- Metadata Loading Functions END ---
+
+
 # --- save_last_frame_to_file remains unchanged ---
 def save_last_frame_to_file(frames, output_dir, filename_base):
     """Save only the last frame from a video frames tensor (bcthw format).
@@ -1686,6 +1877,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         "Start Frame Provided": True,
                         "End Frame Provided": has_end_image,
                         "Timestamped Prompts Used": using_timestamped_prompts,
+                        "GPU Inference Preserved Memory (GB)": gpu_memory_preservation, # <-- ADDED
+                        "Video Quality": video_quality, # <-- ADDED
+                        "RIFE FPS Multiplier": rife_multiplier, # <-- ADDED
                     }
                     if adapter_name_to_use != "None":
                         metadata["LoRA"] = adapter_name_to_use
@@ -2575,11 +2769,13 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         "End Frame": end_image_path_str if current_end_image is not None else "None",
                                         "Multi-line Prompts Mode": batch_use_multiline_prompts,
                                         "Generation Index": f"{generation_count_this_prompt}/{num_generations}",
+                                        "GPU Inference Preserved Memory (GB)": gpu_memory_preservation, # <-- ADDED
+                                        "Video Quality": video_quality, # <-- ADDED
+                                        "RIFE FPS Multiplier": rife_multiplier, # <-- ADDED
+                                        "Number of Generations Configured": num_generations, # <-- ADDED
                                     }
                                     if not batch_use_multiline_prompts:
                                          metadata["Timestamped Prompts Parsed"] = "[Check Worker Logs]" # Indicate worker handled it
-                                    if batch_use_multiline_prompts:
-                                        metadata["Prompt Number"] = f"{prompt_idx+1}/{total_prompts_or_loops}"
 
                                     if current_adapter_name != "None":
                                         metadata["LoRA"] = current_adapter_name
@@ -2763,7 +2959,7 @@ def auto_set_window_size(fps_val: int, current_lws: int):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V46 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack Improved SECourses App V47 - https://www.patreon.com/posts/126855226') # Updated Title
     with gr.Row():
         # --- Model Selector ---
         model_selector = gr.Radio(
@@ -2831,6 +3027,12 @@ with block:
                         open_batch_input_folder = gr.Button(value="Open Start Folder")
                         open_batch_end_folder = gr.Button(value="Open End Folder")
                         open_batch_output_folder = gr.Button(value="Open Output Folder")
+
+                with gr.Tab("Load from Metadata File"):
+                    gr.Markdown("Upload a `.txt` metadata file (previously saved by this application) to automatically populate the settings. This will overwrite current settings in all tabs.")
+                    metadata_file_input = gr.File(label="Upload Metadata .txt File", file_types=[".txt"], type="binary")
+                    load_from_metadata_button = gr.Button("Load Settings from File", variant='primary')
+                    metadata_load_status = gr.Markdown("")
 
 
             with gr.Group("Common Settings"): # Group shared settings
@@ -3219,6 +3421,15 @@ with block:
     )
     # --- End Model Switch Wiring ---
 
+    # --- Metadata File Load Wiring START ---
+    load_from_metadata_button.click(
+        fn=load_settings_from_metadata_file,
+        inputs=[metadata_file_input],
+        outputs=preset_components_list + [metadata_load_status, model_status, iteration_info_display],
+        show_progress="full"
+    )
+    # --- Metadata File Load Wiring END ---
+    
     # --- Gradio Event Wiring END ---
 
 
