@@ -677,6 +677,15 @@ def convert_metadata_to_preset_dict(metadata: Dict[str, str]) -> Dict[str, Any]:
     if "Resolution" in metadata:
         preset_dict["resolution"] = metadata["Resolution"] # load_preset_action will validate if it's a valid choice
 
+    # --- ADDED: Load Target Width/Height from metadata if present ---
+    if "Final Width" in metadata:
+        try: preset_dict["target_width"] = int(metadata["Final Width"])
+        except ValueError: print(f"Warning: Could not parse Final Width '{metadata['Final Width']}' as int in metadata.")
+    if "Final Height" in metadata:
+        try: preset_dict["target_height"] = int(metadata["Final Height"])
+        except ValueError: print(f"Warning: Could not parse Final Height '{metadata['Final Height']}' as int in metadata.")
+    # --- END ADDED ---
+
     lora_name_from_meta = metadata.get("LoRA", "None")
     if not lora_name_from_meta or lora_name_from_meta.strip().lower() == "none":
         preset_dict["selected_lora"] = "None"
@@ -1053,7 +1062,8 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
          # --- End LoRA Args Changed ---
          save_individual_frames_flag=False, save_intermediate_frames_flag=False, save_last_frame_flag=False, use_multiline_prompts_flag=False, rife_enabled=False, rife_multiplier="2x FPS",
          # --- ADDED ---
-         active_model: str = MODEL_DISPLAY_NAME_ORIGINAL # Default to original if not passed
+         active_model: str = MODEL_DISPLAY_NAME_ORIGINAL, # Default to original if not passed
+         target_width_from_ui=640, target_height_from_ui=640 # ADDED from sliders
          ):
     # --- MODIFICATION 3b: Remove LoRA loading/cleanup block --- (Already Done)
 
@@ -1210,9 +1220,13 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
             # --- End prompt encoding ---
 
             # Determine bucket size based on start image
-            H, W, C = input_image.shape
-            height, width = find_nearest_bucket(H, W, resolution=resolution)
-            print(f"Found best resolution bucket {width} x {height}")
+            # H, W, C = input_image.shape # Original image dimensions
+            # height, width = find_nearest_bucket(H, W, resolution=resolution) # Old way
+
+            # New way: Use UI target dimensions and resolution string to find final processing dimensions
+            height = target_height_from_ui
+            width = target_width_from_ui
+            print(f"UI Target Dimensions: {target_width_from_ui}x{target_height_from_ui}. Using these directly for processing. Resolution Guide: '{resolution}'.")
 
             # Processing input image (start frame)
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Processing start frame ...'))))
@@ -1871,7 +1885,9 @@ def worker(input_image, end_image, prompt, n_prompt, seed, use_random_seed, tota
                         "CFG Scale": cfg,
                         "Distilled CFG Scale": gs,
                         "Guidance Rescale": rs,
-                        "Resolution": resolution,
+                        "Resolution": resolution, # This is the resolution guide string
+                        "Final Width": width, # ADDED
+                        "Final Height": height, # ADDED
                         "Generation Time": generation_time_formatted,
                         "Total Seconds": f"{generation_time_seconds} seconds",
                         "Start Frame Provided": True,
@@ -2223,16 +2239,21 @@ def switch_active_model(target_model_display_name: str, progress=gr.Progress()):
 def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num_generations, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, teacache_threshold, video_quality='high', export_gif=False, export_apng=False, export_webp=False, save_metadata=True, resolution="640", fps=30, lora_scale=1.0, use_multiline_prompts=False, save_individual_frames=False, save_intermediate_frames=False, save_last_frame=False, rife_enabled=False, rife_multiplier="2x FPS",
              selected_lora_dropdown_value="None",
              # --- ADDED ---
-             selected_model_display_name=DEFAULT_MODEL_NAME):
+             selected_model_display_name=DEFAULT_MODEL_NAME,
+             target_width=640, target_height=640 # ADDED from sliders
+             ):
 
     global stream, currently_loaded_lora_info, active_model_name # Need global state access
-    assert input_image is not None, 'No start input image!'
+    # assert input_image is not None, 'No start input image!' # Modified below
+
+    # --- Generate black image if no input image is provided ---
+    if input_image is None:
+        print(f"No input image provided. Generating black image of size {target_width}x{target_height}.")
+        input_image = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    # --- End black image generation ---
 
     # --- CHECK AND SWITCH MODEL (if necessary) ---
     # This should ideally happen via a dedicated UI interaction, but can be checked here too.
-    # However, doing the potentially long switch here makes the 'Start' button slow.
-    # Assume `switch_active_model` was called via UI change event before this.
-    # We just need to use the current `active_model_name`.
     if selected_model_display_name != active_model_name:
          print(f"Warning: Selected model '{selected_model_display_name}' differs from active model '{active_model_name}'. Using the active model.")
          # Or trigger switch here? Let's rely on the UI event for switching.
@@ -2286,7 +2307,9 @@ def process(input_image, end_image, prompt, n_prompt, seed, use_random_seed, num
                   use_multiline_prompts_flag=use_multiline_prompts,
                   rife_enabled=rife_enabled, rife_multiplier=rife_multiplier,
                   # --- ADDED ---
-                  active_model=current_active_model
+                  active_model=current_active_model,
+                  target_width_from_ui=target_width, # ADDED
+                  target_height_from_ui=target_height # ADDED
                  )
         # --- END MODIFIED WORKER CALL ---
 
@@ -2413,7 +2436,9 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                    rife_enabled=False, rife_multiplier="2x FPS",
                    selected_lora_dropdown_value="None",
                    # --- ADDED ---
-                   selected_model_display_name=DEFAULT_MODEL_NAME):
+                   selected_model_display_name=DEFAULT_MODEL_NAME,
+                   target_width=640, target_height=640 # ADDED from sliders
+                   ):
 
     global stream, batch_stop_requested, currently_loaded_lora_info, active_model_name # Need global state access
 
@@ -2675,7 +2700,9 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                     use_multiline_prompts_flag=batch_use_multiline_prompts,
                     rife_enabled=rife_enabled, rife_multiplier=rife_multiplier,
                     # --- ADDED ---
-                    active_model=current_active_model
+                    active_model=current_active_model,
+                    target_width_from_ui=target_width, # ADDED for batch
+                    target_height_from_ui=target_height # ADDED for batch
                    )
             # --- END MODIFIED WORKER CALL (BATCH) ---
 
@@ -2748,6 +2775,13 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     gen_time_batch_current = time.time() - gen_start_time_batch
                                     generation_time_seconds = int(gen_time_batch_current)
                                     generation_time_formatted = format_time_human_readable(gen_time_batch_current)
+                                    
+                                    # --- Calculate final processing dimensions for batch metadata ---
+                                    final_proc_width_meta = target_width # Use direct UI value
+                                    final_proc_height_meta = target_height # Use direct UI value
+                                    print(f"Batch metadata: Using UI Target Dimensions {target_width}x{target_height} directly. Resolution Guide '{resolution}'.")
+                                    # --- End calculation for batch metadata ---
+                                    
                                     metadata = {
                                         "Model": current_active_model, # <-- ADDED MODEL NAME
                                         "Prompt": current_prompt_segment, # Use the specific prompt segment
@@ -2762,13 +2796,14 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         "CFG Scale": cfg,
                                         "Distilled CFG Scale": gs,
                                         "Guidance Rescale": rs,
-                                        "Resolution": resolution,
+                                        "Resolution": resolution, # Resolution guide string
+                                        "Final Width": final_proc_width_meta, # ADDED for batch metadata
+                                        "Final Height": final_proc_height_meta, # ADDED for batch metadata
                                         "Generation Time": generation_time_formatted,
                                         "Total Seconds": f"{generation_time_seconds} seconds",
                                         "Start Frame": image_path,
-                                        "End Frame": end_image_path_str if current_end_image is not None else "None",
-                                        "Multi-line Prompts Mode": batch_use_multiline_prompts,
-                                        "Generation Index": f"{generation_count_this_prompt}/{num_generations}",
+                                        "End Frame Provided": has_end_image,
+                                        "Timestamped Prompts Used": using_timestamped_prompts,
                                         "GPU Inference Preserved Memory (GB)": gpu_memory_preservation, # <-- ADDED
                                         "Video Quality": video_quality, # <-- ADDED
                                         "RIFE FPS Multiplier": rife_multiplier, # <-- ADDED
@@ -2955,11 +2990,30 @@ def auto_set_window_size(fps_val: int, current_lws: int):
         return gr.update()
 # --- End Auto-set Function ---
 
+# --- Function to update target dimensions from input image --- 
+def update_target_dimensions_from_image(image_array, resolution_str):
+    if image_array is None:
+        # Reset to default if image is cleared
+        print("Input image cleared, resetting target dimensions to default (640x640).")
+        return gr.update(value=640), gr.update(value=640)
+    try:
+        H, W, _ = image_array.shape
+        print(f"Input image uploaded with dimensions: {W}x{H}. Resolution guide: {resolution_str}")
+        # Use find_nearest_bucket to get suggested dimensions
+        bucket_h, bucket_w = find_nearest_bucket(H, W, resolution=resolution_str)
+        print(f"Suggested bucket dimensions: {bucket_w}x{bucket_h}. Updating target sliders.")
+        return gr.update(value=bucket_w), gr.update(value=bucket_h)
+    except Exception as e:
+        print(f"Error processing uploaded image for target dimensions: {e}")
+        traceback.print_exc()
+        # Fallback to default if error
+        return gr.update(value=640), gr.update(value=640)
+# --- End Function to update target dimensions ---
 
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V47 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack Improved SECourses App V48 - https://www.patreon.com/posts/126855226') # Updated Title
     with gr.Row():
         # --- Model Selector ---
         model_selector = gr.Radio(
@@ -3039,6 +3093,9 @@ with block:
                 with gr.Row():
                     num_generations = gr.Slider(label="Number of Generations", minimum=1, maximum=50, value=1, step=1, info="Generate multiple videos in sequence (per image/prompt)")
                     resolution = gr.Dropdown(label="Resolution", choices=["1440","1320","1200","1080","960","840","720", "640", "480", "320", "240"], value="640", info="Output Resolution (bigger than 640 set more Preserved Memory)")
+                with gr.Row():
+                    target_width_slider = gr.Slider(label="Target Width", minimum=256, maximum=2048, value=640, step=32, info="Desired output width. Will be snapped to nearest bucket.")
+                    target_height_slider = gr.Slider(label="Target Height", minimum=256, maximum=2048, value=640, step=32, info="Desired output height. Will be snapped to nearest bucket.")
 
                 with gr.Row():
                     # TeaCache - F1 Demo default is 0.15 (True). Let's use slider like original.
@@ -3063,6 +3120,7 @@ with block:
                     cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=True, info='Needs > 1.0 for Negative Prompt. F1 model typically uses 1.0.')
                     # RS - F1 Demo uses 0.0. Original uses 0.0. Keep common.
                     rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=True, info='Default 0.0 recommended for both models.')
+
 
                 gr.Markdown("### LoRA Settings (Applies to selected model)")
                 with gr.Row():
@@ -3149,6 +3207,7 @@ with block:
         batch_skip_existing, batch_save_metadata, batch_use_multiline_prompts, batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame,
         num_generations, resolution, teacache_threshold, seed, use_random_seed, n_prompt, fps, total_second_length,
         latent_window_size, steps, gs, cfg, rs,
+        target_width_slider, target_height_slider, # ADDED
         selected_lora,
         lora_scale,
         gpu_memory_preservation, video_quality, rife_enabled, rife_multiplier, export_gif, export_apng, export_webp
@@ -3159,6 +3218,7 @@ with block:
         "batch_skip_existing", "batch_save_metadata", "batch_use_multiline_prompts", "batch_save_individual_frames", "batch_save_intermediate_frames", "batch_save_last_frame",
         "num_generations", "resolution", "teacache_threshold", "seed", "use_random_seed", "n_prompt", "fps", "total_second_length",
         "latent_window_size", "steps", "gs", "cfg", "rs",
+        "target_width", "target_height", # ADDED (matching common variable names)
         "selected_lora",
         "lora_scale",
         "gpu_memory_preservation", "video_quality", "rife_enabled", "rife_multiplier", "export_gif", "export_apng", "export_webp"
@@ -3329,7 +3389,8 @@ with block:
            lora_scale,
            use_multiline_prompts, save_individual_frames, save_intermediate_frames, save_last_frame, rife_enabled, rife_multiplier,
            selected_lora, # LoRA dropdown component
-           model_selector # ADDED Model selector component
+           model_selector, # ADDED Model selector component
+           target_width_slider, target_height_slider # ADDED Target W/H Sliders
            ]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed, timing_display])
 
@@ -3354,7 +3415,8 @@ with block:
                  batch_save_individual_frames, batch_save_intermediate_frames, batch_save_last_frame,
                  rife_enabled, rife_multiplier,
                  selected_lora, # LoRA dropdown component
-                 model_selector # ADDED Model selector component
+                 model_selector, # ADDED Model selector component
+                 target_width_slider, target_height_slider # ADDED Target W/H Sliders
                  ]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
 
@@ -3429,6 +3491,21 @@ with block:
         show_progress="full"
     )
     # --- Metadata File Load Wiring END ---
+
+    # --- Target Dimension Update Wiring ---
+    input_image.upload(
+        fn=update_target_dimensions_from_image,
+        inputs=[input_image, resolution],
+        outputs=[target_width_slider, target_height_slider],
+        queue=False
+    )
+    input_image.clear(
+        fn=update_target_dimensions_from_image,
+        inputs=[input_image, resolution], # input_image will be None here
+        outputs=[target_width_slider, target_height_slider],
+        queue=False
+    )
+    # --- End Target Dimension Update Wiring ---
     
     # --- Gradio Event Wiring END ---
 
@@ -3528,10 +3605,18 @@ with block:
         for i, comp in enumerate(preset_components_list):
              # Try to get default value from component definition
              default_value = getattr(comp, 'value', None)
+             # For new sliders, ensure they have a default if getattr returns None unexpectedly
+             if component_names_for_preset[i] == "target_width" and default_value is None:
+                 default_value = 640
+             if component_names_for_preset[i] == "target_height" and default_value is None:
+                 default_value = 640
              initial_values[component_names_for_preset[i]] = default_value
 
         # Ensure Default preset exists with current defaults (including default model)
         initial_values["model_selector"] = active_model_name # Set initial model
+        # Add new sliders to initial_values if not already there by getattr
+        if "target_width" not in initial_values: initial_values["target_width"] = 640
+        if "target_height" not in initial_values: initial_values["target_height"] = 640
         create_default_preset_if_needed(initial_values)
 
         # Load last used preset name, fallback to Default
@@ -3608,6 +3693,7 @@ with block:
                       else:
                            value_to_set = value_from_preset
                  else:
+                      # This will now also handle target_width and target_height
                       value_to_set = value_from_preset # Use preset value directly
             else:
                  print(f"Startup Warning: Key '{comp_name}' missing in '{preset_to_load}'. Using component's default.")
