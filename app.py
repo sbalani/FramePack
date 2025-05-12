@@ -2782,6 +2782,11 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     print(f"Batch metadata: Using UI Target Dimensions {target_width}x{target_height} directly. Resolution Guide '{resolution}'.")
                                     # --- End calculation for batch metadata ---
                                     
+                                    has_end_image = current_end_image is not None # <-- ADD THIS LINE
+
+                                    # Determine if timestamp parsing was attempted based on batch setting
+                                    using_timestamped_prompts = not batch_use_multiline_prompts
+
                                     metadata = {
                                         "Model": current_active_model, # <-- ADDED MODEL NAME
                                         "Prompt": current_prompt_segment, # Use the specific prompt segment
@@ -3013,7 +3018,7 @@ def update_target_dimensions_from_image(image_array, resolution_str):
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V48 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack Improved SECourses App V49 - https://www.patreon.com/posts/126855226') # Updated Title
     with gr.Row():
         # --- Model Selector ---
         model_selector = gr.Radio(
