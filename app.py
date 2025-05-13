@@ -2437,7 +2437,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                    selected_lora_dropdown_value="None",
                    # --- ADDED ---
                    selected_model_display_name=DEFAULT_MODEL_NAME,
-                   target_width=640, target_height=640 # ADDED from sliders
+                   target_width=640, target_height=640, # ADDED from sliders
+                   batch_auto_resize=True # ADDED auto resize parameter
                    ):
 
     global stream, batch_stop_requested, currently_loaded_lora_info, active_model_name # Need global state access
@@ -2495,6 +2496,30 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
 
         start_image_basename = os.path.basename(image_path)
         output_filename_base = os.path.splitext(start_image_basename)[0]
+
+        # --- Auto-resize logic ---
+        if batch_auto_resize:
+            try:
+                # Read the image to get its dimensions
+                img = Image.open(image_path)
+                orig_width, orig_height = img.size
+                
+                # Calculate new dimensions using resolution parameter
+                new_width, new_height = get_nearest_bucket_size(orig_width, orig_height, resolution)
+                
+                if new_width != orig_width or new_height != orig_height:
+                    print(f"Auto-resizing {start_image_basename} from {orig_width}x{orig_height} to {new_width}x{new_height} (target resolution: {resolution})")
+                    # Resize the image
+                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    # Save to a temporary file
+                    temp_path = os.path.join(output_folder, f"temp_{start_image_basename}")
+                    img.save(temp_path)
+                    # Use the resized image for processing
+                    image_path = temp_path
+            except Exception as e:
+                print(f"Error during auto-resize of {start_image_basename}: {str(e)}")
+                # Continue with original image if resize fails
+        # --- End auto-resize logic ---
 
         current_prompt_text = prompt # Default prompt
         custom_prompt = get_prompt_from_txt_file(image_path)
@@ -2937,6 +2962,19 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
     else:
          yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed_display, ""
 
+    # Clean up temporary resized images
+    if batch_auto_resize:
+        try:
+            for file in os.listdir(output_folder):
+                if file.startswith("temp_"):
+                    temp_path = os.path.join(output_folder, file)
+                    try:
+                        os.remove(temp_path)
+                        print(f"Cleaned up temporary file: {file}")
+                    except Exception as e:
+                        print(f"Error cleaning up temporary file {file}: {str(e)}")
+        except Exception as e:
+            print(f"Error during cleanup of temporary files: {str(e)}")
 
 # --- end_process remains unchanged ---
 def end_process():
@@ -3015,10 +3053,56 @@ def update_target_dimensions_from_image(image_array, resolution_str):
         return gr.update(value=640), gr.update(value=640)
 # --- End Function to update target dimensions ---
 
+def get_nearest_bucket_size(width: int, height: int, resolution: str) -> tuple[int, int]:
+    """
+    Calculate the nearest bucket size for an image while maintaining aspect ratio.
+    The bucket size is determined by the resolution parameter and common SDXL bucket sizes.
+    
+    Args:
+        width: Original image width
+        height: Original image height
+        target_width: Target width for processing
+        target_height: Target height for processing
+        
+    Returns:
+        tuple[int, int]: New width and height that maintain aspect ratio and fit in the nearest bucket
+    """
+    # Common SDXL bucket sizes (width, height)
+    bucket_sizes = [
+        (512, 512), (512, 768), (512, 1024),
+        (768, 512), (768, 768), (768, 1024),
+        (1024, 512), (1024, 768), (1024, 1024)
+    ]
+    
+    # Calculate aspect ratio
+    aspect_ratio = width / height
+    
+    # Find the bucket size that best matches our target dimensions while maintaining aspect ratio
+    best_bucket = None
+    min_diff = float('inf')
+    
+    for bucket_w, bucket_h in bucket_sizes:
+        # Calculate dimensions that maintain aspect ratio within this bucket
+        if aspect_ratio > 1:  # Wider than tall
+            new_width = min(bucket_w, int(bucket_h * aspect_ratio))
+            new_height = int(new_width / aspect_ratio)
+        else:  # Taller than wide
+            new_height = min(bucket_h, int(bucket_w / aspect_ratio))
+            new_width = int(new_height * aspect_ratio)
+            
+        # Calculate how different this is from our target dimensions
+        diff = abs(new_width - target_width) + abs(new_height - target_height)
+        
+        if diff < min_diff:
+            min_diff = diff
+            best_bucket = (new_width, new_height)
+    
+    return best_bucket
+
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V49 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack Improved SECourses App V50 - https://www.patreon.com/posts/126855226') # Updated Title
     with gr.Row():
         # --- Model Selector ---
         model_selector = gr.Radio(
@@ -3072,6 +3156,7 @@ with block:
                         batch_skip_existing = gr.Checkbox(label="Skip Existing Files", value=True, info="Skip images where the first expected output video already exists")
                         batch_save_metadata = gr.Checkbox(label="Save Processing Metadata", value=True, info="Save processing parameters in a text file alongside each video")
                         batch_use_multiline_prompts = gr.Checkbox(label="Use Multi-line Prompts", value=False, info="ON: Each line in prompt/.txt is a separate gen. OFF: Try parsing '[secs] prompt' format from full prompt/.txt.")
+                        batch_auto_resize = gr.Checkbox(label="Auto Resize to Nearest Bucket", value=True, info="Automatically resize input images to nearest bucket size while maintaining aspect ratio")
 
                     with gr.Row():
                         batch_save_individual_frames = gr.Checkbox(label="Save Individual Frames", value=False, info="Save each frame of the final video as an individual image (in batch_output/frames_output)")
@@ -3421,7 +3506,8 @@ with block:
                  rife_enabled, rife_multiplier,
                  selected_lora, # LoRA dropdown component
                  model_selector, # ADDED Model selector component
-                 target_width_slider, target_height_slider # ADDED Target W/H Sliders
+                 target_width_slider, target_height_slider, # ADDED Target W/H Sliders
+                 batch_auto_resize # ADDED auto resize checkbox
                  ]
     batch_start_button.click(fn=batch_process, inputs=batch_ips, outputs=[result_video, preview_image, progress_desc, progress_bar, batch_start_button, batch_end_button, seed, timing_display])
 
