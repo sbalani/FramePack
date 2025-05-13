@@ -3061,12 +3061,14 @@ def get_nearest_bucket_size(width: int, height: int, resolution: str) -> tuple[i
     Args:
         width: Original image width
         height: Original image height
-        target_width: Target width for processing
-        target_height: Target height for processing
+        resolution: Target resolution string (e.g. "640", "720", etc.)
         
     Returns:
         tuple[int, int]: New width and height that maintain aspect ratio and fit in the nearest bucket
     """
+    # Convert resolution string to integer
+    target_res = int(resolution)
+    
     # Common SDXL bucket sizes (width, height)
     bucket_sizes = [
         (512, 512), (512, 768), (512, 1024),
@@ -3077,7 +3079,7 @@ def get_nearest_bucket_size(width: int, height: int, resolution: str) -> tuple[i
     # Calculate aspect ratio
     aspect_ratio = width / height
     
-    # Find the bucket size that best matches our target dimensions while maintaining aspect ratio
+    # Find the bucket size that best matches our target resolution while maintaining aspect ratio
     best_bucket = None
     min_diff = float('inf')
     
@@ -3090,8 +3092,12 @@ def get_nearest_bucket_size(width: int, height: int, resolution: str) -> tuple[i
             new_height = min(bucket_h, int(bucket_w / aspect_ratio))
             new_width = int(new_height * aspect_ratio)
             
-        # Calculate how different this is from our target dimensions
-        diff = abs(new_width - target_width) + abs(new_height - target_height)
+        # Calculate how different this is from our target resolution
+        # We want to find the bucket that gets closest to our target resolution
+        # while maintaining aspect ratio
+        target_area = target_res * target_res
+        actual_area = new_width * new_height
+        diff = abs(target_area - actual_area)
         
         if diff < min_diff:
             min_diff = diff
@@ -3102,7 +3108,7 @@ def get_nearest_bucket_size(width: int, height: int, resolution: str) -> tuple[i
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V50 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack Improved SECourses App V51 - https://www.patreon.com/posts/126855226') # Updated Title
     with gr.Row():
         # --- Model Selector ---
         model_selector = gr.Radio(
