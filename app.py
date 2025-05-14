@@ -2488,46 +2488,117 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
 
 
     # --- OUTER BATCH LOOP ---
-    for idx, image_path in enumerate(image_files):
+    for idx, original_image_path_for_loop in enumerate(image_files): # Renamed variable for clarity
         if batch_stop_requested:
             print("Batch stop requested. Exiting batch process.")
             yield final_output, gr.update(visible=False), "Batch processing stopped by user.", "", gr.update(interactive=True), gr.update(interactive=False), current_batch_seed, ""
             return
 
-        start_image_basename = os.path.basename(image_path)
+        start_image_basename = os.path.basename(original_image_path_for_loop)
         output_filename_base = os.path.splitext(start_image_basename)[0]
 
-        # --- Auto-resize logic ---
-        if batch_auto_resize:
-            try:
-                # Read the image to get its dimensions
-                img = Image.open(image_path)
-                orig_width, orig_height = img.size
-                
-                # Calculate new dimensions using resolution parameter
-                new_width, new_height = get_nearest_bucket_size(orig_width, orig_height, resolution)
-                
-                if new_width != orig_width or new_height != orig_height:
-                    print(f"Auto-resizing {start_image_basename} from {orig_width}x{orig_height} to {new_width}x{new_height} (target resolution: {resolution})")
-                    # Resize the image
-                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    # Save to a temporary file
-                    temp_path = os.path.join(output_folder, f"temp_{start_image_basename}")
-                    img.save(temp_path)
-                    # Use the resized image for processing
-                    image_path = temp_path
-            except Exception as e:
-                print(f"Error during auto-resize of {start_image_basename}: {str(e)}")
-                # Continue with original image if resize fails
-        # --- End auto-resize logic ---
+        # --- Image loading and Auto-resize logic START ---
+        input_image_for_worker_np = None
+        effective_width_for_worker = 0
+        effective_height_for_worker = 0
+
+        try:
+            img_pil_original = Image.open(original_image_path_for_loop)
+            if img_pil_original.mode != 'RGB': img_pil_original = img_pil_original.convert('RGB')
+            orig_width_pil, orig_height_pil = img_pil_original.size
+            
+            # Default to original image and dimensions
+            img_for_processing_pil = img_pil_original
+            effective_width_for_worker = orig_width_pil
+            effective_height_for_worker = orig_height_pil
+
+            if batch_auto_resize:
+                print(f"Processing {start_image_basename} with Auto Resize enabled.")
+                target_res_val = int(resolution) # 'resolution' is from UI dropdown e.g. "640"
+                target_pixel_count = target_res_val * target_res_val
+                original_pixel_count = orig_width_pil * orig_height_pil
+
+                if original_pixel_count > 0:
+                    scale_factor = math.sqrt(target_pixel_count / original_pixel_count)
+                    scaled_width_float = orig_width_pil * scale_factor
+                    scaled_height_float = orig_height_pil * scale_factor
+
+                    # Calculate final dimensions for cropping, must be divisible by 32
+                    final_crop_width = math.floor(scaled_width_float / 32.0) * 32
+                    final_crop_height = math.floor(scaled_height_float / 32.0) * 32
+
+                    # Ensure minimum dimensions (e.g., 32x32)
+                    final_crop_width = max(32, final_crop_width)
+                    final_crop_height = max(32, final_crop_height)
+
+                    # Only proceed if dimensions change and are valid
+                    if not (final_crop_width == orig_width_pil and final_crop_height == orig_height_pil) and final_crop_width > 0 and final_crop_height > 0:
+                        print(f"  Auto-resizing {start_image_basename} from {orig_width_pil}x{orig_height_pil}...")
+                        print(f"    Target area from resolution '{resolution}': {target_pixel_count}px.")
+                        print(f"    Scaled aspect-preserved (float) to: {scaled_width_float:.2f}x{scaled_height_float:.2f}")
+                        print(f"    Target final cropped dimensions (divisible by 32): {final_crop_width}x{final_crop_height}")
+
+                        # Determine resize dimensions for smart cropping (fit original aspect into final_crop_width/height box)
+                        img_aspect = orig_width_pil / orig_height_pil
+                        # Avoid division by zero if final_crop_height is somehow zero (though max(32,...) should prevent this)
+                        crop_target_aspect = final_crop_width / final_crop_height if final_crop_height > 0 else 1.0 
+
+                        if img_aspect > crop_target_aspect: # Image is wider than target crop aspect
+                            # Fit to target height, width will be larger or equal
+                            resize_h_for_crop = final_crop_height
+                            resize_w_for_crop = int(round(final_crop_height * img_aspect))
+                        else: # Image is taller or same aspect as target crop
+                            # Fit to target width, height will be larger or equal
+                            resize_w_for_crop = final_crop_width
+                            resize_h_for_crop = int(round(final_crop_width / img_aspect))
+                        
+                        # Ensure resize dimensions are at least 1x1 for PIL
+                        resize_w_for_crop = max(1, resize_w_for_crop)
+                        resize_h_for_crop = max(1, resize_h_for_crop)
+                        
+                        print(f"    Resizing original to {resize_w_for_crop}x{resize_h_for_crop} for center cropping...")
+                        img_resized_for_cropping = img_pil_original.resize((resize_w_for_crop, resize_h_for_crop), Image.Resampling.LANCZOS)
+
+                        # Perform center crop
+                        current_w_rc, current_h_rc = img_resized_for_cropping.size
+                        left = (current_w_rc - final_crop_width) / 2
+                        top = (current_h_rc - final_crop_height) / 2
+                        right = (current_w_rc + final_crop_width) / 2
+                        bottom = (current_h_rc + final_crop_height) / 2
+                        
+                        img_for_processing_pil = img_resized_for_cropping.crop((int(round(left)), int(round(top)), int(round(right)), int(round(bottom))))
+                        effective_width_for_worker = final_crop_width
+                        effective_height_for_worker = final_crop_height
+                        print(f"    Resized and center-cropped to: {effective_width_for_worker}x{effective_height_for_worker}")
+                    else:
+                        print(f"  Image {start_image_basename} ({orig_width_pil}x{orig_height_pil}) already meets target criteria or does not require changes. Using original dimensions.")
+                        # img_for_processing_pil and effective dimensions remain as original
+                else: # original_pixel_count <= 0
+                    print(f"  Warning: Original image {start_image_basename} has zero or negative pixels. Using original dimensions {orig_width_pil}x{orig_height_pil}.")
+                    # img_for_processing_pil and effective dimensions remain as original
+            
+            # Convert the (potentially resized/cropped) PIL image to numpy array for the worker
+            input_image_for_worker_np = np.array(img_for_processing_pil)
+            if len(input_image_for_worker_np.shape) == 2: # Handle grayscale images
+                 input_image_for_worker_np = np.stack([input_image_for_worker_np]*3, axis=2)
+            
+            print(f"  Prepared image {start_image_basename} for worker with final dimensions: {effective_width_for_worker}x{effective_height_for_worker}")
+
+        except Exception as e:
+            print(f"Error loading or auto-resizing image {original_image_path_for_loop}: {str(e)}")
+            traceback.print_exc()
+            yield None, None, f"Error processing {idx+1}/{len(image_files)}: {start_image_basename} - {str(e)}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed_display, ""
+            continue # Skip to the next image file in the batch
+        # --- Image loading and Auto-resize logic END ---
+
 
         current_prompt_text = prompt # Default prompt
-        custom_prompt = get_prompt_from_txt_file(image_path)
+        custom_prompt = get_prompt_from_txt_file(original_image_path_for_loop) # Use original path
         if custom_prompt:
             current_prompt_text = custom_prompt
-            print(f"Using custom prompt from txt file for {image_path}")
+            print(f"Using custom prompt from txt file for {original_image_path_for_loop}")
         else:
-            print(f"Using default batch prompt for {image_path}")
+            print(f"Using default batch prompt for {original_image_path_for_loop}")
 
 
         if batch_use_multiline_prompts:
@@ -2575,20 +2646,20 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                  skip_this_image = exists_mp4 # Skip if MP4 exists
 
         if skip_this_image:
-            print(f"Skipping {image_path} - output already exists")
+            print(f"Skipping {original_image_path_for_loop} - output already exists")
             yield None, None, f"Skipping {idx+1}/{len(image_files)}: {start_image_basename} - already processed", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed, ""
             continue
         # --- End Skip Check ---
 
 
         try:
-            img = Image.open(image_path)
+            img = Image.open(original_image_path_for_loop)
             if img.mode != 'RGB': img = img.convert('RGB')
             input_image = np.array(img)
             if len(input_image.shape) == 2: input_image = np.stack([input_image]*3, axis=2)
-            print(f"Loaded start image {image_path} with shape {input_image.shape} and dtype {input_image.dtype}")
+            print(f"Loaded start image {original_image_path_for_loop} with shape {input_image.shape} and dtype {input_image.dtype}")
         except Exception as e:
-            print(f"Error loading start image {image_path}: {str(e)}")
+            print(f"Error loading start image {original_image_path_for_loop}: {str(e)}")
             yield None, None, f"Error processing {idx+1}/{len(image_files)}: {start_image_basename} - {str(e)}", "", gr.update(interactive=False), gr.update(interactive=True), current_batch_seed, ""
             continue
 
@@ -2706,7 +2777,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
 
             # --- MODIFIED WORKER CALL (BATCH - Add active_model) ---
             async_run(worker_function_to_call,
-                    input_image, current_end_image, current_prompt_segment, n_prompt,
+                    input_image_for_worker_np, # UPDATED: Pass the processed numpy array
+                    current_end_image, current_prompt_segment, n_prompt,
                     current_batch_seed_display, # Use the seed calculated for this specific task
                     False, # Use fixed seed for each generation within the same image/prompt
                     total_second_length, latent_window_size, steps, cfg, gs, rs,
@@ -2726,8 +2798,8 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                     rife_enabled=rife_enabled, rife_multiplier=rife_multiplier,
                     # --- ADDED ---
                     active_model=current_active_model,
-                    target_width_from_ui=target_width, # ADDED for batch
-                    target_height_from_ui=target_height # ADDED for batch
+                    target_width_from_ui=effective_width_for_worker, # UPDATED: Pass effective dimensions
+                    target_height_from_ui=effective_height_for_worker # UPDATED: Pass effective dimensions
                    )
             # --- END MODIFIED WORKER CALL (BATCH) ---
 
@@ -2802,9 +2874,9 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                     generation_time_formatted = format_time_human_readable(gen_time_batch_current)
                                     
                                     # --- Calculate final processing dimensions for batch metadata ---
-                                    final_proc_width_meta = target_width # Use direct UI value
-                                    final_proc_height_meta = target_height # Use direct UI value
-                                    print(f"Batch metadata: Using UI Target Dimensions {target_width}x{target_height} directly. Resolution Guide '{resolution}'.")
+                                    final_proc_width_meta = effective_width_for_worker # UPDATED
+                                    final_proc_height_meta = effective_height_for_worker # UPDATED
+                                    print(f"Batch metadata: Using effective dimensions {effective_width_for_worker}x{effective_height_for_worker}. Resolution Guide from UI '{resolution}'.") # UPDATED PRINT
                                     # --- End calculation for batch metadata ---
                                     
                                     has_end_image = current_end_image is not None # <-- ADD THIS LINE
@@ -2831,7 +2903,7 @@ def batch_process(input_folder, output_folder, batch_end_frame_folder, prompt, n
                                         "Final Height": final_proc_height_meta, # ADDED for batch metadata
                                         "Generation Time": generation_time_formatted,
                                         "Total Seconds": f"{generation_time_seconds} seconds",
-                                        "Start Frame": image_path,
+                                        "Start Frame": original_image_path_for_loop, # Use original path
                                         "End Frame Provided": has_end_image,
                                         "Timestamped Prompts Used": using_timestamped_prompts,
                                         "GPU Inference Preserved Memory (GB)": gpu_memory_preservation, # <-- ADDED
@@ -3108,7 +3180,7 @@ def get_nearest_bucket_size(width: int, height: int, resolution: str) -> tuple[i
 css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
-    gr.Markdown('# FramePack Improved SECourses App V51 - https://www.patreon.com/posts/126855226') # Updated Title
+    gr.Markdown('# FramePack Improved SECourses App V52 - https://www.patreon.com/posts/126855226') # Updated Title
     with gr.Row():
         # --- Model Selector ---
         model_selector = gr.Radio(
