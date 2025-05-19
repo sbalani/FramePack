@@ -136,6 +136,8 @@ loras_folder =os .path .join (current_dir ,'loras')
 presets_folder =os .path .join (current_dir ,'presets')
 last_used_preset_file =os .path .join (presets_folder ,'_lastused.txt')
 
+TEMP_METADATA_FOLDER = os.path.join(outputs_folder, 'outputs')
+
 batch_stop_requested =False 
 
 N_LORA = 4  # Number of supported LoRA slots
@@ -160,7 +162,8 @@ intermediate_individual_frames_folder ,
 last_frames_folder ,
 intermediate_last_frames_folder ,
 loras_folder ,
-presets_folder 
+presets_folder,
+TEMP_METADATA_FOLDER
 ]:
     try :
         os .makedirs (directory ,exist_ok =True )
@@ -261,18 +264,38 @@ def format_time_human_readable (seconds ):
     else :
         return f"{seconds} seconds"
 
-def save_processing_metadata (output_path ,metadata ):
+def save_processing_metadata (output_path_for_final_file: Optional[str],
+                              metadata_dict: Dict[str, Any],
+                              is_temporary: bool = False,
+                              job_id_for_temp: Optional[str] = None,
+                              base_folder_for_temp_metadata: Optional[str] = None
+                             ):
+    metadata_path = ""
+    if is_temporary:
+        if not job_id_for_temp:
+            print("ERROR: job_id_for_temp must be provided for temporary metadata.")
+            return False
+        if not base_folder_for_temp_metadata:
+            print("ERROR: base_folder_for_temp_metadata must be provided for temporary metadata.")
+            return False
+        os.makedirs(base_folder_for_temp_metadata, exist_ok=True) # Ensure base folder exists
+        metadata_path = get_temp_metadata_filepath_for_job(job_id_for_temp, base_folder_for_temp_metadata)
+    elif output_path_for_final_file:
+        metadata_path = os.path.splitext(output_path_for_final_file)[0] + '_metadata.txt'
+    else:
+        print("ERROR: output_path_for_final_file must be provided for final metadata, or is_temporary must be True with job_id_for_temp and base_folder_for_temp_metadata.")
+        return False
 
-    metadata_path =os .path .splitext (output_path )[0 ]+'_metadata.txt'
     try :
-
         os .makedirs (os .path .dirname (metadata_path ),exist_ok =True )
         with open (metadata_path ,'w',encoding ='utf-8')as f :
-
-            f .write (f"Model: {metadata.pop('Model', 'Unknown')}\n")
-
-            for key ,value in metadata .items ():
+            # Ensure Model is always first if present
+            if "Model" in metadata_dict:
+                 f .write (f"Model: {metadata_dict.pop('Model', 'Unknown')}\n") # Use .pop with default
+            # Write other items
+            for key ,value in metadata_dict .items (): 
                 f .write (f"{key}: {value}\n")
+        print(f"Successfully saved metadata to {metadata_path}")
         return True 
     except Exception as e :
         print (f"Error saving metadata to {metadata_path}: {str(e)}")
@@ -475,6 +498,18 @@ def force_remove_lora_modules (model ):
         return False 
 
 print_supported_image_formats ()
+
+def get_temp_metadata_filepath_for_job(job_id: str, base_folder: str) -> str:
+    return os.path.join(base_folder, f"{job_id}_temp_metadata.txt")
+
+def delete_temporary_metadata_for_job(job_id: str, base_folder: str):
+    temp_meta_path = get_temp_metadata_filepath_for_job(job_id, base_folder)
+    try:
+        if os.path.exists(temp_meta_path):
+            os.remove(temp_meta_path)
+            print(f"Successfully deleted temporary metadata: {temp_meta_path}")
+    except Exception as e:
+        print(f"Error deleting temporary metadata {temp_meta_path}: {str(e)}")
 
 def get_preset_path (name :str )->str :
 
@@ -686,6 +721,9 @@ def convert_metadata_to_preset_dict (metadata :Dict [str ,str ])->Dict [str ,Any
     if "GPU Inference Preserved Memory (GB)"in metadata :
         try :preset_dict ["gpu_memory_preservation"]=float (metadata ["GPU Inference Preserved Memory (GB)"])
         except ValueError :print (f"Warning: Could not parse GPU Memory '{metadata['GPU Inference Preserved Memory (GB)']}' as float.")
+
+    if "Save Temporary Metadata Setting" in metadata:
+        preset_dict["save_temp_metadata"] = metadata["Save Temporary Metadata Setting"].lower() == "true"
 
     return preset_dict 
 
@@ -943,61 +981,19 @@ lora_scales=None,
 save_individual_frames_flag =False ,save_intermediate_frames_flag =False ,save_last_frame_flag =False ,use_multiline_prompts_flag =False ,rife_enabled =False ,rife_multiplier ="2x FPS",
 
 active_model :str =MODEL_DISPLAY_NAME_ORIGINAL ,
-target_width_from_ui =640 ,target_height_from_ui =640 ,
-immediate_metadata =True 
+target_width_from_ui =640 ,target_height_from_ui =640,
+save_temp_metadata_ui_value: bool = True # New parameter
 ):
 
     global transformer ,text_encoder ,text_encoder_2 ,image_encoder ,vae 
     global individual_frames_folder ,intermediate_individual_frames_folder ,last_frames_folder ,intermediate_last_frames_folder 
     global currently_loaded_lora_info
+    global outputs_folder # Ensure outputs_folder is accessible
 
     if selected_lora_dropdown_values is None:
         selected_lora_dropdown_values = ["None"] * N_LORA
     if lora_scales is None:
         lora_scales = [1.0] * N_LORA
-
-    # Generate metadata immediately if requested
-    if immediate_metadata:
-        metadata = {
-            'Model': active_model,
-            'Prompt': prompt,
-            'Negative Prompt': n_prompt,
-            'Seed': seed,
-            'Use Random Seed': use_random_seed,
-            'Total Second Length': total_second_length,
-            'Latent Window Size': latent_window_size,
-            'Steps': steps,
-            'CFG': cfg,
-            'GS': gs,
-            'RS': rs,
-            'GPU Memory Preservation': gpu_memory_preservation,
-            'TeaCache Threshold': teacache_threshold,
-            'Video Quality': video_quality,
-            'Export GIF': export_gif,
-            'Export APNG': export_apng,
-            'Export WebP': export_webp,
-            'Resolution': resolution,
-            'FPS': fps,
-            'Use Multiline Prompts': use_multiline_prompts_flag,
-            'Save Individual Frames': save_individual_frames_flag,
-            'Save Intermediate Frames': save_intermediate_frames_flag,
-            'Save Last Frame': save_last_frame_flag,
-            'RIFE Enabled': rife_enabled,
-            'RIFE Multiplier': rife_multiplier,
-            'Target Width': target_width_from_ui,
-            'Target Height': target_height_from_ui
-        }
-        
-        # Add LoRA information
-        for i in range(N_LORA):
-            if selected_lora_dropdown_values[i] != "None":
-                metadata[f'LoRA {i+1}'] = selected_lora_dropdown_values[i]
-                metadata[f'LoRA {i+1} Scale'] = lora_scales[i]
-        
-        # Create a temporary path for the metadata file
-        temp_metadata_path = os.path.join(outputs_folder, f'temp_metadata_{generate_new_timestamp()}.txt')
-        save_processing_metadata(temp_metadata_path, metadata)
-        print(f"Generated immediate metadata at {temp_metadata_path}")
 
     # Prepare unique adapter names and scales for set_adapters
     peft_adapters_to_activate = []  # list of (adapter_name, scale)
@@ -1109,8 +1105,66 @@ immediate_metadata =True
         last_used_seed =current_seed 
         stream .output_queue .push (('seed_update',current_seed ))
 
-        job_id =generate_new_timestamp ()
+        job_id =generate_new_timestamp () # This will be our unique ID for temp metadata
         stream .output_queue .push (('progress',(None ,'',make_progress_bar_html (0 ,f'Starting generation {gen_idx+1}/{num_generations} with seed {current_seed} using {active_model}...'))))
+        
+        print(f"[Worker Debug] job_id: {job_id}, save_temp_metadata_ui_value: {save_temp_metadata_ui_value}")
+
+        if save_temp_metadata_ui_value:
+            print(f"[Worker Debug] Entered block to save temporary metadata for job_id: {job_id}")
+            # Prepare metadata dictionary for temporary saving
+            # Note: using_timestamped_prompts is determined later. We can save without it for now,
+            # or update the temp file later if strictly needed (more complex).
+            # For simplicity, save what's known now.
+            current_metadata_for_temp = {
+                "Model": active_model,
+                "Prompt": prompt, # Use the prompt passed to worker
+                "Negative Prompt": n_prompt,
+                "Seed": current_seed,
+                "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0.0 else "Disabled",
+                "Video Length (seconds)": total_second_length,
+                "FPS": fps,
+                "Latent Window Size": latent_window_size,
+                "Steps": steps,
+                "CFG Scale": cfg,
+                "Distilled CFG Scale": gs,
+                "Guidance Rescale": rs,
+                "Resolution": resolution,
+                "Final Width": target_width_from_ui, # Use actual processing width
+                "Final Height": target_height_from_ui, # Use actual processing height
+                "Start Frame Provided": input_image is not None, # Check if input_image was provided
+                "End Frame Provided": end_image is not None,
+                "GPU Inference Preserved Memory (GB)": gpu_memory_preservation,
+                "Video Quality": video_quality,
+                "RIFE FPS Multiplier": rife_multiplier,
+                "Save Temporary Metadata Setting": save_temp_metadata_ui_value,
+                # Add other relevant settings that are known at this point
+                "Number of Generations Configured": num_generations,
+                "Use Random Seed Setting": use_random_seed,
+                "Use Multiline Prompts Setting (Worker)": use_multiline_prompts_flag,
+            }
+            # Add LoRA info if any are selected via dropdowns
+            if selected_lora_dropdown_values and lora_scales:
+                for i in range(N_LORA):
+                    lora_name = selected_lora_dropdown_values[i]
+                    lora_scale_val = lora_scales[i]
+                    if lora_name and lora_name != "None":
+                        if i == 0: # First LoRA
+                            current_metadata_for_temp["LoRA"] = lora_name
+                            current_metadata_for_temp["LoRA Scale"] = lora_scale_val
+                        else: # Subsequent LoRAs
+                            current_metadata_for_temp[f"LoRA {i+1} Name"] = lora_name
+                            current_metadata_for_temp[f"LoRA {i+1} Scale"] = lora_scale_val
+            
+            base_folder_for_job_temp_metadata = outputs_folder # Define the base folder for this job's temp metadata
+            save_processing_metadata(
+                output_path_for_final_file=None, 
+                metadata_dict=current_metadata_for_temp.copy(), # Pass a copy
+                is_temporary=True,
+                job_id_for_temp=job_id,
+                base_folder_for_temp_metadata=base_folder_for_job_temp_metadata
+            )
+            # print(f"Saved temporary metadata for job_id: {job_id}") # Already printed by save_processing_metadata if successful
 
         try :
 
@@ -1764,7 +1818,20 @@ immediate_metadata =True
                                 metadata[f"LoRA {i+1} Name"] = lora_name
                                 metadata[f"LoRA {i+1} Scale"] = lora_scale
 
-                    if output_filename :save_processing_metadata (output_filename ,metadata .copy ())
+                    metadata["Save Temporary Metadata Setting"] = save_temp_metadata_ui_value # Add the setting itself to final metadata
+
+                    final_metadata_saved_successfully = True
+                    final_metadata_for_main_output_saved = False
+                    if output_filename: 
+                        if save_processing_metadata (output_filename ,metadata .copy ()):
+                            final_metadata_for_main_output_saved = True
+                        else:
+                             final_metadata_saved_successfully = False # Though this var isn't used after this block
+
+                    if final_metadata_for_main_output_saved and save_temp_metadata_ui_value:
+                        base_folder_for_job_temp_metadata = outputs_folder # Same base folder used for creation
+                        delete_temporary_metadata_for_job(job_id, base_folder_for_job_temp_metadata)
+
                     final_gif_path =os .path .join (gif_videos_folder ,f'{job_id}.gif')
                     if export_gif and os .path .exists (final_gif_path ):
                         save_processing_metadata (final_gif_path ,metadata .copy ())
@@ -2077,8 +2144,8 @@ selected_lora_1="None", selected_lora_2="None", selected_lora_3="None", selected
 use_multiline_prompts =False ,save_individual_frames =False ,save_intermediate_frames =False ,save_last_frame =False ,rife_enabled =False ,rife_multiplier ="2x FPS",
 
 selected_model_display_name =DEFAULT_MODEL_NAME ,
-target_width =640 ,target_height =640 ,
-immediate_metadata =True 
+target_width =640 ,target_height =640,
+save_temp_metadata_ui_value_from_ui: bool = True
 ):
 
     global stream ,currently_loaded_lora_info ,active_model_name 
@@ -2138,7 +2205,7 @@ immediate_metadata =True
             active_model =current_active_model ,
             target_width_from_ui =target_width ,
             target_height_from_ui =target_height ,
-            immediate_metadata =immediate_metadata 
+            save_temp_metadata_ui_value = save_temp_metadata_ui_value_from_ui # Pass the UI value
         )
 
         output_filename =None 
@@ -2259,8 +2326,8 @@ batch_save_individual_frames =False ,batch_save_intermediate_frames =False ,batc
 rife_enabled =False ,rife_multiplier ="2x FPS",
 selected_model_display_name =DEFAULT_MODEL_NAME ,
 target_width =640 ,target_height =640 ,
-batch_auto_resize =True ,
-immediate_metadata =True 
+batch_auto_resize =True,
+save_temp_metadata_ui_value_from_ui: bool = True
 ):
 
     global stream ,batch_stop_requested ,currently_loaded_lora_info ,active_model_name 
@@ -2271,52 +2338,6 @@ immediate_metadata =True
     if selected_model_display_name !=active_model_name :
          print (f"Warning: Selected batch model '{selected_model_display_name}' differs from active model '{active_model_name}'. Using the active model for the entire batch.")
     current_active_model =active_model_name 
-
-    # Generate batch metadata immediately if requested
-    if immediate_metadata:
-        metadata = {
-            'Model': current_active_model,
-            'Prompt': prompt,
-            'Negative Prompt': n_prompt,
-            'Seed': seed,
-            'Use Random Seed': use_random_seed,
-            'Total Second Length': total_second_length,
-            'Latent Window Size': latent_window_size,
-            'Steps': steps,
-            'CFG': cfg,
-            'GS': gs,
-            'RS': rs,
-            'GPU Memory Preservation': gpu_memory_preservation,
-            'TeaCache Threshold': teacache_threshold,
-            'Video Quality': video_quality,
-            'Export GIF': export_gif,
-            'Export APNG': export_apng,
-            'Export WebP': export_webp,
-            'Resolution': resolution,
-            'FPS': fps,
-            'Use Multiline Prompts': batch_use_multiline_prompts,
-            'Save Individual Frames': batch_save_individual_frames,
-            'Save Intermediate Frames': batch_save_intermediate_frames,
-            'Save Last Frame': batch_save_last_frame,
-            'RIFE Enabled': rife_enabled,
-            'RIFE Multiplier': rife_multiplier,
-            'Target Width': target_width,
-            'Target Height': target_height,
-            'Batch Auto Resize': batch_auto_resize
-        }
-        
-        # Add LoRA information
-        selected_lora_dropdown_values = [selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4]
-        lora_scales = [lora_scale_1, lora_scale_2, lora_scale_3, lora_scale_4]
-        for i in range(N_LORA):
-            if selected_lora_dropdown_values[i] != "None":
-                metadata[f'LoRA {i+1}'] = selected_lora_dropdown_values[i]
-                metadata[f'LoRA {i+1} Scale'] = lora_scales[i]
-        
-        # Create a temporary path for the batch metadata file
-        temp_metadata_path = os.path.join(outputs_batch_folder, f'batch_metadata_{generate_new_timestamp()}.txt')
-        save_processing_metadata(temp_metadata_path, metadata)
-        print(f"Generated immediate batch metadata at {temp_metadata_path}")
 
     # Multi-LoRA: collect all 4 dropdowns and scales
     selected_lora_dropdown_values = [selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4]
@@ -2624,7 +2645,8 @@ immediate_metadata =True
             rife_enabled =rife_enabled ,rife_multiplier =rife_multiplier ,
             active_model =current_active_model ,
             target_width_from_ui =effective_width_for_worker ,
-            target_height_from_ui =effective_height_for_worker 
+            target_height_from_ui =effective_height_for_worker ,
+            save_temp_metadata_ui_value = save_temp_metadata_ui_value_from_ui # Pass the UI value
             )
 
             output_filename_from_worker =None 
@@ -3030,10 +3052,29 @@ with block :
                     load_from_metadata_button =gr .Button ("Load Settings from File",variant ='primary')
                     metadata_load_status =gr .Markdown ("")
 
+                with gr .Row ():
+
+                    gpu_memory_preservation =gr .Slider (label ="GPU Inference Preserved Memory (GB)",minimum =0 ,maximum =128 ,value =8 ,step =0.1 ,info ="Increase this until you don't use shared VRAM. If you increase unnecessarily it will become slower. However If you make this lower than expected, It will use shared VRAM and will become ultra slow. Follow nvitop and monitor GPU watt usage")
+
+                    def update_memory_for_resolution (res ):
+
+                        res_int =int (res )
+                        if res_int >=1440 :return 23 
+                        elif res_int >=1320 :return 21 
+                        elif res_int >=1200 :return 19 
+                        elif res_int >=1080 :return 16 
+                        elif res_int >=960 :return 14 
+                        elif res_int >=840 :return 12 
+                        elif res_int >=720 :return 10 
+                        elif res_int >=640 :return 8 
+                        else :return 6 
+                    
+
             with gr .Group ("Common Settings"):
                 with gr .Row ():
                     num_generations =gr .Slider (label ="Number of Generations",minimum =1 ,maximum =50 ,value =1 ,step =1 ,info ="Generate multiple videos in sequence (per image/prompt)")
                     resolution =gr .Dropdown (label ="Resolution",choices =["1440","1320","1200","1080","960","840","720","640","480","320","240"],value ="640",info ="Output Resolution (bigger than 640 set more Preserved Memory)")
+                    resolution.change (fn=update_memory_for_resolution ,inputs=resolution ,outputs=gpu_memory_preservation )
                 with gr .Row ():
                     target_width_slider =gr .Slider (label ="Target Width",minimum =256 ,maximum =2048 ,value =640 ,step =32 ,info ="Desired output width. Will be snapped to nearest bucket.")
                     target_height_slider =gr .Slider (label ="Target Height",minimum =256 ,maximum =2048 ,value =640 ,step =32 ,info ="Desired output height. Will be snapped to nearest bucket.")
@@ -3078,23 +3119,7 @@ with block :
                         lora_scale_3 =gr .Slider (label ="LoRA 3 Scale",minimum =0.0 ,maximum =9.0 ,value =1.0 ,step =0.01 ,info ="Adjust the strength of the LoRA 3 effect")
                         lora_scale_4 =gr .Slider (label ="LoRA 4 Scale",minimum =0.0 ,maximum =9.0 ,value =1.0 ,step =0.01 ,info ="Adjust the strength of the LoRA 4 effect")
 
-                with gr .Row ():
 
-                    gpu_memory_preservation =gr .Slider (label ="GPU Inference Preserved Memory (GB)",minimum =0 ,maximum =128 ,value =8 ,step =0.1 ,info ="Memory to keep free on GPU (Low VRAM mode). Larger value causes slower speed but helps prevent OOM. Adjust based on Resolution and VRAM.")
-
-                    def update_memory_for_resolution (res ):
-
-                        res_int =int (res )
-                        if res_int >=1440 :return 23 
-                        elif res_int >=1320 :return 21 
-                        elif res_int >=1200 :return 19 
-                        elif res_int >=1080 :return 16 
-                        elif res_int >=960 :return 14 
-                        elif res_int >=840 :return 12 
-                        elif res_int >=720 :return 10 
-                        elif res_int >=640 :return 8 
-                        else :return 6 
-                    resolution .change (fn =update_memory_for_resolution ,inputs =resolution ,outputs =gpu_memory_preservation )
 
         with gr .Column ():
             preview_image =gr .Image (label ="Next Latents",height =200 ,visible =False )
@@ -3142,8 +3167,8 @@ with block :
                 export_gif =gr .Checkbox (label ="Export as GIF",value =False ,info ="Save animation as GIF")
                 export_apng =gr .Checkbox (label ="Export as APNG",value =False ,info ="Save animation as Animated PNG")
                 export_webp =gr .Checkbox (label ="Export as WebP",value =False ,info ="Save animation as WebP")
-
-            immediate_metadata = gr.Checkbox(label="Generate Metadata Immediately", value=True, info="Generate metadata file as soon as generation starts")
+            with gr .Row ():
+                save_temp_metadata = gr.Checkbox(label="Save Temporary Metadata", value=True, info="If generation fails or is cancelled, metadata up to that point is kept as a temporary file. This temp file is deleted on successful generation of final metadata.")
 
     preset_components_list =[
     model_selector ,
@@ -3154,8 +3179,8 @@ with block :
     target_width_slider ,target_height_slider ,
     selected_lora_1 ,selected_lora_2 ,selected_lora_3 ,selected_lora_4 ,
     lora_scale_1 ,lora_scale_2 ,lora_scale_3 ,lora_scale_4 ,
-    gpu_memory_preservation ,video_quality ,rife_enabled ,rife_multiplier ,export_gif ,export_apng ,export_webp ,
-    immediate_metadata
+    gpu_memory_preservation ,video_quality ,rife_enabled ,rife_multiplier ,export_gif ,export_apng ,export_webp,
+    save_temp_metadata
     ]
     component_names_for_preset =[
     "model_selector",
@@ -3167,7 +3192,7 @@ with block :
     "selected_lora_1","selected_lora_2","selected_lora_3","selected_lora_4",
     "lora_scale_1","lora_scale_2","lora_scale_3","lora_scale_4",
     "gpu_memory_preservation","video_quality","rife_enabled","rife_multiplier","export_gif","export_apng","export_webp",
-    "immediate_metadata"
+    "save_temp_metadata"
     ]
 
     def save_preset_action (name :str ,*values ):
@@ -3322,7 +3347,7 @@ with block :
     use_multiline_prompts ,save_individual_frames ,save_intermediate_frames ,save_last_frame ,rife_enabled ,rife_multiplier ,
     model_selector ,
     target_width_slider ,target_height_slider ,
-    immediate_metadata
+    save_temp_metadata # Add the checkbox component here
     ]
     start_button .click (fn =process ,inputs =ips ,outputs =[result_video ,preview_image ,progress_desc ,progress_bar ,start_button ,end_button ,seed ,timing_display ])
 
@@ -3347,8 +3372,8 @@ with block :
     rife_enabled ,rife_multiplier ,
     model_selector ,
     target_width_slider ,target_height_slider ,
-    batch_auto_resize ,
-    immediate_metadata
+    batch_auto_resize,
+    save_temp_metadata # Add the checkbox component here
     ]
     batch_start_button .click (fn =batch_process ,inputs =batch_ips ,outputs =[result_video ,preview_image ,progress_desc ,progress_bar ,batch_start_button ,batch_end_button ,seed ,timing_display ])
 
