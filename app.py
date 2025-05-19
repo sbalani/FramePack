@@ -943,7 +943,8 @@ lora_scales=None,
 save_individual_frames_flag =False ,save_intermediate_frames_flag =False ,save_last_frame_flag =False ,use_multiline_prompts_flag =False ,rife_enabled =False ,rife_multiplier ="2x FPS",
 
 active_model :str =MODEL_DISPLAY_NAME_ORIGINAL ,
-target_width_from_ui =640 ,target_height_from_ui =640 
+target_width_from_ui =640 ,target_height_from_ui =640 ,
+immediate_metadata =True 
 ):
 
     global transformer ,text_encoder ,text_encoder_2 ,image_encoder ,vae 
@@ -954,6 +955,49 @@ target_width_from_ui =640 ,target_height_from_ui =640
         selected_lora_dropdown_values = ["None"] * N_LORA
     if lora_scales is None:
         lora_scales = [1.0] * N_LORA
+
+    # Generate metadata immediately if requested
+    if immediate_metadata:
+        metadata = {
+            'Model': active_model,
+            'Prompt': prompt,
+            'Negative Prompt': n_prompt,
+            'Seed': seed,
+            'Use Random Seed': use_random_seed,
+            'Total Second Length': total_second_length,
+            'Latent Window Size': latent_window_size,
+            'Steps': steps,
+            'CFG': cfg,
+            'GS': gs,
+            'RS': rs,
+            'GPU Memory Preservation': gpu_memory_preservation,
+            'TeaCache Threshold': teacache_threshold,
+            'Video Quality': video_quality,
+            'Export GIF': export_gif,
+            'Export APNG': export_apng,
+            'Export WebP': export_webp,
+            'Resolution': resolution,
+            'FPS': fps,
+            'Use Multiline Prompts': use_multiline_prompts_flag,
+            'Save Individual Frames': save_individual_frames_flag,
+            'Save Intermediate Frames': save_intermediate_frames_flag,
+            'Save Last Frame': save_last_frame_flag,
+            'RIFE Enabled': rife_enabled,
+            'RIFE Multiplier': rife_multiplier,
+            'Target Width': target_width_from_ui,
+            'Target Height': target_height_from_ui
+        }
+        
+        # Add LoRA information
+        for i in range(N_LORA):
+            if selected_lora_dropdown_values[i] != "None":
+                metadata[f'LoRA {i+1}'] = selected_lora_dropdown_values[i]
+                metadata[f'LoRA {i+1} Scale'] = lora_scales[i]
+        
+        # Create a temporary path for the metadata file
+        temp_metadata_path = os.path.join(outputs_folder, f'temp_metadata_{generate_new_timestamp()}.txt')
+        save_processing_metadata(temp_metadata_path, metadata)
+        print(f"Generated immediate metadata at {temp_metadata_path}")
 
     # Prepare unique adapter names and scales for set_adapters
     peft_adapters_to_activate = []  # list of (adapter_name, scale)
@@ -2033,7 +2077,8 @@ selected_lora_1="None", selected_lora_2="None", selected_lora_3="None", selected
 use_multiline_prompts =False ,save_individual_frames =False ,save_intermediate_frames =False ,save_last_frame =False ,rife_enabled =False ,rife_multiplier ="2x FPS",
 
 selected_model_display_name =DEFAULT_MODEL_NAME ,
-target_width =640 ,target_height =640 
+target_width =640 ,target_height =640 ,
+immediate_metadata =True 
 ):
 
     global stream ,currently_loaded_lora_info ,active_model_name 
@@ -2092,7 +2137,8 @@ target_width =640 ,target_height =640
             rife_enabled =rife_enabled ,rife_multiplier =rife_multiplier ,
             active_model =current_active_model ,
             target_width_from_ui =target_width ,
-            target_height_from_ui =target_height 
+            target_height_from_ui =target_height ,
+            immediate_metadata =immediate_metadata 
         )
 
         output_filename =None 
@@ -2213,7 +2259,8 @@ batch_save_individual_frames =False ,batch_save_intermediate_frames =False ,batc
 rife_enabled =False ,rife_multiplier ="2x FPS",
 selected_model_display_name =DEFAULT_MODEL_NAME ,
 target_width =640 ,target_height =640 ,
-batch_auto_resize =True 
+batch_auto_resize =True ,
+immediate_metadata =True 
 ):
 
     global stream ,batch_stop_requested ,currently_loaded_lora_info ,active_model_name 
@@ -2224,6 +2271,52 @@ batch_auto_resize =True
     if selected_model_display_name !=active_model_name :
          print (f"Warning: Selected batch model '{selected_model_display_name}' differs from active model '{active_model_name}'. Using the active model for the entire batch.")
     current_active_model =active_model_name 
+
+    # Generate batch metadata immediately if requested
+    if immediate_metadata:
+        metadata = {
+            'Model': current_active_model,
+            'Prompt': prompt,
+            'Negative Prompt': n_prompt,
+            'Seed': seed,
+            'Use Random Seed': use_random_seed,
+            'Total Second Length': total_second_length,
+            'Latent Window Size': latent_window_size,
+            'Steps': steps,
+            'CFG': cfg,
+            'GS': gs,
+            'RS': rs,
+            'GPU Memory Preservation': gpu_memory_preservation,
+            'TeaCache Threshold': teacache_threshold,
+            'Video Quality': video_quality,
+            'Export GIF': export_gif,
+            'Export APNG': export_apng,
+            'Export WebP': export_webp,
+            'Resolution': resolution,
+            'FPS': fps,
+            'Use Multiline Prompts': batch_use_multiline_prompts,
+            'Save Individual Frames': batch_save_individual_frames,
+            'Save Intermediate Frames': batch_save_intermediate_frames,
+            'Save Last Frame': batch_save_last_frame,
+            'RIFE Enabled': rife_enabled,
+            'RIFE Multiplier': rife_multiplier,
+            'Target Width': target_width,
+            'Target Height': target_height,
+            'Batch Auto Resize': batch_auto_resize
+        }
+        
+        # Add LoRA information
+        selected_lora_dropdown_values = [selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4]
+        lora_scales = [lora_scale_1, lora_scale_2, lora_scale_3, lora_scale_4]
+        for i in range(N_LORA):
+            if selected_lora_dropdown_values[i] != "None":
+                metadata[f'LoRA {i+1}'] = selected_lora_dropdown_values[i]
+                metadata[f'LoRA {i+1} Scale'] = lora_scales[i]
+        
+        # Create a temporary path for the batch metadata file
+        temp_metadata_path = os.path.join(outputs_batch_folder, f'batch_metadata_{generate_new_timestamp()}.txt')
+        save_processing_metadata(temp_metadata_path, metadata)
+        print(f"Generated immediate batch metadata at {temp_metadata_path}")
 
     # Multi-LoRA: collect all 4 dropdowns and scales
     selected_lora_dropdown_values = [selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4]
@@ -2861,7 +2954,7 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
 with block :
-    gr .Markdown ('# FramePack Improved SECourses App V53 - https://www.patreon.com/posts/126855226')
+    gr .Markdown ('# FramePack Improved SECourses App V54 - https://www.patreon.com/posts/126855226')
     with gr .Row ():
 
         model_selector =gr .Radio (
@@ -3050,6 +3143,8 @@ with block :
                 export_apng =gr .Checkbox (label ="Export as APNG",value =False ,info ="Save animation as Animated PNG")
                 export_webp =gr .Checkbox (label ="Export as WebP",value =False ,info ="Save animation as WebP")
 
+            immediate_metadata = gr.Checkbox(label="Generate Metadata Immediately", value=True, info="Generate metadata file as soon as generation starts")
+
     preset_components_list =[
     model_selector ,
     use_multiline_prompts ,save_metadata ,save_individual_frames ,save_intermediate_frames ,save_last_frame ,
@@ -3059,7 +3154,8 @@ with block :
     target_width_slider ,target_height_slider ,
     selected_lora_1 ,selected_lora_2 ,selected_lora_3 ,selected_lora_4 ,
     lora_scale_1 ,lora_scale_2 ,lora_scale_3 ,lora_scale_4 ,
-    gpu_memory_preservation ,video_quality ,rife_enabled ,rife_multiplier ,export_gif ,export_apng ,export_webp 
+    gpu_memory_preservation ,video_quality ,rife_enabled ,rife_multiplier ,export_gif ,export_apng ,export_webp ,
+    immediate_metadata
     ]
     component_names_for_preset =[
     "model_selector",
@@ -3070,7 +3166,8 @@ with block :
     "target_width","target_height",
     "selected_lora_1","selected_lora_2","selected_lora_3","selected_lora_4",
     "lora_scale_1","lora_scale_2","lora_scale_3","lora_scale_4",
-    "gpu_memory_preservation","video_quality","rife_enabled","rife_multiplier","export_gif","export_apng","export_webp"
+    "gpu_memory_preservation","video_quality","rife_enabled","rife_multiplier","export_gif","export_apng","export_webp",
+    "immediate_metadata"
     ]
 
     def save_preset_action (name :str ,*values ):
@@ -3224,7 +3321,8 @@ with block :
     selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4,
     use_multiline_prompts ,save_individual_frames ,save_intermediate_frames ,save_last_frame ,rife_enabled ,rife_multiplier ,
     model_selector ,
-    target_width_slider ,target_height_slider 
+    target_width_slider ,target_height_slider ,
+    immediate_metadata
     ]
     start_button .click (fn =process ,inputs =ips ,outputs =[result_video ,preview_image ,progress_desc ,progress_bar ,start_button ,end_button ,seed ,timing_display ])
 
@@ -3249,7 +3347,8 @@ with block :
     rife_enabled ,rife_multiplier ,
     model_selector ,
     target_width_slider ,target_height_slider ,
-    batch_auto_resize 
+    batch_auto_resize ,
+    immediate_metadata
     ]
     batch_start_button .click (fn =batch_process ,inputs =batch_ips ,outputs =[result_video ,preview_image ,progress_desc ,progress_bar ,batch_start_button ,batch_end_button ,seed ,timing_display ])
 
