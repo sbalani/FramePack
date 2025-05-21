@@ -2057,15 +2057,23 @@ def switch_active_model (target_model_display_name :str ,progress =gr .Progress 
 
             unload_success =safe_unload_lora (transformer ,cpu )
             if unload_success :
-                print (f"Successfully unloaded LoRA '{currently_loaded_lora_info['adapter_name']}'.")
-                currently_loaded_lora_info ={"adapter_name":None ,"lora_path":None }
+                active_loras_before_unload = [info["adapter_name"] for info in currently_loaded_lora_info if info["adapter_name"]]
+                if active_loras_before_unload:
+                    print(f"Successfully unloaded LoRA(s): {', '.join(active_loras_before_unload)}.")
+                else:
+                    print("Successfully ensured no LoRAs are active (or none were loaded).")
+                currently_loaded_lora_info = [{"adapter_name": None, "lora_path": None} for _ in range(N_LORA)]
             else :
-                print (f"Warning: Failed to cleanly unload LoRA '{currently_loaded_lora_info['adapter_name']}'. Proceeding with model switch, but LoRA state might be inconsistent.")
-                currently_loaded_lora_info ={"adapter_name":None ,"lora_path":None }
+                active_loras_before_attempt = [info["adapter_name"] for info in currently_loaded_lora_info if info["adapter_name"]]
+                if active_loras_before_attempt:
+                    print(f"Warning: Failed to cleanly unload LoRA(s): {', '.join(active_loras_before_attempt)}. Proceeding with model switch, but LoRA state might be inconsistent.")
+                else:
+                    print("Warning: Failed to cleanly unload LoRAs (though none might have been loaded). Proceeding with model switch.")
+                currently_loaded_lora_info = [{"adapter_name": None, "lora_path": None} for _ in range(N_LORA)]
         except Exception as e :
             print (f"Error unloading LoRA during model switch: {e}")
             traceback .print_exc ()
-            currently_loaded_lora_info ={"adapter_name":None ,"lora_path":None }
+            currently_loaded_lora_info = [{"adapter_name": None, "lora_path": None} for _ in range(N_LORA)]
 
     progress (0.3 ,desc =f"Unloading current model '{active_model_name}'...")
     print (f"Unloading current model '{active_model_name}'...")
@@ -2370,7 +2378,7 @@ save_temp_metadata_ui_value_from_ui: bool = True
 
     final_output =None 
     current_batch_seed =seed 
-    current_adapter_name =currently_loaded_lora_info ["adapter_name"]if currently_loaded_lora_info ["adapter_name"]else "None"
+    # current_adapter_name =currently_loaded_lora_info ["adapter_name"]if currently_loaded_lora_info ["adapter_name"]else "None"
 
     for idx ,original_image_path_for_loop in enumerate (image_files ):
         if batch_stop_requested :
@@ -2752,6 +2760,19 @@ save_temp_metadata_ui_value_from_ui: bool = True
                                         metadata ["LoRA"]=current_adapter_name 
                                         metadata ["LoRA Scale"]=lora_scale 
 
+                                    # Multi-LoRA metadata for batch
+                                    for i in range(N_LORA):
+                                        lora_name = selected_lora_dropdown_values[i] # Use the dropdown value which is the display name
+                                        lora_scale_val = lora_scales[i]
+                                        if lora_name and lora_name != "None":
+                                            if i == 0: # First LoRA (already handled by old LoRA/LoRA Scale if present)
+                                                if "LoRA" not in metadata: # only add if not covered by legacy single LoRA
+                                                    metadata["LoRA"] = lora_name
+                                                    metadata["LoRA Scale"] = lora_scale_val
+                                            else: # Subsequent LoRAs
+                                                metadata[f"LoRA {i+1} Name"] = lora_name
+                                                metadata[f"LoRA {i+1} Scale"] = lora_scale_val
+
                                     save_processing_metadata (moved_primary_file ,metadata .copy ())
 
                                     worker_output_base =os .path .splitext (output_filename_from_worker )[0 ]
@@ -2976,7 +2997,7 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
 with block :
-    gr .Markdown ('# FramePack Improved SECourses App V55 - https://www.patreon.com/posts/126855226')
+    gr .Markdown ('# FramePack Improved SECourses App V56 - https://www.patreon.com/posts/126855226')
     with gr .Row ():
 
         model_selector =gr .Radio (
