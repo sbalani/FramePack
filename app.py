@@ -39,6 +39,7 @@ from transformers import SiglipImageProcessor ,SiglipVisionModel
 from diffusers_helper .clip_vision import hf_clip_vision_encode 
 from diffusers_helper .load_lora import load_lora ,set_adapters 
 from diffusers_helper .bucket_tools import find_nearest_bucket 
+from PIL import ImageOps
 
 parser =argparse .ArgumentParser ()
 parser .add_argument ('--share',action ='store_true')
@@ -2404,6 +2405,15 @@ save_temp_metadata_ui_value_from_ui: bool = True
 
             if batch_auto_resize :
                 print (f"Processing {start_image_basename} with Auto Resize enabled.")
+                # Apply EXIF transpose before getting original dimensions for calculations
+                try:
+                    print(f"  Applying EXIF transpose to {start_image_basename}...")
+                    img_for_processing_pil = ImageOps.exif_transpose(img_for_processing_pil)
+                    orig_width_pil, orig_height_pil = img_for_processing_pil.size # Update dimensions after transpose
+                    print(f"  Dimensions after EXIF transpose: {orig_width_pil}x{orig_height_pil}")
+                except Exception as exif_err:
+                    print(f"  Warning: Could not apply EXIF transpose to {start_image_basename}: {exif_err}")
+                
                 target_res_val =int (resolution )
                 target_pixel_count =target_res_val *target_res_val 
                 original_pixel_count =orig_width_pil *orig_height_pil 
@@ -2442,7 +2452,7 @@ save_temp_metadata_ui_value_from_ui: bool = True
                         resize_h_for_crop =max (1 ,resize_h_for_crop )
 
                         print (f"    Resizing original to {resize_w_for_crop}x{resize_h_for_crop} for center cropping...")
-                        img_resized_for_cropping =img_pil_original .resize ((resize_w_for_crop ,resize_h_for_crop ),Image .Resampling .LANCZOS )
+                        img_resized_for_cropping =img_for_processing_pil .resize ((resize_w_for_crop ,resize_h_for_crop ),Image .Resampling .LANCZOS )
 
                         current_w_rc ,current_h_rc =img_resized_for_cropping .size 
                         left =(current_w_rc -final_crop_width )/2 
@@ -2543,9 +2553,17 @@ save_temp_metadata_ui_value_from_ui: bool = True
             potential_end_path =os .path .join (batch_end_frame_folder ,start_image_basename )
             if os .path .exists (potential_end_path ):
                 try :
-                    end_img =Image .open (potential_end_path )
-                    if end_img .mode !='RGB':end_img =end_img .convert ('RGB')
-                    current_end_image =np .array (end_img )
+                    end_img_pil = Image.open(potential_end_path)
+                    # Apply EXIF transpose to end image as well if it's used
+                    try:
+                        print(f"  Applying EXIF transpose to end image: {potential_end_path}...")
+                        end_img_pil = ImageOps.exif_transpose(end_img_pil)
+                        print(f"  Dimensions of end image after EXIF transpose: {end_img_pil.width}x{end_img_pil.height}")
+                    except Exception as exif_err_end:
+                        print(f"  Warning: Could not apply EXIF transpose to end image {potential_end_path}: {exif_err_end}")
+
+                    if end_img_pil.mode != 'RGB': end_img_pil = end_img_pil.convert('RGB')
+                    current_end_image =np .array (end_img_pil)
                     if len (current_end_image .shape )==2 :current_end_image =np .stack ([current_end_image ]*3 ,axis =2 )
                     print (f"Loaded matching end image: {potential_end_path}")
                     end_image_path_str =potential_end_path 
@@ -2756,9 +2774,9 @@ save_temp_metadata_ui_value_from_ui: bool = True
                                     if not batch_use_multiline_prompts :
                                          metadata ["Timestamped Prompts Parsed"]="[Check Worker Logs]"
 
-                                    if current_adapter_name !="None":
-                                        metadata ["LoRA"]=current_adapter_name 
-                                        metadata ["LoRA Scale"]=lora_scale 
+                                    # if current_adapter_name !="None":
+                                    #     metadata ["LoRA"]=current_adapter_name 
+                                    #     metadata ["LoRA Scale"]=lora_scale 
 
                                     # Multi-LoRA metadata for batch
                                     for i in range(N_LORA):
@@ -2997,7 +3015,7 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
 with block :
-    gr .Markdown ('# FramePack Improved SECourses App V56 - https://www.patreon.com/posts/126855226')
+    gr .Markdown ('# FramePack Improved SECourses App V57 - https://www.patreon.com/posts/126855226')
     with gr .Row ():
 
         model_selector =gr .Radio (
