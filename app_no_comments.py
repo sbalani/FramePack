@@ -39,7 +39,6 @@ from transformers import SiglipImageProcessor ,SiglipVisionModel
 from diffusers_helper .clip_vision import hf_clip_vision_encode 
 from diffusers_helper .load_lora import load_lora ,set_adapters 
 from diffusers_helper .bucket_tools import find_nearest_bucket 
-from PIL import ImageOps
 
 parser =argparse .ArgumentParser ()
 parser .add_argument ('--share',action ='store_true')
@@ -137,14 +136,12 @@ loras_folder =os .path .join (current_dir ,'loras')
 presets_folder =os .path .join (current_dir ,'presets')
 last_used_preset_file =os .path .join (presets_folder ,'_lastused.txt')
 
-TEMP_METADATA_FOLDER = os.path.join(outputs_folder, 'outputs')
-
 batch_stop_requested =False 
 
-N_LORA = 4  # Number of supported LoRA slots
-currently_loaded_lora_info = [
-    {"adapter_name": None, "lora_path": None} for _ in range(N_LORA)
-]
+currently_loaded_lora_info ={
+"adapter_name":None ,
+"lora_path":None 
+}
 
 for directory in [
 outputs_folder ,
@@ -163,8 +160,7 @@ intermediate_individual_frames_folder ,
 last_frames_folder ,
 intermediate_last_frames_folder ,
 loras_folder ,
-presets_folder,
-TEMP_METADATA_FOLDER
+presets_folder 
 ]:
     try :
         os .makedirs (directory ,exist_ok =True )
@@ -265,38 +261,18 @@ def format_time_human_readable (seconds ):
     else :
         return f"{seconds} seconds"
 
-def save_processing_metadata (output_path_for_final_file: Optional[str],
-                              metadata_dict: Dict[str, Any],
-                              is_temporary: bool = False,
-                              job_id_for_temp: Optional[str] = None,
-                              base_folder_for_temp_metadata: Optional[str] = None
-                             ):
-    metadata_path = ""
-    if is_temporary:
-        if not job_id_for_temp:
-            print("ERROR: job_id_for_temp must be provided for temporary metadata.")
-            return False
-        if not base_folder_for_temp_metadata:
-            print("ERROR: base_folder_for_temp_metadata must be provided for temporary metadata.")
-            return False
-        os.makedirs(base_folder_for_temp_metadata, exist_ok=True) # Ensure base folder exists
-        metadata_path = get_temp_metadata_filepath_for_job(job_id_for_temp, base_folder_for_temp_metadata)
-    elif output_path_for_final_file:
-        metadata_path = os.path.splitext(output_path_for_final_file)[0] + '_metadata.txt'
-    else:
-        print("ERROR: output_path_for_final_file must be provided for final metadata, or is_temporary must be True with job_id_for_temp and base_folder_for_temp_metadata.")
-        return False
+def save_processing_metadata (output_path ,metadata ):
 
+    metadata_path =os .path .splitext (output_path )[0 ]+'_metadata.txt'
     try :
+
         os .makedirs (os .path .dirname (metadata_path ),exist_ok =True )
         with open (metadata_path ,'w',encoding ='utf-8')as f :
-            # Ensure Model is always first if present
-            if "Model" in metadata_dict:
-                 f .write (f"Model: {metadata_dict.pop('Model', 'Unknown')}\n") # Use .pop with default
-            # Write other items
-            for key ,value in metadata_dict .items (): 
+
+            f .write (f"Model: {metadata.pop('Model', 'Unknown')}\n")
+
+            for key ,value in metadata .items ():
                 f .write (f"{key}: {value}\n")
-        print(f"Successfully saved metadata to {metadata_path}")
         return True 
     except Exception as e :
         print (f"Error saving metadata to {metadata_path}: {str(e)}")
@@ -500,18 +476,6 @@ def force_remove_lora_modules (model ):
 
 print_supported_image_formats ()
 
-def get_temp_metadata_filepath_for_job(job_id: str, base_folder: str) -> str:
-    return os.path.join(base_folder, f"{job_id}_temp_metadata.txt")
-
-def delete_temporary_metadata_for_job(job_id: str, base_folder: str):
-    temp_meta_path = get_temp_metadata_filepath_for_job(job_id, base_folder)
-    try:
-        if os.path.exists(temp_meta_path):
-            os.remove(temp_meta_path)
-            print(f"Successfully deleted temporary metadata: {temp_meta_path}")
-    except Exception as e:
-        print(f"Error deleting temporary metadata {temp_meta_path}: {str(e)}")
-
 def get_preset_path (name :str )->str :
 
     safe_name ="".join (c for c in name if c .isalnum ()or c in (' ','_','-')).rstrip ()
@@ -654,38 +618,15 @@ def convert_metadata_to_preset_dict (metadata :Dict [str ,str ])->Dict [str ,Any
         try :preset_dict ["target_height"]=int (metadata ["Final Height"])
         except ValueError :print (f"Warning: Could not parse Final Height '{metadata['Final Height']}' as int in metadata.")
 
-    # Multi-LoRA: parse all 4 LoRA names/scales from metadata
-    for i in range(N_LORA):
-        if i == 0:
-            lora_name = metadata.get("LoRA", "None")
-            lora_scale = metadata.get("LoRA Scale", 1.0)
-            preset_dict["selected_lora_1"] = lora_name
-            try:
-                preset_dict["lora_scale_1"] = float(lora_scale)
-            except Exception:
-                preset_dict["lora_scale_1"] = 1.0
-        else:
-            lora_name = metadata.get(f"LoRA {i+1} Name", "None")
-            lora_scale = metadata.get(f"LoRA {i+1} Scale", 1.0)
-            preset_dict[f"selected_lora_{i+1}"] = lora_name
-            try:
-                preset_dict[f"lora_scale_{i+1}"] = float(lora_scale)
-            except Exception:
-                preset_dict[f"lora_scale_{i+1}"] = 1.0
+    lora_name_from_meta =metadata .get ("LoRA","None")
+    if not lora_name_from_meta or lora_name_from_meta .strip ().lower ()=="none":
+        preset_dict ["selected_lora"]="None"
+    else :
+        preset_dict ["selected_lora"]=lora_name_from_meta 
 
-    if "LoRA" not in metadata and "selected_lora_1" not in preset_dict:
-        preset_dict["selected_lora_1"] = "None"
-        preset_dict["lora_scale_1"] = 1.0
-    for i in range(2, N_LORA+1):
-        if f"selected_lora_{i}" not in preset_dict:
-            preset_dict[f"selected_lora_{i}"] = "None"
-            preset_dict[f"lora_scale_{i}"] = 1.0
-
-    if "LoRA Scale" in metadata and "lora_scale_1" not in preset_dict:
-        try:
-            preset_dict["lora_scale_1"] = float(metadata["LoRA Scale"])
-        except Exception:
-            preset_dict["lora_scale_1"] = 1.0
+    if "LoRA Scale"in metadata :
+        try :preset_dict ["lora_scale"]=float (metadata ["LoRA Scale"])
+        except ValueError :print (f"Warning: Could not parse LoRA Scale '{metadata['LoRA Scale']}' as float in metadata.")
 
     if "Timestamped Prompts Used"in metadata :
         if metadata ["Timestamped Prompts Used"].lower ()=="true":
@@ -722,9 +663,6 @@ def convert_metadata_to_preset_dict (metadata :Dict [str ,str ])->Dict [str ,Any
     if "GPU Inference Preserved Memory (GB)"in metadata :
         try :preset_dict ["gpu_memory_preservation"]=float (metadata ["GPU Inference Preserved Memory (GB)"])
         except ValueError :print (f"Warning: Could not parse GPU Memory '{metadata['GPU Inference Preserved Memory (GB)']}' as float.")
-
-    if "Save Temporary Metadata Setting" in metadata:
-        preset_dict["save_temp_metadata"] = metadata["Save Temporary Metadata Setting"].lower() == "true"
 
     return preset_dict 
 
@@ -976,73 +914,17 @@ def update_iteration_info (vid_len_s ,fps_val ,win_size ):
 @torch .no_grad ()
 def worker (input_image ,end_image ,prompt ,n_prompt ,seed ,use_random_seed ,total_second_length ,latent_window_size ,steps ,cfg ,gs ,rs ,gpu_memory_preservation ,teacache_threshold ,video_quality ='high',export_gif =False ,export_apng =False ,export_webp =False ,num_generations =1 ,resolution ="640",fps =30 ,
 
-selected_lora_dropdown_values=None,
-lora_scales=None,
+adapter_name_to_use :str ="None",
+lora_scale :float =1.0 ,
 
 save_individual_frames_flag =False ,save_intermediate_frames_flag =False ,save_last_frame_flag =False ,use_multiline_prompts_flag =False ,rife_enabled =False ,rife_multiplier ="2x FPS",
 
 active_model :str =MODEL_DISPLAY_NAME_ORIGINAL ,
-target_width_from_ui =640 ,target_height_from_ui =640,
-save_temp_metadata_ui_value: bool = True # New parameter
+target_width_from_ui =640 ,target_height_from_ui =640 
 ):
 
     global transformer ,text_encoder ,text_encoder_2 ,image_encoder ,vae 
     global individual_frames_folder ,intermediate_individual_frames_folder ,last_frames_folder ,intermediate_last_frames_folder 
-    global currently_loaded_lora_info
-    global outputs_folder # Ensure outputs_folder is accessible
-
-    if selected_lora_dropdown_values is None:
-        selected_lora_dropdown_values = ["None"] * N_LORA
-    if lora_scales is None:
-        lora_scales = [1.0] * N_LORA
-
-    # Prepare unique adapter names and scales for set_adapters
-    peft_adapters_to_activate = []  # list of (adapter_name, scale)
-    activated_peft_names_in_this_call = set()
-    for i in range(N_LORA):
-        peft_adapter_name_for_slot = currently_loaded_lora_info[i]["adapter_name"]
-        scale_for_slot = lora_scales[i]
-        if peft_adapter_name_for_slot is not None and peft_adapter_name_for_slot not in activated_peft_names_in_this_call:
-            peft_adapters_to_activate.append((peft_adapter_name_for_slot, scale_for_slot))
-            activated_peft_names_in_this_call.add(peft_adapter_name_for_slot)
-
-    # IMPORTANT: First ensure all LoRA parameters are on the same device (GPU)
-    # This must be done before set_adapters to avoid device mismatch errors
-    if peft_adapters_to_activate:
-        adapter_names_for_set_adapters = [item[0] for item in peft_adapters_to_activate]
-        weights_for_set_adapters = [item[1] for item in peft_adapters_to_activate]
-        
-        # First, ensure ALL LoRA-related parameters are on GPU
-        print(f"Worker: Moving ALL LoRA parameters to {gpu} before activation...")
-        lora_params_synced_count = 0
-        try:
-            for param_name, param in transformer.named_parameters():
-                if 'lora_' in param_name:  # Any LoRA parameter
-                    if param.device != gpu:
-                        param.data = param.data.to(gpu)
-                        lora_params_synced_count += 1
-            if lora_params_synced_count > 0:
-                print(f"Worker: Synced {lora_params_synced_count} LoRA parameters to {gpu}.")
-            else:
-                print(f"Worker: All LoRA parameters appear to be already on {gpu}.")
-        except Exception as sync_err:
-            print(f"Worker ERROR: Failed to sync LoRA parameters to {gpu}: {sync_err}")
-            traceback.print_exc()
-        
-        # Now apply adapters
-        try:
-            set_adapters(transformer, adapter_names_for_set_adapters, weights_for_set_adapters)
-            print(f"Worker: Applied LoRA adapters {adapter_names_for_set_adapters} with scales {weights_for_set_adapters}")
-        except Exception as e:
-            print(f"Worker ERROR applying LoRA adapters: {e}")
-            traceback.print_exc()
-    
-    elif hasattr(transformer, 'disable_adapters'):
-        try:
-            transformer.disable_adapters()
-            print("No active LoRAs - disabled all adapters")
-        except Exception as e:
-            print(f"Error disabling adapters: {e}")
 
     total_latent_sections =0 
     frames_per_section_calc =latent_window_size *4 
@@ -1106,66 +988,8 @@ save_temp_metadata_ui_value: bool = True # New parameter
         last_used_seed =current_seed 
         stream .output_queue .push (('seed_update',current_seed ))
 
-        job_id =generate_new_timestamp () # This will be our unique ID for temp metadata
+        job_id =generate_new_timestamp ()
         stream .output_queue .push (('progress',(None ,'',make_progress_bar_html (0 ,f'Starting generation {gen_idx+1}/{num_generations} with seed {current_seed} using {active_model}...'))))
-        
-        print(f"[Worker Debug] job_id: {job_id}, save_temp_metadata_ui_value: {save_temp_metadata_ui_value}")
-
-        if save_temp_metadata_ui_value:
-            print(f"[Worker Debug] Entered block to save temporary metadata for job_id: {job_id}")
-            # Prepare metadata dictionary for temporary saving
-            # Note: using_timestamped_prompts is determined later. We can save without it for now,
-            # or update the temp file later if strictly needed (more complex).
-            # For simplicity, save what's known now.
-            current_metadata_for_temp = {
-                "Model": active_model,
-                "Prompt": prompt, # Use the prompt passed to worker
-                "Negative Prompt": n_prompt,
-                "Seed": current_seed,
-                "TeaCache": f"Enabled (Threshold: {teacache_threshold})" if teacache_threshold > 0.0 else "Disabled",
-                "Video Length (seconds)": total_second_length,
-                "FPS": fps,
-                "Latent Window Size": latent_window_size,
-                "Steps": steps,
-                "CFG Scale": cfg,
-                "Distilled CFG Scale": gs,
-                "Guidance Rescale": rs,
-                "Resolution": resolution,
-                "Final Width": target_width_from_ui, # Use actual processing width
-                "Final Height": target_height_from_ui, # Use actual processing height
-                "Start Frame Provided": input_image is not None, # Check if input_image was provided
-                "End Frame Provided": end_image is not None,
-                "GPU Inference Preserved Memory (GB)": gpu_memory_preservation,
-                "Video Quality": video_quality,
-                "RIFE FPS Multiplier": rife_multiplier,
-                "Save Temporary Metadata Setting": save_temp_metadata_ui_value,
-                # Add other relevant settings that are known at this point
-                "Number of Generations Configured": num_generations,
-                "Use Random Seed Setting": use_random_seed,
-                "Use Multiline Prompts Setting (Worker)": use_multiline_prompts_flag,
-            }
-            # Add LoRA info if any are selected via dropdowns
-            if selected_lora_dropdown_values and lora_scales:
-                for i in range(N_LORA):
-                    lora_name = selected_lora_dropdown_values[i]
-                    lora_scale_val = lora_scales[i]
-                    if lora_name and lora_name != "None":
-                        if i == 0: # First LoRA
-                            current_metadata_for_temp["LoRA"] = lora_name
-                            current_metadata_for_temp["LoRA Scale"] = lora_scale_val
-                        else: # Subsequent LoRAs
-                            current_metadata_for_temp[f"LoRA {i+1} Name"] = lora_name
-                            current_metadata_for_temp[f"LoRA {i+1} Scale"] = lora_scale_val
-            
-            base_folder_for_job_temp_metadata = outputs_folder # Define the base folder for this job's temp metadata
-            save_processing_metadata(
-                output_path_for_final_file=None, 
-                metadata_dict=current_metadata_for_temp.copy(), # Pass a copy
-                is_temporary=True,
-                job_id_for_temp=job_id,
-                base_folder_for_temp_metadata=base_folder_for_job_temp_metadata
-            )
-            # print(f"Saved temporary metadata for job_id: {job_id}") # Already printed by save_processing_metadata if successful
 
         try :
 
@@ -1474,21 +1298,34 @@ save_temp_metadata_ui_value: bool = True # New parameter
                     if transformer .device !=gpu :
                          print ("Moving transformer to GPU (High VRAM mode)...")
                          transformer .to (gpu )
-                
-                # Make sure all LoRA modules are also moved to GPU
-                if peft_adapters_to_activate:
-                    print("Verifying all LoRA modules are on GPU...")
-                    lora_modules_moved = 0
-                    for name, module in transformer.named_modules():
-                        if 'lora_' in name.lower():
-                            try:
-                                if next(module.parameters(), torch.tensor(0)).device != gpu:
-                                    module.to(gpu)
-                                    lora_modules_moved += 1
-                            except Exception as e:
-                                print(f"Error moving LoRA module {name} to GPU: {e}")
-                    if lora_modules_moved > 0:
-                        print(f"Moved {lora_modules_moved} LoRA modules to GPU")
+
+                if adapter_name_to_use !="None":
+                    print (f"Worker: Ensuring LoRA adapter '{adapter_name_to_use}' parameters are on {gpu}...")
+                    try :
+                        lora_params_synced =0 
+                        for name ,param in transformer .named_parameters ():
+                            if 'lora_'in name or f"'{adapter_name_to_use}'"in name :
+                                if param .device !=gpu :
+                                    param .data =param .data .to (gpu )
+                                    lora_params_synced +=1 
+                        if lora_params_synced >0 :
+                             print (f"Worker: Synced {lora_params_synced} LoRA parameters to {gpu}.")
+                    except Exception as sync_err :
+                        print (f"Worker ERROR: Failed to sync LoRA parameters to {gpu}: {sync_err}")
+                        traceback .print_exc ()
+
+                if adapter_name_to_use !="None":
+                    try :
+                        set_adapters (transformer ,[adapter_name_to_use ],[lora_scale ])
+                        print (f"Worker: Applied scale {lora_scale} to adapter '{adapter_name_to_use}'")
+                    except Exception as e :
+                         print (f"Worker ERROR applying LoRA scale: {e}")
+                         traceback .print_exc ()
+                elif hasattr (transformer ,'disable_adapters'):
+                     try :
+                         transformer .disable_adapters ()
+                     except Exception as e :
+                         print (f"Trying to disable adapters (this is not an error if you did not select any LoRA): {e}")
 
                 use_teacache_effective =teacache_threshold >0.0 
                 if use_teacache_effective :
@@ -1559,22 +1396,6 @@ save_temp_metadata_ui_value: bool = True # New parameter
                     return 
 
                 try :
-                    # Critical check to ensure all LoRA parameters are on GPU before sampling
-                    if peft_adapters_to_activate:
-                        print("Final device check for all LoRA tensors before sampling...")
-                        devices_found = set()
-                        lora_params_moved = 0
-                        for name, param in transformer.named_parameters():
-                            if 'lora_' in name.lower():
-                                devices_found.add(str(param.device))
-                                if param.device.type != 'cuda':
-                                    print(f"Moving {name} from {param.device} to {gpu}")
-                                    param.data = param.data.to(gpu)
-                                    lora_params_moved += 1
-                        
-                        print(f"LoRA parameter device check complete. Found devices: {devices_found}")
-                        if lora_params_moved > 0:
-                            print(f"Moved {lora_params_moved} LoRA parameters to GPU before generation")
 
                     generated_latents =sample_hunyuan (
                     transformer =transformer ,
@@ -1806,33 +1627,11 @@ save_temp_metadata_ui_value: bool = True # New parameter
                     "Video Quality":video_quality ,
                     "RIFE FPS Multiplier":rife_multiplier ,
                     }
-                    # Multi-LoRA metadata
-                    for i in range(N_LORA):
-                        lora_name = selected_lora_dropdown_values[i] if selected_lora_dropdown_values else "None"
-                        lora_scale = lora_scales[i] if lora_scales else 1.0
-                        if i == 0:
-                            if lora_name != "None":
-                                metadata["LoRA"] = lora_name
-                                metadata["LoRA Scale"] = lora_scale
-                        else:
-                            if lora_name != "None":
-                                metadata[f"LoRA {i+1} Name"] = lora_name
-                                metadata[f"LoRA {i+1} Scale"] = lora_scale
+                    if adapter_name_to_use !="None":
+                        metadata ["LoRA"]=adapter_name_to_use 
+                        metadata ["LoRA Scale"]=lora_scale 
 
-                    metadata["Save Temporary Metadata Setting"] = save_temp_metadata_ui_value # Add the setting itself to final metadata
-
-                    final_metadata_saved_successfully = True
-                    final_metadata_for_main_output_saved = False
-                    if output_filename: 
-                        if save_processing_metadata (output_filename ,metadata .copy ()):
-                            final_metadata_for_main_output_saved = True
-                        else:
-                             final_metadata_saved_successfully = False # Though this var isn't used after this block
-
-                    if final_metadata_for_main_output_saved and save_temp_metadata_ui_value:
-                        base_folder_for_job_temp_metadata = outputs_folder # Same base folder used for creation
-                        delete_temporary_metadata_for_job(job_id, base_folder_for_job_temp_metadata)
-
+                    if output_filename :save_processing_metadata (output_filename ,metadata .copy ())
                     final_gif_path =os .path .join (gif_videos_folder ,f'{job_id}.gif')
                     if export_gif and os .path .exists (final_gif_path ):
                         save_processing_metadata (final_gif_path ,metadata .copy ())
@@ -1945,94 +1744,74 @@ save_temp_metadata_ui_value: bool = True # New parameter
     stream .output_queue .push (('end',None ))
     return 
 
-def manage_lora_structure (selected_lora_dropdown_values):
-    global transformer, currently_loaded_lora_info, text_encoder, text_encoder_2, image_encoder, vae
+def manage_lora_structure (selected_lora_dropdown_value :str ):
 
-    if not isinstance(selected_lora_dropdown_values, list) or len(selected_lora_dropdown_values) != N_LORA:
-        raise ValueError(f"Expected a list of {N_LORA} LoRA selections.")
+    global transformer ,currently_loaded_lora_info ,text_encoder ,text_encoder_2 ,image_encoder ,vae 
 
-    # Get target adapter names and paths for all slots
-    target_adapter_names = []
-    target_lora_paths = []
-    for display_name in selected_lora_dropdown_values:
-        lora_path = get_lora_path_from_name(display_name)
-        if lora_path != "none":
-            adapter_name = os.path.splitext(os.path.basename(lora_path))[0]
-        else:
-            adapter_name = None
-        target_adapter_names.append(adapter_name)
-        target_lora_paths.append(lora_path)
+    lora_path =get_lora_path_from_name (selected_lora_dropdown_value )
 
-    # Check if any change in adapter names or paths
-    changed = False
-    for i in range(N_LORA):
-        if (currently_loaded_lora_info[i]["adapter_name"] != target_adapter_names[i] or
-            currently_loaded_lora_info[i]["lora_path"] != target_lora_paths[i]):
-            changed = True
-            break
+    target_adapter_name =None 
+    if lora_path !="none":
+        target_adapter_name =os .path .splitext (os .path .basename (lora_path ))[0 ]
 
-    if changed:
-        print(f"LoRA Change Detected: Target={target_adapter_names}, Current={[info['adapter_name'] for info in currently_loaded_lora_info]}")
+    if target_adapter_name !=currently_loaded_lora_info ["adapter_name"]:
+        print (f"LoRA Change Detected: Target='{target_adapter_name}', Current='{currently_loaded_lora_info['adapter_name']}'")
 
-        transformer_on_cpu = False
-        if transformer.device == cpu or (hasattr(transformer, 'model') and transformer.model.device == cpu):
-            transformer_on_cpu = True
-        elif not high_vram:
-            print("Ensuring transformer is on CPU before LoRA structure change (Low VRAM mode)...")
-            unload_complete_models(transformer)
-            transformer_on_cpu = True
-        else:
-            try:
-                print("Moving transformer to CPU for LoRA structure change (High VRAM mode)...")
-                transformer.to(cpu)
-                torch.cuda.empty_cache()
-                transformer_on_cpu = True
-            except Exception as e:
-                print(f"Warning: Failed to move transformer to CPU in high VRAM mode: {e}")
+        transformer_on_cpu =False 
+        if transformer .device ==cpu or (hasattr (transformer ,'model')and transformer .model .device ==cpu ):
+             transformer_on_cpu =True 
+        elif not high_vram :
 
-        if not transformer_on_cpu:
-            print("ERROR: Transformer could not be confirmed on CPU. Aborting LoRA structure change.")
-            raise RuntimeError("Failed to ensure transformer is on CPU for LoRA modification.")
+             print ("Ensuring transformer is on CPU before LoRA structure change (Low VRAM mode)...")
+             unload_complete_models (transformer )
+             transformer_on_cpu =True 
+        else :
+             try :
+                 print ("Moving transformer to CPU for LoRA structure change (High VRAM mode)...")
+                 transformer .to (cpu )
+                 torch .cuda .empty_cache ()
+                 transformer_on_cpu =True 
+             except Exception as e :
+                 print (f"Warning: Failed to move transformer to CPU in high VRAM mode: {e}")
 
-        # Unload all previous LoRAs
-        any_loaded = any(info["adapter_name"] is not None for info in currently_loaded_lora_info)
-        if any_loaded:
-            print("Unloading previous LoRA structures...")
-            unload_success = safe_unload_lora(transformer, cpu)
-            if unload_success:
-                print("Successfully unloaded all previous LoRAs.")
-            else:
-                print("ERROR: Failed to unload previous LoRAs! State may be corrupt.")
-        # Reset info
-        for i in range(N_LORA):
-            currently_loaded_lora_info[i] = {"adapter_name": None, "lora_path": None}
+        if not transformer_on_cpu :
+             print ("ERROR: Transformer could not be confirmed on CPU. Aborting LoRA structure change.")
+             raise RuntimeError ("Failed to ensure transformer is on CPU for LoRA modification.")
 
-        # Load each unique LoRA file only once
-        loaded_in_this_cycle_adapter_names = set()
-        for i in range(N_LORA):
-            lora_path = target_lora_paths[i]
-            adapter_name = target_adapter_names[i]
-            if lora_path != "none" and adapter_name not in loaded_in_this_cycle_adapter_names:
-                lora_dir, lora_filename = os.path.split(lora_path)
-                print(f"Loading new LoRA structure: {adapter_name} from {lora_path}")
-                try:
-                    load_lora(transformer, lora_dir, lora_filename)
-                    print(f"Successfully loaded structure for {adapter_name}.")
-                    loaded_in_this_cycle_adapter_names.add(adapter_name)
-                except Exception as e:
-                    print(f"ERROR loading LoRA structure for {adapter_name}: {e}")
-                    traceback.print_exc()
-                    continue
-            # Update info for this slot
-            if lora_path != "none":
-                currently_loaded_lora_info[i] = {"adapter_name": adapter_name, "lora_path": lora_path}
-            else:
-                currently_loaded_lora_info[i] = {"adapter_name": None, "lora_path": None}
-        print(f"Final currently_loaded_lora_info: {currently_loaded_lora_info}")
-    else:
-        print(f"No LoRA structure change needed. Current: {[info['adapter_name'] for info in currently_loaded_lora_info]}")
+        if currently_loaded_lora_info ["adapter_name"]is not None :
+            print (f"Unloading previous LoRA structure: {currently_loaded_lora_info['adapter_name']}")
+            unload_success =safe_unload_lora (transformer ,cpu )
+            if unload_success :
+                print (f"Successfully unloaded {currently_loaded_lora_info['adapter_name']}.")
+                currently_loaded_lora_info ["adapter_name"]=None 
+                currently_loaded_lora_info ["lora_path"]=None 
+            else :
+                print (f"ERROR: Failed to unload LoRA {currently_loaded_lora_info['adapter_name']}! State may be corrupt.")
 
-def switch_active_model (target_model_display_name :str ,progress =gr .Progress () ):
+        if target_adapter_name is not None and lora_path !="none":
+            print (f"Loading new LoRA structure: {target_adapter_name} from {lora_path}")
+            try :
+                lora_dir ,lora_filename =os .path .split (lora_path )
+
+                load_lora (transformer ,lora_dir ,lora_filename )
+                print (f"Successfully loaded structure for {target_adapter_name}.")
+                currently_loaded_lora_info ["adapter_name"]=target_adapter_name 
+                currently_loaded_lora_info ["lora_path"]=lora_path 
+            except Exception as e :
+                print (f"ERROR loading LoRA structure for {target_adapter_name}: {e}")
+                traceback .print_exc ()
+                currently_loaded_lora_info ["adapter_name"]=None 
+                currently_loaded_lora_info ["lora_path"]=None 
+                raise RuntimeError (f"Failed to load LoRA structure '{target_adapter_name}'.")
+        else :
+             print ("Target LoRA is 'None'. No new structure loaded.")
+             currently_loaded_lora_info ["adapter_name"]=None 
+             currently_loaded_lora_info ["lora_path"]=None 
+
+    else :
+        print (f"No LoRA structure change needed. Current: '{currently_loaded_lora_info['adapter_name']}'")
+
+def switch_active_model (target_model_display_name :str ,progress =gr .Progress ()):
 
     global transformer ,active_model_name ,currently_loaded_lora_info 
 
@@ -2043,12 +1822,11 @@ def switch_active_model (target_model_display_name :str ,progress =gr .Progress 
     progress (0 ,desc =f"Switching model to '{target_model_display_name}'...")
     print (f"Switching model from '{active_model_name}' to '{target_model_display_name}'...")
 
-    # Multi-LoRA: unload all if any are loaded
-    any_loaded = any(info["adapter_name"] is not None for info in currently_loaded_lora_info)
-    if any_loaded :
-        print (f"Unloading LoRA(s) before switching model...")
-        progress (0.1 ,desc =f"Unloading LoRA(s)...")
+    if currently_loaded_lora_info ["adapter_name"]is not None :
+        print (f"Unloading LoRA '{currently_loaded_lora_info['adapter_name']}' before switching model...")
+        progress (0.1 ,desc =f"Unloading LoRA '{currently_loaded_lora_info['adapter_name']}'...")
         try :
+
             if transformer .device !=cpu :
                 if not high_vram :
                     unload_complete_models (transformer )
@@ -2058,23 +1836,15 @@ def switch_active_model (target_model_display_name :str ,progress =gr .Progress 
 
             unload_success =safe_unload_lora (transformer ,cpu )
             if unload_success :
-                active_loras_before_unload = [info["adapter_name"] for info in currently_loaded_lora_info if info["adapter_name"]]
-                if active_loras_before_unload:
-                    print(f"Successfully unloaded LoRA(s): {', '.join(active_loras_before_unload)}.")
-                else:
-                    print("Successfully ensured no LoRAs are active (or none were loaded).")
-                currently_loaded_lora_info = [{"adapter_name": None, "lora_path": None} for _ in range(N_LORA)]
+                print (f"Successfully unloaded LoRA '{currently_loaded_lora_info['adapter_name']}'.")
+                currently_loaded_lora_info ={"adapter_name":None ,"lora_path":None }
             else :
-                active_loras_before_attempt = [info["adapter_name"] for info in currently_loaded_lora_info if info["adapter_name"]]
-                if active_loras_before_attempt:
-                    print(f"Warning: Failed to cleanly unload LoRA(s): {', '.join(active_loras_before_attempt)}. Proceeding with model switch, but LoRA state might be inconsistent.")
-                else:
-                    print("Warning: Failed to cleanly unload LoRAs (though none might have been loaded). Proceeding with model switch.")
-                currently_loaded_lora_info = [{"adapter_name": None, "lora_path": None} for _ in range(N_LORA)]
+                print (f"Warning: Failed to cleanly unload LoRA '{currently_loaded_lora_info['adapter_name']}'. Proceeding with model switch, but LoRA state might be inconsistent.")
+                currently_loaded_lora_info ={"adapter_name":None ,"lora_path":None }
         except Exception as e :
             print (f"Error unloading LoRA during model switch: {e}")
             traceback .print_exc ()
-            currently_loaded_lora_info = [{"adapter_name": None, "lora_path": None} for _ in range(N_LORA)]
+            currently_loaded_lora_info ={"adapter_name":None ,"lora_path":None }
 
     progress (0.3 ,desc =f"Unloading current model '{active_model_name}'...")
     print (f"Unloading current model '{active_model_name}'...")
@@ -2145,16 +1915,11 @@ def switch_active_model (target_model_display_name :str ,progress =gr .Progress 
 
              return active_model_name ,fatal_error_msg 
 
-def process (input_image ,end_image ,prompt ,n_prompt ,seed ,use_random_seed ,num_generations ,total_second_length ,latent_window_size ,steps ,cfg ,gs ,rs ,gpu_memory_preservation ,teacache_threshold ,video_quality ='high',export_gif =False ,export_apng =False ,export_webp =False ,save_metadata =True ,resolution ="640",fps =30 ,
-
-lora_scale_1=1.0, lora_scale_2=1.0, lora_scale_3=1.0, lora_scale_4=1.0,
-selected_lora_1="None", selected_lora_2="None", selected_lora_3="None", selected_lora_4="None",
-
-use_multiline_prompts =False ,save_individual_frames =False ,save_intermediate_frames =False ,save_last_frame =False ,rife_enabled =False ,rife_multiplier ="2x FPS",
+def process (input_image ,end_image ,prompt ,n_prompt ,seed ,use_random_seed ,num_generations ,total_second_length ,latent_window_size ,steps ,cfg ,gs ,rs ,gpu_memory_preservation ,teacache_threshold ,video_quality ='high',export_gif =False ,export_apng =False ,export_webp =False ,save_metadata =True ,resolution ="640",fps =30 ,lora_scale =1.0 ,use_multiline_prompts =False ,save_individual_frames =False ,save_intermediate_frames =False ,save_last_frame =False ,rife_enabled =False ,rife_multiplier ="2x FPS",
+selected_lora_dropdown_value ="None",
 
 selected_model_display_name =DEFAULT_MODEL_NAME ,
-target_width =640 ,target_height =640,
-save_temp_metadata_ui_value_from_ui: bool = True
+target_width =640 ,target_height =640 
 ):
 
     global stream ,currently_loaded_lora_info ,active_model_name 
@@ -2168,12 +1933,9 @@ save_temp_metadata_ui_value_from_ui: bool = True
 
     current_active_model =active_model_name 
 
-    # Multi-LoRA: collect all 4 dropdowns and scales
-    selected_lora_dropdown_values = [selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4]
-    lora_scales = [lora_scale_1, lora_scale_2, lora_scale_3, lora_scale_4]
-
     try :
-        manage_lora_structure(selected_lora_dropdown_values)
+
+        manage_lora_structure (selected_lora_dropdown_value )
     except RuntimeError as e :
          print (f"LoRA Management Error: {e}")
          yield None ,None ,f"Error managing LoRA: {e}",'',gr .update (interactive =True ),gr .update (interactive =False ),seed ,''
@@ -2202,19 +1964,21 @@ save_temp_metadata_ui_value_from_ui: bool = True
 
         prompt_to_worker =prompt if not use_multiline_prompts else current_prompt_line 
 
-        # Multi-LoRA: pass all 4 dropdowns and scales
+        current_adapter_name =currently_loaded_lora_info ["adapter_name"]if currently_loaded_lora_info ["adapter_name"]else "None"
         async_run (worker ,input_image ,end_image ,prompt_to_worker ,n_prompt ,seed ,use_random_seed ,total_second_length ,latent_window_size ,steps ,cfg ,gs ,rs ,gpu_memory_preservation ,teacache_threshold ,video_quality ,export_gif ,export_apng ,export_webp ,num_generations ,resolution ,fps ,
-            selected_lora_dropdown_values=selected_lora_dropdown_values,
-            lora_scales=lora_scales,
-            save_individual_frames_flag =save_individual_frames ,
-            save_intermediate_frames_flag =save_intermediate_frames ,
-            save_last_frame_flag =save_last_frame ,
-            use_multiline_prompts_flag =use_multiline_prompts ,
-            rife_enabled =rife_enabled ,rife_multiplier =rife_multiplier ,
-            active_model =current_active_model ,
-            target_width_from_ui =target_width ,
-            target_height_from_ui =target_height ,
-            save_temp_metadata_ui_value = save_temp_metadata_ui_value_from_ui # Pass the UI value
+
+        adapter_name_to_use =current_adapter_name ,
+        lora_scale =lora_scale ,
+
+        save_individual_frames_flag =save_individual_frames ,
+        save_intermediate_frames_flag =save_intermediate_frames ,
+        save_last_frame_flag =save_last_frame ,
+        use_multiline_prompts_flag =use_multiline_prompts ,
+        rife_enabled =rife_enabled ,rife_multiplier =rife_multiplier ,
+
+        active_model =current_active_model ,
+        target_width_from_ui =target_width ,
+        target_height_from_ui =target_height 
         )
 
         output_filename =None 
@@ -2328,15 +2092,14 @@ def batch_process (input_folder ,output_folder ,batch_end_frame_folder ,prompt ,
 latent_window_size ,steps ,cfg ,gs ,rs ,gpu_memory_preservation ,teacache_threshold ,
 video_quality ='high',export_gif =False ,export_apng =False ,export_webp =False ,
 skip_existing =True ,save_metadata =True ,num_generations =1 ,resolution ="640",fps =30 ,
-lora_scale_1=1.0, lora_scale_2=1.0, lora_scale_3=1.0, lora_scale_4=1.0,
-selected_lora_1="None", selected_lora_2="None", selected_lora_3="None", selected_lora_4="None",
-batch_use_multiline_prompts =False ,
+lora_scale =1.0 ,batch_use_multiline_prompts =False ,
 batch_save_individual_frames =False ,batch_save_intermediate_frames =False ,batch_save_last_frame =False ,
 rife_enabled =False ,rife_multiplier ="2x FPS",
+selected_lora_dropdown_value ="None",
+
 selected_model_display_name =DEFAULT_MODEL_NAME ,
 target_width =640 ,target_height =640 ,
-batch_auto_resize =True,
-save_temp_metadata_ui_value_from_ui: bool = True
+batch_auto_resize =True 
 ):
 
     global stream ,batch_stop_requested ,currently_loaded_lora_info ,active_model_name 
@@ -2348,12 +2111,9 @@ save_temp_metadata_ui_value_from_ui: bool = True
          print (f"Warning: Selected batch model '{selected_model_display_name}' differs from active model '{active_model_name}'. Using the active model for the entire batch.")
     current_active_model =active_model_name 
 
-    # Multi-LoRA: collect all 4 dropdowns and scales
-    selected_lora_dropdown_values = [selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4]
-    lora_scales = [lora_scale_1, lora_scale_2, lora_scale_3, lora_scale_4]
-
     try :
-        manage_lora_structure(selected_lora_dropdown_values)
+
+        manage_lora_structure (selected_lora_dropdown_value )
     except RuntimeError as e :
          print (f"LoRA Management Error during batch setup: {e}")
          yield None ,None ,f"Error managing LoRA: {e}","",gr .update (interactive =True ),gr .update (interactive =False ),seed ,""
@@ -2379,7 +2139,7 @@ save_temp_metadata_ui_value_from_ui: bool = True
 
     final_output =None 
     current_batch_seed =seed 
-    # current_adapter_name =currently_loaded_lora_info ["adapter_name"]if currently_loaded_lora_info ["adapter_name"]else "None"
+    current_adapter_name =currently_loaded_lora_info ["adapter_name"]if currently_loaded_lora_info ["adapter_name"]else "None"
 
     for idx ,original_image_path_for_loop in enumerate (image_files ):
         if batch_stop_requested :
@@ -2405,15 +2165,6 @@ save_temp_metadata_ui_value_from_ui: bool = True
 
             if batch_auto_resize :
                 print (f"Processing {start_image_basename} with Auto Resize enabled.")
-                # Apply EXIF transpose before getting original dimensions for calculations
-                try:
-                    print(f"  Applying EXIF transpose to {start_image_basename}...")
-                    img_for_processing_pil = ImageOps.exif_transpose(img_for_processing_pil)
-                    orig_width_pil, orig_height_pil = img_for_processing_pil.size # Update dimensions after transpose
-                    print(f"  Dimensions after EXIF transpose: {orig_width_pil}x{orig_height_pil}")
-                except Exception as exif_err:
-                    print(f"  Warning: Could not apply EXIF transpose to {start_image_basename}: {exif_err}")
-                
                 target_res_val =int (resolution )
                 target_pixel_count =target_res_val *target_res_val 
                 original_pixel_count =orig_width_pil *orig_height_pil 
@@ -2452,7 +2203,7 @@ save_temp_metadata_ui_value_from_ui: bool = True
                         resize_h_for_crop =max (1 ,resize_h_for_crop )
 
                         print (f"    Resizing original to {resize_w_for_crop}x{resize_h_for_crop} for center cropping...")
-                        img_resized_for_cropping =img_for_processing_pil .resize ((resize_w_for_crop ,resize_h_for_crop ),Image .Resampling .LANCZOS )
+                        img_resized_for_cropping =img_pil_original .resize ((resize_w_for_crop ,resize_h_for_crop ),Image .Resampling .LANCZOS )
 
                         current_w_rc ,current_h_rc =img_resized_for_cropping .size 
                         left =(current_w_rc -final_crop_width )/2 
@@ -2553,17 +2304,9 @@ save_temp_metadata_ui_value_from_ui: bool = True
             potential_end_path =os .path .join (batch_end_frame_folder ,start_image_basename )
             if os .path .exists (potential_end_path ):
                 try :
-                    end_img_pil = Image.open(potential_end_path)
-                    # Apply EXIF transpose to end image as well if it's used
-                    try:
-                        print(f"  Applying EXIF transpose to end image: {potential_end_path}...")
-                        end_img_pil = ImageOps.exif_transpose(end_img_pil)
-                        print(f"  Dimensions of end image after EXIF transpose: {end_img_pil.width}x{end_img_pil.height}")
-                    except Exception as exif_err_end:
-                        print(f"  Warning: Could not apply EXIF transpose to end image {potential_end_path}: {exif_err_end}")
-
-                    if end_img_pil.mode != 'RGB': end_img_pil = end_img_pil.convert('RGB')
-                    current_end_image =np .array (end_img_pil)
+                    end_img =Image .open (potential_end_path )
+                    if end_img .mode !='RGB':end_img =end_img .convert ('RGB')
+                    current_end_image =np .array (end_img )
                     if len (current_end_image .shape )==2 :current_end_image =np .stack ([current_end_image ]*3 ,axis =2 )
                     print (f"Loaded matching end image: {potential_end_path}")
                     end_image_path_str =potential_end_path 
@@ -2662,17 +2405,20 @@ save_temp_metadata_ui_value_from_ui: bool = True
             export_apng ,export_webp ,
             num_generations =num_generations ,
             resolution =resolution ,fps =fps ,
-            selected_lora_dropdown_values=selected_lora_dropdown_values,
-            lora_scales=lora_scales,
+
+            adapter_name_to_use =current_adapter_name ,
+            lora_scale =lora_scale ,
+
             save_individual_frames_flag =batch_save_individual_frames ,
             save_intermediate_frames_flag =batch_save_intermediate_frames ,
             save_last_frame_flag =batch_save_last_frame ,
+
             use_multiline_prompts_flag =batch_use_multiline_prompts ,
             rife_enabled =rife_enabled ,rife_multiplier =rife_multiplier ,
+
             active_model =current_active_model ,
             target_width_from_ui =effective_width_for_worker ,
-            target_height_from_ui =effective_height_for_worker ,
-            save_temp_metadata_ui_value = save_temp_metadata_ui_value_from_ui # Pass the UI value
+            target_height_from_ui =effective_height_for_worker 
             )
 
             output_filename_from_worker =None 
@@ -2774,22 +2520,9 @@ save_temp_metadata_ui_value_from_ui: bool = True
                                     if not batch_use_multiline_prompts :
                                          metadata ["Timestamped Prompts Parsed"]="[Check Worker Logs]"
 
-                                    # if current_adapter_name !="None":
-                                    #     metadata ["LoRA"]=current_adapter_name 
-                                    #     metadata ["LoRA Scale"]=lora_scale 
-
-                                    # Multi-LoRA metadata for batch
-                                    for i in range(N_LORA):
-                                        lora_name = selected_lora_dropdown_values[i] # Use the dropdown value which is the display name
-                                        lora_scale_val = lora_scales[i]
-                                        if lora_name and lora_name != "None":
-                                            if i == 0: # First LoRA (already handled by old LoRA/LoRA Scale if present)
-                                                if "LoRA" not in metadata: # only add if not covered by legacy single LoRA
-                                                    metadata["LoRA"] = lora_name
-                                                    metadata["LoRA Scale"] = lora_scale_val
-                                            else: # Subsequent LoRAs
-                                                metadata[f"LoRA {i+1} Name"] = lora_name
-                                                metadata[f"LoRA {i+1} Scale"] = lora_scale_val
+                                    if current_adapter_name !="None":
+                                        metadata ["LoRA"]=current_adapter_name 
+                                        metadata ["LoRA Scale"]=lora_scale 
 
                                     save_processing_metadata (moved_primary_file ,metadata .copy ())
 
@@ -3015,7 +2748,7 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
 with block :
-    gr .Markdown ('# FramePack Improved SECourses App V57 - https://www.patreon.com/posts/126855226')
+    gr .Markdown ('# FramePack Improved SECourses App V52 - https://www.patreon.com/posts/126855226')
     with gr .Row ():
 
         model_selector =gr .Radio (
@@ -3091,29 +2824,10 @@ with block :
                     load_from_metadata_button =gr .Button ("Load Settings from File",variant ='primary')
                     metadata_load_status =gr .Markdown ("")
 
-                with gr .Row ():
-
-                    gpu_memory_preservation =gr .Slider (label ="GPU Inference Preserved Memory (GB)",minimum =0 ,maximum =128 ,value =8 ,step =0.1 ,info ="Increase this until you don't use shared VRAM. If you increase unnecessarily it will become slower. However If you make this lower than expected, It will use shared VRAM and will become ultra slow. Follow nvitop and monitor GPU watt usage")
-
-                    def update_memory_for_resolution (res ):
-
-                        res_int =int (res )
-                        if res_int >=1440 :return 23 
-                        elif res_int >=1320 :return 21 
-                        elif res_int >=1200 :return 19 
-                        elif res_int >=1080 :return 16 
-                        elif res_int >=960 :return 14 
-                        elif res_int >=840 :return 12 
-                        elif res_int >=720 :return 10 
-                        elif res_int >=640 :return 8 
-                        else :return 6 
-                    
-
             with gr .Group ("Common Settings"):
                 with gr .Row ():
                     num_generations =gr .Slider (label ="Number of Generations",minimum =1 ,maximum =50 ,value =1 ,step =1 ,info ="Generate multiple videos in sequence (per image/prompt)")
                     resolution =gr .Dropdown (label ="Resolution",choices =["1440","1320","1200","1080","960","840","720","640","480","320","240"],value ="640",info ="Output Resolution (bigger than 640 set more Preserved Memory)")
-                    resolution.change (fn=update_memory_for_resolution ,inputs=resolution ,outputs=gpu_memory_preservation )
                 with gr .Row ():
                     target_width_slider =gr .Slider (label ="Target Width",minimum =256 ,maximum =2048 ,value =640 ,step =32 ,info ="Desired output width. Will be snapped to nearest bucket.")
                     target_height_slider =gr .Slider (label ="Target Height",minimum =256 ,maximum =2048 ,value =640 ,step =32 ,info ="Desired output height. Will be snapped to nearest bucket.")
@@ -3145,20 +2859,30 @@ with block :
                 with gr .Row ():
                     with gr .Column ():
                         lora_options =scan_lora_files ()
-                        selected_lora_1 =gr .Dropdown (label ="Select LoRA 1",choices =[name for name ,_ in lora_options ],value ="None",info ="Select a LoRA to apply")
-                        selected_lora_2 =gr .Dropdown (label ="Select LoRA 2",choices =[name for name ,_ in lora_options ],value ="None",info ="Select a second LoRA to apply")
-                        selected_lora_3 =gr .Dropdown (label ="Select LoRA 3",choices =[name for name ,_ in lora_options ],value ="None",info ="Select a third LoRA to apply")
-                        selected_lora_4 =gr .Dropdown (label ="Select LoRA 4",choices =[name for name ,_ in lora_options ],value ="None",info ="Select a fourth LoRA to apply")
+                        selected_lora =gr .Dropdown (label ="Select LoRA",choices =[name for name ,_ in lora_options ],value ="None",info ="Select a LoRA to apply")
                     with gr .Column ():
                         with gr .Row ():
                              lora_refresh_btn =gr .Button (value ="🔄 Refresh",scale =1 )
                              lora_folder_btn =gr .Button (value ="📁 Open Folder",scale =1 )
-                        lora_scale_1 =gr .Slider (label ="LoRA 1 Scale",minimum =0.0 ,maximum =9.0 ,value =1.0 ,step =0.01 ,info ="Adjust the strength of the LoRA 1 effect")
-                        lora_scale_2 =gr .Slider (label ="LoRA 2 Scale",minimum =0.0 ,maximum =9.0 ,value =1.0 ,step =0.01 ,info ="Adjust the strength of the LoRA 2 effect")
-                        lora_scale_3 =gr .Slider (label ="LoRA 3 Scale",minimum =0.0 ,maximum =9.0 ,value =1.0 ,step =0.01 ,info ="Adjust the strength of the LoRA 3 effect")
-                        lora_scale_4 =gr .Slider (label ="LoRA 4 Scale",minimum =0.0 ,maximum =9.0 ,value =1.0 ,step =0.01 ,info ="Adjust the strength of the LoRA 4 effect")
+                        lora_scale =gr .Slider (label ="LoRA Scale",minimum =0.0 ,maximum =9.0 ,value =1.0 ,step =0.01 ,info ="Adjust the strength of the LoRA effect")
 
+                with gr .Row ():
 
+                    gpu_memory_preservation =gr .Slider (label ="GPU Inference Preserved Memory (GB)",minimum =0 ,maximum =128 ,value =8 ,step =0.1 ,info ="Memory to keep free on GPU (Low VRAM mode). Larger value causes slower speed but helps prevent OOM. Adjust based on Resolution and VRAM.")
+
+                    def update_memory_for_resolution (res ):
+
+                        res_int =int (res )
+                        if res_int >=1440 :return 23 
+                        elif res_int >=1320 :return 21 
+                        elif res_int >=1200 :return 19 
+                        elif res_int >=1080 :return 16 
+                        elif res_int >=960 :return 14 
+                        elif res_int >=840 :return 12 
+                        elif res_int >=720 :return 10 
+                        elif res_int >=640 :return 8 
+                        else :return 6 
+                    resolution .change (fn =update_memory_for_resolution ,inputs =resolution ,outputs =gpu_memory_preservation )
 
         with gr .Column ():
             preview_image =gr .Image (label ="Next Latents",height =200 ,visible =False )
@@ -3206,8 +2930,6 @@ with block :
                 export_gif =gr .Checkbox (label ="Export as GIF",value =False ,info ="Save animation as GIF")
                 export_apng =gr .Checkbox (label ="Export as APNG",value =False ,info ="Save animation as Animated PNG")
                 export_webp =gr .Checkbox (label ="Export as WebP",value =False ,info ="Save animation as WebP")
-            with gr .Row ():
-                save_temp_metadata = gr.Checkbox(label="Save Temporary Metadata", value=True, info="If generation fails or is cancelled, metadata up to that point is kept as a temporary file. This temp file is deleted on successful generation of final metadata.")
 
     preset_components_list =[
     model_selector ,
@@ -3216,10 +2938,9 @@ with block :
     num_generations ,resolution ,teacache_threshold ,seed ,use_random_seed ,n_prompt ,fps ,total_second_length ,
     latent_window_size ,steps ,gs ,cfg ,rs ,
     target_width_slider ,target_height_slider ,
-    selected_lora_1 ,selected_lora_2 ,selected_lora_3 ,selected_lora_4 ,
-    lora_scale_1 ,lora_scale_2 ,lora_scale_3 ,lora_scale_4 ,
-    gpu_memory_preservation ,video_quality ,rife_enabled ,rife_multiplier ,export_gif ,export_apng ,export_webp,
-    save_temp_metadata
+    selected_lora ,
+    lora_scale ,
+    gpu_memory_preservation ,video_quality ,rife_enabled ,rife_multiplier ,export_gif ,export_apng ,export_webp 
     ]
     component_names_for_preset =[
     "model_selector",
@@ -3228,10 +2949,9 @@ with block :
     "num_generations","resolution","teacache_threshold","seed","use_random_seed","n_prompt","fps","total_second_length",
     "latent_window_size","steps","gs","cfg","rs",
     "target_width","target_height",
-    "selected_lora_1","selected_lora_2","selected_lora_3","selected_lora_4",
-    "lora_scale_1","lora_scale_2","lora_scale_3","lora_scale_4",
-    "gpu_memory_preservation","video_quality","rife_enabled","rife_multiplier","export_gif","export_apng","export_webp",
-    "save_temp_metadata"
+    "selected_lora",
+    "lora_scale",
+    "gpu_memory_preservation","video_quality","rife_enabled","rife_multiplier","export_gif","export_apng","export_webp"
     ]
 
     def save_preset_action (name :str ,*values ):
@@ -3264,7 +2984,7 @@ with block :
 
             return gr .update (),gr .update (value =error_msg )
 
-    def load_preset_action (name :str ,progress =gr .Progress () ):
+    def load_preset_action (name :str ,progress =gr .Progress ()):
 
         global active_model_name 
 
@@ -3308,13 +3028,6 @@ with block :
         loaded_values :Dict [str ,Any ]={}
         available_loras =[lora_name for lora_name ,_ in scan_lora_files ()]
 
-        # Multi-LoRA: default missing slots to 'None' and 1.0
-        for i in range(1, N_LORA+1):
-            if f"selected_lora_{i}" not in preset_data:
-                preset_data[f"selected_lora_{i}"] = "None"
-            if f"lora_scale_{i}" not in preset_data:
-                preset_data[f"lora_scale_{i}"] = 1.0
-
         for i ,comp_name in enumerate (component_names_for_preset ):
             target_component =preset_components_list [i ]
 
@@ -3323,7 +3036,7 @@ with block :
             if comp_name in preset_data :
                 value =preset_data [comp_name ]
 
-                if comp_name.startswith("selected_lora_"):
+                if comp_name =="selected_lora":
                     if value not in available_loras :
                         print (f"Preset Warning: Saved LoRA '{value}' not found. Setting LoRA to 'None'.")
                         value ="None"
@@ -3377,16 +3090,15 @@ with block :
         selected =last_used if last_used in presets else "Default"
         return gr .update (choices =presets ,value =selected )
 
-    lora_refresh_btn .click (fn =lambda : [refresh_loras() for _ in range(N_LORA)],outputs =[selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4])
+    lora_refresh_btn .click (fn =refresh_loras ,outputs =[selected_lora ])
     lora_folder_btn .click (fn =lambda :open_folder (loras_folder ),inputs =None ,outputs =None )
 
     ips =[input_image ,end_image ,prompt ,n_prompt ,seed ,use_random_seed ,num_generations ,total_second_length ,latent_window_size ,steps ,cfg ,gs ,rs ,gpu_memory_preservation ,teacache_threshold ,video_quality ,export_gif ,export_apng ,export_webp ,save_metadata ,resolution ,fps ,
-    lora_scale_1, lora_scale_2, lora_scale_3, lora_scale_4,
-    selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4,
+    lora_scale ,
     use_multiline_prompts ,save_individual_frames ,save_intermediate_frames ,save_last_frame ,rife_enabled ,rife_multiplier ,
+    selected_lora ,
     model_selector ,
-    target_width_slider ,target_height_slider ,
-    save_temp_metadata # Add the checkbox component here
+    target_width_slider ,target_height_slider 
     ]
     start_button .click (fn =process ,inputs =ips ,outputs =[result_video ,preview_image ,progress_desc ,progress_bar ,start_button ,end_button ,seed ,timing_display ])
 
@@ -3404,15 +3116,14 @@ with block :
     total_second_length ,latent_window_size ,steps ,cfg ,gs ,rs ,gpu_memory_preservation ,
     teacache_threshold ,video_quality ,export_gif ,export_apng ,export_webp ,batch_skip_existing ,
     batch_save_metadata ,num_generations ,resolution ,fps ,
-    lora_scale_1, lora_scale_2, lora_scale_3, lora_scale_4,
-    selected_lora_1, selected_lora_2, selected_lora_3, selected_lora_4,
+    lora_scale ,
     batch_use_multiline_prompts ,
     batch_save_individual_frames ,batch_save_intermediate_frames ,batch_save_last_frame ,
     rife_enabled ,rife_multiplier ,
+    selected_lora ,
     model_selector ,
     target_width_slider ,target_height_slider ,
-    batch_auto_resize,
-    save_temp_metadata # Add the checkbox component here
+    batch_auto_resize 
     ]
     batch_start_button .click (fn =batch_process ,inputs =batch_ips ,outputs =[result_video ,preview_image ,progress_desc ,progress_bar ,batch_start_button ,batch_end_button ,seed ,timing_display ])
 
@@ -3593,12 +3304,6 @@ with block :
 
         if "target_width"not in initial_values :initial_values ["target_width"]=640 
         if "target_height"not in initial_values :initial_values ["target_height"]=640 
-        # Multi-LoRA: default missing slots to 'None' and 1.0
-        for i in range(1, N_LORA+1):
-            if f"selected_lora_{i}" not in initial_values:
-                initial_values[f"selected_lora_{i}"] = "None"
-            if f"lora_scale_{i}" not in initial_values:
-                initial_values[f"lora_scale_{i}"] = 1.0
         create_default_preset_if_needed (initial_values )
 
         preset_to_load =load_last_used_preset_name ()
