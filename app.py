@@ -3018,14 +3018,13 @@ with block:
     gr.Markdown('# FramePack EndangeredAI')
     gr.Markdown('### [Support Development on Patreon](https://www.patreon.com/posts/127557380/)')
     
-
-        model_selector =gr .Radio (
-        label ="Select Model",
-        choices =[MODEL_DISPLAY_NAME_ORIGINAL ,MODEL_DISPLAY_NAME_F1 ],
-        value =active_model_name ,
-        info ="Choose the generation model. Switching will unload the current model and load the new one."
-        )
-        model_status =gr .Markdown (f"Active model: **{active_model_name}**")
+    model_selector =gr .Radio (
+        label="Select Model",
+        choices=[MODEL_DISPLAY_NAME_ORIGINAL, MODEL_DISPLAY_NAME_F1],
+        value=active_model_name,
+        info="Choose the generation model. Switching will unload the current model and load the new one."
+    )
+    model_status =gr .Markdown (f"Active model: **{active_model_name}**")
 
     with gr .Row ():
         with gr .Column ():
