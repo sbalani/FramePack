@@ -3014,9 +3014,10 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
-with block :
-    gr .Markdown ('# FramePack Improved SECourses App V57 - https://www.patreon.com/posts/126855226')
-    with gr .Row ():
+with block:
+    gr.Markdown('# FramePack EndangeredAI')
+    gr.Markdown('### [Support Development on Patreon](https://www.patreon.com/posts/127557380/)')
+    
 
         model_selector =gr .Radio (
         label ="Select Model",
